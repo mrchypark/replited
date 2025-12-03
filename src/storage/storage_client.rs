@@ -45,6 +45,7 @@ pub struct WalSegmentInfo {
     pub index: u64,
     pub offset: u64,
     pub size: u64,
+    pub created_at: DateTime<Utc>,
 }
 
 // restore wal_segments formats: vector<index, vector<offsets in order>>
@@ -233,6 +234,7 @@ impl StorageClient {
             .operator
             .list_with(&walsegments_dir)
             .metakey(Metakey::ContentLength)
+            .metakey(Metakey::LastModified)
             .await?;
 
         let mut wal_segments = vec![];
@@ -247,6 +249,7 @@ impl StorageClient {
                 index,
                 offset,
                 size: entry.metadata().content_length(),
+                created_at: entry.metadata().last_modified().unwrap_or_default(),
             })
         }
 
@@ -263,8 +266,17 @@ impl StorageClient {
         Ok(bytes)
     }
 
-    async fn restore_wal_segments_of(&self, snapshot: &SnapshotInfo) -> Result<RestoreWalSegments> {
+    async fn restore_wal_segments_of(
+        &self,
+        snapshot: &SnapshotInfo,
+        limit: Option<DateTime<Utc>>,
+    ) -> Result<RestoreWalSegments> {
         let mut wal_segments = self.wal_segments(snapshot.generation.as_str()).await?;
+
+        // filter wal segments by limit
+        if let Some(limit) = limit {
+            wal_segments.retain(|segment| segment.created_at <= limit);
+        }
 
         // sort wal segments first by index, then offset
         wal_segments.sort_by(|a, b| {
@@ -316,7 +328,7 @@ impl StorageClient {
         Ok(restore_wal_segments.into_iter().collect())
     }
 
-    pub async fn restore_info(&self) -> Result<Option<RestoreInfo>> {
+    pub async fn restore_info(&self, limit: Option<DateTime<Utc>>) -> Result<Option<RestoreInfo>> {
         let dir = remote_generations_dir(&self.db_name);
         let entries = self.operator.list(&dir).await?;
 
@@ -353,7 +365,7 @@ impl StorageClient {
             };
 
             // return only if wal segments in this snapshot is valid.
-            if let Ok(wal_segments) = self.restore_wal_segments_of(&snapshot).await {
+            if let Ok(wal_segments) = self.restore_wal_segments_of(&snapshot, limit).await {
                 return Ok(Some(RestoreInfo {
                     snapshot,
                     wal_segments,
