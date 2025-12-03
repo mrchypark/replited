@@ -5,6 +5,7 @@ use std::io::Write;
 use log::debug;
 use log::error;
 use log::info;
+use log::warn;
 use rusqlite::Connection;
 use tempfile::NamedTempFile;
 
@@ -382,18 +383,53 @@ impl Restore {
             let wal_path = format!("{}-wal", target_path);
             if let Ok(metadata) = fs::metadata(&wal_path) {
                 let current_offset = metadata.len();
-                // Find last_index based on offset
-                last_index = latest_restore_info
-                    .wal_segments
-                    .iter()
-                    .filter(|(_index, offsets)| offsets.iter().any(|&o| o < current_offset))
-                    .map(|(index, _)| *index)
-                    .max()
-                    .unwrap_or(0);
+                let mut valid = false;
 
-                last_offset = current_offset;
-                info!("resuming from index {}, offset {}", last_index, last_offset);
-                resume = true;
+                // Validate WAL file integrity
+                if current_offset > WAL_HEADER_SIZE as u64 {
+                    match WALHeader::read(&wal_path) {
+                        Ok(header) => {
+                            let frame_size = WAL_FRAME_HEADER_SIZE as u64 + header.page_size;
+                            let remainder = (current_offset - WAL_HEADER_SIZE as u64) % frame_size;
+                            if remainder == 0 {
+                                valid = true;
+                            } else {
+                                warn!(
+                                    "WAL file {} has partial frame (remainder {}), deleting it",
+                                    wal_path, remainder
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to read WAL header: {:?}, deleting WAL file", e);
+                        }
+                    }
+                } else if current_offset > 0 {
+                    warn!("WAL file {} is too small for header, deleting it", wal_path);
+                } else {
+                    // Empty file is valid (start from 0)
+                    valid = true;
+                }
+
+                if !valid {
+                    let _ = fs::remove_file(&wal_path);
+                    let shm_path = format!("{}-shm", target_path);
+                    let _ = fs::remove_file(&shm_path);
+                    // last_index and last_offset remain 0
+                } else {
+                    // Find last_index based on offset
+                    last_index = latest_restore_info
+                        .wal_segments
+                        .iter()
+                        .filter(|(_index, offsets)| offsets.iter().any(|&o| o < current_offset))
+                        .map(|(index, _)| *index)
+                        .max()
+                        .unwrap_or(0);
+
+                    last_offset = current_offset;
+                    info!("resuming from index {}, offset {}", last_index, last_offset);
+                    resume = true;
+                }
             }
         }
 
@@ -445,6 +481,7 @@ impl Restore {
         );
 
         if self.options.follow {
+            drop(_keepalive_connection);
             self.follow_loop(
                 client,
                 latest_restore_info.snapshot,

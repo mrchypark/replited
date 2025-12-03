@@ -30,14 +30,18 @@ pub struct RestoreOptions {
     // restore db output path
     #[arg(long, default_value = "")]
     pub output: String,
-    // restore db generation string.
-    // when empty, use the most recent generation from replicates.
-    //#[arg(short, long, default_value = "")]
-    // pub generation: String,
 
-    // if overwrite existing db in the same path
-    //#[arg(long, default_value_t = false)]
-    // pub overwrite: bool,
+    // follow mode
+    #[arg(short, long, default_value_t = false)]
+    pub follow: bool,
+
+    // follow interval in seconds
+    #[arg(short, long, default_value_t = 1)]
+    pub interval: u64,
+
+    // restore to specific timestamp
+    #[arg(short, long, default_value = "")]
+    pub timestamp: String,
 }
 
 impl RestoreOptions {
