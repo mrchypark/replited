@@ -366,20 +366,21 @@ impl Database {
             );
             return Some(CheckpointMode::Passive);
         } else if self.config.checkpoint_interval_secs > 0
-            && let Some(db_mod_time) = &info.db_mod_time {
-                let now = SystemTime::now();
+            && let Some(db_mod_time) = &info.db_mod_time
+        {
+            let now = SystemTime::now();
 
-                if let Ok(duration) = now.duration_since(*db_mod_time)
-                    && duration.as_secs() > self.config.checkpoint_interval_secs
-                        && new_wal_size > self.calc_wal_size(1)
-                    {
-                        debug!(
-                            "checkpoint by db_mod_time > checkpoint_interval_secs({})",
-                            self.config.checkpoint_interval_secs
-                        );
-                        return Some(CheckpointMode::Passive);
-                    }
+            if let Ok(duration) = now.duration_since(*db_mod_time)
+                && duration.as_secs() > self.config.checkpoint_interval_secs
+                && new_wal_size > self.calc_wal_size(1)
+            {
+                debug!(
+                    "checkpoint by db_mod_time > checkpoint_interval_secs({})",
+                    self.config.checkpoint_interval_secs
+                );
+                return Some(CheckpointMode::Passive);
             }
+        }
 
         None
     }
@@ -1063,13 +1064,16 @@ impl Database {
         Ok(())
     }
 
-    fn snapshot(&mut self) -> Result<(Vec<u8>, WalGenerationPos)> {
-        // Issue a passive checkpoint to flush any pages to disk before snapshotting.
+    async fn snapshot(&mut self) -> Result<(Vec<u8>, WalGenerationPos)> {
+        // Issue a PASSIVE checkpoint to flush pages to disk.
+        // We use PASSIVE because TRUNCATE would delete the WAL header, causing create_generation to fail.
+        // With PASSIVE, the new generation will start with the existing WAL header and frames.
+        // The snapshot will contain the DB state including those frames.
+        // Restoring will re-apply those frames, which is safe.
         self.checkpoint(CheckpointMode::Passive)?;
 
-        // Prevent internal checkpoints during snapshot.
-
-        // Acquire a read lock on the database during snapshot to prevent external checkpoints.
+        // Acquire a read lock on the database during snapshot to prevent external checkpoints
+        // and ensure the DB file is stable while we compress it.
         self.acquire_read_lock()?;
 
         // Obtain current position.
@@ -1078,14 +1082,28 @@ impl Database {
             return Err(Error::NoGenerationError("no generation"));
         }
 
+        info!("db {} snapshot created, pos: {:?}", self.config.db, pos);
+
         // compress db file
         let compressed_data = compress_file(&self.config.db)?;
+
+        // Release lock is handled by caller or Drop?
+        // acquire_read_lock sets self.tx_connection.
+        // We should probably release it?
+        // But the original code didn't release it explicitly in snapshot().
+        // It seems `handle_db_snapshot_command` doesn't release it either.
+        // Wait, `acquire_read_lock` keeps the transaction open.
+        // If we don't release it, no one can checkpoint!
+        // The original code relied on `Drop`? No, `Connection` drop rolls back?
+        // `self.tx_connection` is stored in `Database`.
+        // We MUST release the lock.
+        self.release_read_lock()?;
 
         Ok((compressed_data.to_owned(), pos))
     }
 
     async fn handle_db_snapshot_command(&mut self, index: usize) -> Result<()> {
-        let (compressed_data, generation_pos) = self.snapshot()?;
+        let (compressed_data, generation_pos) = self.snapshot().await?;
         debug!(
             "db {} snapshot {} data of pos {:?}",
             self.config.db,

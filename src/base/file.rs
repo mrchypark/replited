@@ -13,7 +13,7 @@ static WAL_SEGMENT_EXTENDION: &str = ".wal.lz4";
 static WAL_SEGMENT_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^([0-9]{10})(?:_([0-9]{10}))\.wal\.lz4$").unwrap());
 static SNAPSHOT_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^([0-9]{10})\.snapshot\.lz4$").unwrap());
+    LazyLock::new(|| Regex::new(r"^([0-9]{10})(?:_([0-9]{10}))\.snapshot\.lz4$").unwrap());
 static SNAPSHOT_EXTENDION: &str = ".snapshot.lz4";
 
 // return base name of path
@@ -78,8 +78,8 @@ pub fn parse_wal_segment_path(path: &str) -> Result<(u64, u64)> {
     Ok((index, offset))
 }
 
-// parse snapshot file path, return snapshot index
-pub fn parse_snapshot_path(path: &str) -> Result<u64> {
+// parse snapshot file path, return snapshot index and offset
+pub fn parse_snapshot_path(path: &str) -> Result<(u64, u64)> {
     let base = path_base(path)?;
     let a = SNAPSHOT_REGEX
         .captures(&base)
@@ -87,19 +87,26 @@ pub fn parse_snapshot_path(path: &str) -> Result<u64> {
             "invalid snapshot path {}",
             path
         )))?;
-    let a = a
+    let index = a
         .get(1)
         .ok_or(Error::InvalidPath(format!(
             "invalid snapshot path {}",
             path
         )))?
         .as_str();
+    let offset = a
+        .get(2)
+        .ok_or(Error::InvalidPath(format!(
+            "invalid snapshot path {}",
+            path
+        )))?
+        .as_str();
 
-    Ok(a.parse::<u64>()?)
+    Ok((index.parse::<u64>()?, offset.parse::<u64>()?))
 }
 
-pub fn format_snapshot_path(index: u64) -> String {
-    format!("{:0>10}{}", index, SNAPSHOT_EXTENDION)
+pub fn format_snapshot_path(index: u64, offset: u64) -> String {
+    format!("{:0>10}_{:0>10}{}", index, offset, SNAPSHOT_EXTENDION)
 }
 
 pub fn local_generations_dir(meta_dir: &str) -> String {
@@ -140,10 +147,10 @@ pub fn snapshots_dir(db: &str, generation: &str) -> String {
         .to_string()
 }
 
-pub fn snapshot_file(db: &str, generation: &str, index: u64) -> String {
+pub fn snapshot_file(db: &str, generation: &str, index: u64, offset: u64) -> String {
     Path::new(&generation_dir(db, generation))
         .join("snapshots")
-        .join(format_snapshot_path(index))
+        .join(format_snapshot_path(index, offset))
         .as_path()
         .to_str()
         .unwrap()
@@ -250,17 +257,19 @@ mod tests {
 
     #[test]
     fn test_parse_snapshot_path() -> Result<()> {
-        let path = "a/b/c/0000000019.snapshot.lz4";
-        let index = parse_snapshot_path(path)?;
+        let path = "a/b/c/0000000019_0000000100.snapshot.lz4";
+        let (index, offset) = parse_snapshot_path(path)?;
         assert_eq!(index, 19);
+        assert_eq!(offset, 100);
 
         let path = "a/b/c/000000019.snapshot.lz4";
         let index = parse_snapshot_path(path);
         assert!(index.is_err());
 
-        let path = format!("a/b/{}", format_snapshot_path(19));
-        let index = parse_snapshot_path(&path)?;
+        let path = format!("a/b/{}", format_snapshot_path(19, 100));
+        let (index, offset) = parse_snapshot_path(&path)?;
         assert_eq!(index, 19);
+        assert_eq!(offset, 100);
         Ok(())
     }
 

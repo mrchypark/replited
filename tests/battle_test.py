@@ -138,6 +138,54 @@ class BattleTest:
             if (target == 'restore' or target == 'both') and self.running:
                 self.start_restore()
 
+    def wait_for_catchup(self, timeout=90):
+        print(f"Waiting for replica to catch up (timeout={timeout}s)...")
+        start_time = time.time()
+        
+        last_count = -1
+        stable_count = 0
+        
+        while time.time() - start_time < timeout:
+            # Stop restore to safely read DB
+            if self.restore_proc:
+                self.stop_process(self.restore_proc, "Restore")
+                
+            try:
+                conn = sqlite3.connect(self.replica_path)
+                cursor = conn.cursor()
+                cursor.execute('SELECT count(*) FROM data')
+                count = cursor.fetchone()[0]
+                conn.close()
+                
+                target = len(self.records)
+                print(f"Replica count: {count}/{target}")
+                
+                if count >= target:
+                    return True
+                
+                if count == last_count:
+                    stable_count += 1
+                else:
+                    stable_count = 0
+                last_count = count
+                
+            except Exception as e:
+                print(f"Check failed: {e}")
+                pass
+            
+            # Restart restore to fetch more data
+            print("Restarting restore to fetch more data...")
+            self.start_restore()
+            
+            # Ensure replicate is running
+            if self.replicate_proc is None:
+                self.start_replicate()
+                
+            # Wait a bit for restore to do its job
+            time.sleep(5)
+            
+        return False
+
     def verify(self):
         print("\n--- Verifying Data Integrity ---")
         if not os.path.exists(self.replica_path):
@@ -217,20 +265,13 @@ class BattleTest:
 
         print("Writers finished. Ensuring replication catches up...")
         
-        # Ensure Replicate is running and give it time
-        if self.replicate_proc is None:
-            self.start_replicate()
-        
-        time.sleep(10)
+        if self.wait_for_catchup(timeout=90):
+            print("Catchup successful!")
+        else:
+            print("Catchup timed out!")
+
+        # Stop processes
         self.stop_process(self.replicate_proc, "Replicate")
-        
-        print("Ensuring restore catches up...")
-        # Restart restore to ensure clean state and catch up
-        if self.restore_proc:
-            self.stop_process(self.restore_proc, "Restore")
-        
-        self.start_restore()
-        time.sleep(10)
         self.stop_process(self.restore_proc, "Restore")
 
         return self.verify()

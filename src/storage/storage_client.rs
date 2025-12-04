@@ -35,6 +35,7 @@ pub struct StorageClient {
 pub struct SnapshotInfo {
     pub generation: Generation,
     pub index: u64,
+    pub offset: u64,
     pub size: u64,
     pub created_at: DateTime<Utc>,
 }
@@ -100,10 +101,12 @@ impl StorageClient {
             pos.index,
             pos.offset,
         );
+        let temp_file = format!("{}.tmp", file);
 
         self.ensure_parent_exist(&file).await?;
 
-        self.operator.write(&file, compressed_data).await?;
+        self.operator.write(&temp_file, compressed_data).await?;
+        self.operator.rename(&temp_file, &file).await?;
 
         Ok(())
     }
@@ -113,23 +116,36 @@ impl StorageClient {
         pos: &WalGenerationPos,
         compressed_data: Vec<u8>,
     ) -> Result<SnapshotInfo> {
-        let snapshot_file = snapshot_file(&self.db_name, pos.generation.as_str(), pos.index);
+        let snapshot_file = snapshot_file(
+            &self.db_name,
+            pos.generation.as_str(),
+            pos.index,
+            pos.offset,
+        );
+        let temp_file = format!("{}.tmp", snapshot_file);
         let snapshot_info = SnapshotInfo {
             generation: pos.generation.clone(),
             index: pos.index,
+            offset: pos.offset,
             size: compressed_data.len() as u64,
             created_at: Utc::now(),
         };
 
         self.ensure_parent_exist(&snapshot_file).await?;
 
-        self.operator.write(&snapshot_file, compressed_data).await?;
+        self.operator.write(&temp_file, compressed_data).await?;
+        self.operator.rename(&temp_file, &snapshot_file).await?;
 
         Ok(snapshot_info)
     }
 
     pub async fn read_snapshot(&self, info: &SnapshotInfo) -> Result<Vec<u8>> {
-        let snapshot_file = snapshot_file(&self.db_name, info.generation.as_str(), info.index);
+        let snapshot_file = snapshot_file(
+            &self.db_name,
+            info.generation.as_str(),
+            info.index,
+            info.offset,
+        );
 
         let data = self.operator.read(&snapshot_file).await?;
 
@@ -169,10 +185,11 @@ impl StorageClient {
             if !metadata.is_file() {
                 continue;
             }
-            let index = parse_snapshot_path(entry.name())?;
+            let (index, offset) = parse_snapshot_path(entry.name())?;
             snapshots.push(SnapshotInfo {
                 generation: generation.clone(),
                 index,
+                offset,
                 size: metadata.content_length(),
                 created_at: metadata.last_modified().unwrap(),
             })
@@ -198,7 +215,7 @@ impl StorageClient {
             if !metadata.is_file() {
                 continue;
             }
-            let index = parse_snapshot_path(entry.name())?;
+            let (index, offset) = parse_snapshot_path(entry.name())?;
             let mut update = false;
             match max_index {
                 Some(mi) => {
@@ -219,6 +236,7 @@ impl StorageClient {
             snapshot = Some(SnapshotInfo {
                 generation: generation.clone(),
                 index,
+                offset,
                 size: metadata.content_length(),
                 created_at: metadata.last_modified().unwrap(),
             });

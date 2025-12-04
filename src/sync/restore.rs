@@ -16,7 +16,7 @@ use crate::config::RestoreOptions;
 use crate::config::StorageConfig;
 use crate::error::Error;
 use crate::error::Result;
-use crate::sqlite::{WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE, WALHeader, checksum};
+use crate::sqlite::{WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE, WALHeader};
 use crate::storage::RestoreInfo;
 use crate::storage::RestoreWalSegments;
 use crate::storage::SnapshotInfo;
@@ -81,13 +81,37 @@ impl Restore {
         let compressed_data = client.read_snapshot(snapshot).await?;
         let decompressed_data = decompressed_data(compressed_data)?;
 
+        // Clean up existing WAL and SHM files to prevent corruption
+        let wal_path = format!("{}-wal", path);
+        let _ = fs::remove_file(&wal_path);
+        let _ = fs::remove_file(format!("{}-shm", path));
+
         let mut file = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
-            .open(path)?;
+            .open(format!("{}.tmp", path))?;
 
         file.write_all(&decompressed_data)?;
+        file.sync_all()?;
+
+        // Verify integrity of the downloaded snapshot
+        let temp_path = format!("{}.tmp", path);
+        {
+            let conn = Connection::open(&temp_path)?;
+            conn.pragma_query(None, "integrity_check", |row| {
+                let s: String = row.get(0)?;
+                if s != "ok" {
+                    return Err(rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error::new(11), // SQLITE_CORRUPT
+                        Some(format!("Integrity check failed: {}", s)),
+                    ));
+                }
+                Ok(())
+            })?;
+        }
+
+        fs::rename(temp_path, path)?;
 
         Ok(())
     }
@@ -200,20 +224,11 @@ impl Restore {
             last_index = *index;
 
             // Force SHM deletion to trigger recovery and update mxFrame
-            let shm_path = format!("{}-shm", db_path);
-            let _ = fs::remove_file(&shm_path);
-
-            let connection = Connection::open(db_path)?;
-
-            if let Err(e) = connection.query_row(WAL_CHECKPOINT_PASSIVE, [], |_row| Ok(())) {
-                error!(
-                    "passive checkpoint failed during restore {}:{:?}",
-                    index, offsets
-                );
-                return Err(e.into());
-            }
+            // let shm_path = format!("{}-shm", db_path);
+            // let _ = fs::remove_file(&shm_path);
 
             if keep_alive {
+                let connection = Connection::open(db_path)?;
                 return Ok((last_index, last_offset, Some(connection)));
             }
             // connection is dropped here if not returned
@@ -321,7 +336,7 @@ impl Restore {
                             &current_snapshot,
                             &latest_info.wal_segments,
                             &self.options.output,
-                            0, // Start fresh for new generation
+                            current_snapshot.offset, // Start fresh for new generation
                             false,
                         )
                         .await?;
@@ -426,8 +441,10 @@ impl Restore {
                         .max()
                         .unwrap_or(0);
 
-                    last_offset = current_offset;
-                    info!("resuming from index {}, offset {}", last_index, last_offset);
+                    info!(
+                        "resuming from index {}, offset {}",
+                        last_index, current_offset
+                    );
                     resume = true;
                 }
             }
@@ -446,7 +463,7 @@ impl Restore {
                 &latest_restore_info.snapshot,
                 &latest_restore_info.wal_segments,
                 &target_path,
-                last_index,
+                0, // Force full WAL reconstruction from offset 0
                 self.options.follow,
             )
             .await?;

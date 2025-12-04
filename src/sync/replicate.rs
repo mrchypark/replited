@@ -118,9 +118,14 @@ impl Replicate {
         }
         let mut max_index = 0;
         let mut max_wg_index = 0;
+        let mut max_wg_offset = 0;
         for (i, wg) in wal_segments.iter().enumerate() {
             if wg.index > max_wg_index {
                 max_wg_index = wg.index;
+                max_wg_offset = wg.offset;
+                max_index = i;
+            } else if wg.index == max_wg_index && wg.offset > max_wg_offset {
+                max_wg_offset = wg.offset;
                 max_index = i;
             }
         }
@@ -318,9 +323,10 @@ impl Replicate {
         // Read all WAL files since the last position.
         loop {
             if let Err(e) = self.sync_wal().await
-                && e.code() == Error::UNEXPECTED_EOF_ERROR {
-                    break;
-                }
+                && e.code() == Error::UNEXPECTED_EOF_ERROR
+            {
+                break;
+            }
         }
         Ok(())
     }
