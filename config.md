@@ -34,6 +34,12 @@ See config sample in [sample.toml](./etc/sample.toml)
 | :---- | ---- |
 | db | sqlite database file path |
 | replicate | one or more database replicate backend |
+| min_checkpoint_page_number | passive checkpoint threshold (pages) |
+| max_checkpoint_page_number | forced checkpoint threshold (pages) |
+| truncate_page_number | forced truncation checkpoint threshold (pages) |
+| checkpoint_interval_secs | seconds between background checkpoints on primary |
+| apply_checkpoint_frame_interval | **replica-side**: WAL frames to buffer before checkpoint (default 128) |
+| apply_checkpoint_interval_ms | **replica-side**: max milliseconds between checkpoints (default 2000) |
 
 ### Replicate Config
 | item  |  value    |

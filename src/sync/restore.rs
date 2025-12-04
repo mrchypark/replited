@@ -352,7 +352,7 @@ impl Restore {
         }
     }
 
-    pub async fn run(&self) -> Result<()> {
+    pub async fn run(&self) -> Result<Option<crate::database::WalGenerationPos>> {
         // Ensure output path does not already exist.
         if fs::exists(&self.options.output)? {
             if !self.options.follow {
@@ -375,7 +375,7 @@ impl Restore {
             Some(latest_restore_info) => latest_restore_info,
             None => {
                 debug!("cannot find snapshot");
-                return Ok(());
+                return Err(Error::NoSnapshotError(self.db.clone()));
             }
         };
 
@@ -509,17 +509,27 @@ impl Restore {
                 last_offset,
             )
             .await?;
+
+            // follow mode does not return a position (it keeps running)
+            return Ok(None);
         }
 
-        Ok(())
+        let pos = crate::database::WalGenerationPos {
+            generation: latest_restore_info.snapshot.generation.clone(),
+            index: last_index,
+            offset: last_offset,
+        };
+
+        Ok(Some(pos))
     }
 }
 
-pub async fn run_restore(config: &DbConfig, options: &RestoreOptions) -> Result<()> {
+pub async fn run_restore(
+    config: &DbConfig,
+    options: &RestoreOptions,
+) -> Result<Option<crate::database::WalGenerationPos>> {
     let restore =
         Restore::try_create(config.db.clone(), config.replicate.clone(), options.clone())?;
 
-    restore.run().await?;
-
-    Ok(())
+    restore.run().await
 }

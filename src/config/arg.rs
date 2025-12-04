@@ -17,7 +17,13 @@ pub struct Arg {
 #[derive(Subcommand, Clone, Debug)]
 pub enum ArgCommand {
     Replicate,
-    ReplicaSidecar,
+
+    /// Run replica sidecar that bootstraps (restore) then streams WAL.
+    ReplicaSidecar {
+        /// Force full restore even if local DB exists (will delete existing db/wal/shm first)
+        #[arg(long, default_value_t = false)]
+        force_restore: bool,
+    },
 
     Restore(RestoreOptions),
 }

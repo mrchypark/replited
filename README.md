@@ -54,6 +54,11 @@ replited --config {config file} restore --db {db in config file} --output {outpu
 
 See [config.md](./config.md)
 
+Replica-side WAL checkpoint tuning (new)
+- `apply_checkpoint_frame_interval` (default: 128): number of WAL frames to buffer before checkpointing. Lower values surface new schema/data faster at the cost of more I/O.
+- `apply_checkpoint_interval_ms` (default: 2000): max milliseconds between checkpoints even if the frame threshold is not reached.
+- DDL (page 1) followed by a commit triggers an immediate checkpoint and SHM rebuild so schema changes are visible without restarting the sidecar.
+
 
 ## Sub commands
 ### Replicate
@@ -71,6 +76,17 @@ replited  --config ./etc/sample.toml restore --db /Users/codedump/local/sqlite/t
 command options:
 * `db`: which db will be restore from config
 * `output`: which path will restored db saved
+
+### Stream (primary + replica)
+- Primary: add a stream replicate target in config (`params.type = "stream"`, `addr = "127.0.0.1:50051"`) and run:
+  ```
+  replited --config primary.toml replicate
+  ```
+- Replica: point to the primary stream endpoint in the replica config (`params.type = "stream"`, `addr = "http://127.0.0.1:50051"`) and run:
+  ```
+  replited --config replica.toml replica-sidecar --force-restore
+  ```
+  The sidecar fetches the restore config, downloads the latest snapshot, then continuously applies streamed WAL frames. Schema changes are surfaced without restart thanks to automatic checkpoints and SHM rebuilds.
 
 ## Stargazers over time
 [![Stargazers over time](https://starchart.cc/lichuang/replited.svg?variant=adaptive)](https://starchart.cc/lichuang/replited)

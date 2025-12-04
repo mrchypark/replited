@@ -1,28 +1,18 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
-use log::error;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::Request;
-use tonic::Response;
-use tonic::Status;
+use tonic::{Request, Response, Status};
 
-use crate::base::Generation;
-use crate::config::Config;
-use crate::config::DbConfig;
-use crate::database::DatabaseInfo;
-use crate::database::WalGenerationPos;
-use crate::pb::replication::Handshake;
-use crate::pb::replication::RestoreConfig;
-use crate::pb::replication::RestoreRequest;
-use crate::pb::replication::WalPacket;
+use crate::config::{Config, DbConfig};
 use crate::pb::replication::replication_server::Replication;
-use crate::sqlite::WALFrame;
-use crate::sqlite::WALHeader;
-use crate::sync::ShadowWalReader;
+use crate::pb::replication::{Handshake, RestoreConfig, RestoreRequest, WalPacket};
+use crate::sqlite::{
+    WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE, WALFrame, WALHeader, align_frame, checksum,
+};
 
 pub struct ReplicationServer {
     db_paths: HashMap<String, PathBuf>,
@@ -62,7 +52,6 @@ impl Replication for ReplicationServer {
             Status::not_found(format!("Database {} not found", req.db_name))
         })?;
 
-        // Serialize DbConfig to JSON
         let config_json = serde_json::to_string(db_config).map_err(|e| {
             eprintln!("Primary: Failed to serialize config: {}", e);
             Status::internal(format!("Failed to serialize config: {}", e))
@@ -72,6 +61,7 @@ impl Replication for ReplicationServer {
         Ok(Response::new(RestoreConfig { config_json }))
     }
 
+    // Stream WAL by directly tailing the WAL file. Shadow WAL is bypassed.
     async fn stream_wal(
         &self,
         request: Request<Handshake>,
@@ -85,156 +75,147 @@ impl Replication for ReplicationServer {
             .ok_or_else(|| Status::not_found(format!("Database {} not found", handshake.db_name)))?
             .clone();
 
-        let generation = if handshake.generation.is_empty() {
-            let file_path = std::path::Path::new(&db_path);
-            let db_name = file_path.file_name().unwrap().to_str().unwrap();
-            let dir_path = match file_path.parent() {
-                Some(p) if p == std::path::Path::new("") => std::path::Path::new("."),
-                Some(p) => p,
-                None => std::path::Path::new("."),
-            };
-            let meta_dir = format!("{}/.{}-replited/", dir_path.to_str().unwrap(), db_name);
-            let generation_file = std::path::Path::new(&meta_dir).join("generation");
-
-            if !generation_file.exists() {
-                return Err(Status::unavailable("Generation file not found"));
-            }
-
-            let generation_str = std::fs::read_to_string(generation_file)
-                .map_err(|e| Status::internal(format!("Failed to read generation file: {}", e)))?;
-            Generation::try_create(&generation_str)
-                .map_err(|e| Status::internal(format!("Invalid generation in file: {}", e)))?
+        let mut offset = if handshake.offset == 0 {
+            crate::sqlite::WAL_HEADER_SIZE
         } else {
-            Generation::try_create(&handshake.generation).map_err(|e| {
-                Status::invalid_argument(format!(
-                    "Invalid generation format: '{}', error: {}",
-                    handshake.generation, e
-                ))
-            })?
-        };
-        let start_pos = WalGenerationPos {
-            generation,
-            index: handshake.index,
-            // When offset=0, skip the 32-byte WAL header since we send it separately
-            offset: if handshake.offset == 0 {
-                crate::sqlite::WAL_HEADER_SIZE
-            } else {
-                handshake.offset
-            },
+            handshake.offset
         };
 
         let (tx, rx) = mpsc::channel(1);
-        eprintln!("Primary: Created channel, spawning reader task...");
+        eprintln!("Primary: Created channel, spawning reader task (live WAL tail)...");
 
         tokio::spawn(async move {
             eprintln!("Primary: Reader task started");
-
-            // Read WAL header to get page size
             let wal_path = format!("{}-wal", db_path.display());
-            let wal_header = match WALHeader::read(&wal_path) {
-                Ok(h) => h,
-                Err(e) => {
-                    eprintln!("Primary: Failed to read WAL header: {}", e);
-                    let _ = tx
-                        .send(Err(Status::internal(format!(
-                            "Failed to read WAL header: {}",
-                            e
-                        ))))
-                        .await;
-                    return;
-                }
-            };
-
-            // Send WAL header first
-            let header_bytes = wal_header.to_bytes();
-            eprintln!(
-                "Primary: Sending WAL header packet ({} bytes)",
-                header_bytes.len()
-            );
-            let header_packet = WalPacket {
-                payload: Some(crate::pb::replication::wal_packet::Payload::FrameData(
-                    header_bytes,
-                )),
-            };
-            if let Err(e) = tx.send(Ok(header_packet)).await {
-                eprintln!("Primary: Failed to send header: {}", e);
-                return;
-            }
-
-            // Prepare DatabaseInfo for ShadowWalReader
-            let file_path = std::path::Path::new(&db_path);
-            let db_name = file_path.file_name().unwrap().to_str().unwrap();
-            let dir_path = match file_path.parent() {
-                Some(p) if p == std::path::Path::new("") => std::path::Path::new("."),
-                Some(p) => p,
-                None => std::path::Path::new("."),
-            };
-            let meta_dir = format!("{}/.{}-replited/", dir_path.to_str().unwrap(), db_name);
-
-            let info = DatabaseInfo {
-                meta_dir,
-                page_size: wal_header.page_size,
-            };
-
-            // Wait for generation file
-            let generation_dir = db_path.parent().unwrap().join(".data.db-replited");
-            let generation_file_path = generation_dir.join("generation");
-
-            if !generation_file_path.exists() {
-                let _ = tx
-                    .send(Err(Status::unavailable("Generation file not found")))
-                    .await;
-                return;
-            }
-
-            let mut reader = match ShadowWalReader::new(start_pos, &info) {
-                Ok(reader) => {
-                    eprintln!("Primary: ShadowWalReader created, left={}", reader.left());
-                    reader
-                }
-                Err(e) => {
-                    let _ = tx.send(Err(Status::internal(e.to_string()))).await;
-                    return;
-                }
-            };
+            let mut sent_header = false;
+            let mut last_checksum: Option<(u32, u32)> = None;
 
             loop {
-                if reader.left() == 0 {
-                    // Simple polling for now to wait for more data.
-                    sleep(Duration::from_millis(100)).await;
-
-                    // Try to re-create reader from current pos to refresh metadata (check for new data).
-                    let pos = reader.position();
-                    match ShadowWalReader::new(pos, &info) {
-                        Ok(r) => reader = r,
-                        Err(_) => continue, // Wait more
-                    }
-                    if reader.left() == 0 {
+                // Read WAL header to get page size (handle WAL reset)
+                let wal_header = match WALHeader::read(&wal_path) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        eprintln!("Primary: Failed to read WAL header: {}", e);
+                        sleep(Duration::from_millis(200)).await;
                         continue;
                     }
+                };
+                let page_size = wal_header.page_size;
+                let header_seed = checksum(
+                    &wal_header.to_bytes()[0..24],
+                    0,
+                    0,
+                    wal_header.is_big_endian,
+                );
+
+                // Send WAL header first if not sent or if we are at the beginning.
+                if !sent_header || offset == crate::sqlite::WAL_HEADER_SIZE {
+                    let header_bytes = wal_header.to_bytes();
+                    eprintln!(
+                        "Primary: Sending WAL header packet ({} bytes)",
+                        header_bytes.len()
+                    );
+                    let header_packet = WalPacket {
+                        payload: Some(crate::pb::replication::wal_packet::Payload::FrameData(
+                            header_bytes,
+                        )),
+                    };
+                    if let Err(e) = tx.send(Ok(header_packet)).await {
+                        eprintln!("Primary: Failed to send header: {}", e);
+                        return;
+                    }
+                    sent_header = true;
+                    last_checksum = Some(header_seed);
+                    // Always realign offset to start of frames after a header resend.
+                    offset = WAL_HEADER_SIZE;
                 }
 
-                let wal_frame = match WALFrame::read(&mut reader, info.page_size) {
-                    Ok(f) => f,
+                let wal_len = match std::fs::metadata(&wal_path) {
+                    Ok(meta) => align_frame(page_size, meta.len()),
                     Err(e) => {
-                        error!("Error reading WAL frame: {}", e);
-                        break;
+                        eprintln!("Primary: wal metadata error: {}", e);
+                        sleep(Duration::from_millis(200)).await;
+                        continue;
                     }
                 };
 
-                eprintln!("Primary: Sending packet...");
-                let packet = WalPacket {
-                    payload: Some(crate::pb::replication::wal_packet::Payload::FrameData(
-                        wal_frame.to_bytes(),
-                    )),
-                };
-                if let Err(e) = tx.send(Ok(packet)).await {
-                    eprintln!("Primary: Failed to send packet: {}", e);
-                    break;
+                if wal_len <= offset {
+                    sleep(Duration::from_millis(100)).await;
+                    continue;
                 }
-                eprintln!("Primary: Packet sent.");
+
+                if let Ok(meta) = std::fs::metadata(&wal_path) {
+                    let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+                    eprintln!(
+                        "Primary: streaming wal tail offset {} -> {} (len {}), mtime={:?}",
+                        offset, wal_len, wal_len, mtime
+                    );
+                }
+
+                if let Ok(mut f) = std::fs::File::open(&wal_path) {
+                    use std::io::{Seek, SeekFrom};
+                    if f.seek(SeekFrom::Start(offset)).is_err() {
+                        sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+
+                    while offset < wal_len {
+                        let frame = match WALFrame::read(&mut f, page_size) {
+                            Ok(frame) => frame,
+                            Err(e) => {
+                                eprintln!("Primary: WAL read error at offset {}: {}", offset, e);
+                                break;
+                            }
+                        };
+
+                        // Validate salt and checksum to avoid streaming partially written frames.
+                        if frame.salt1 != wal_header.salt1 || frame.salt2 != wal_header.salt2 {
+                            eprintln!("Primary: WAL salt mismatch detected, resetting stream");
+                            sent_header = false;
+                            last_checksum = None;
+                            offset = WAL_HEADER_SIZE;
+                            break;
+                        }
+
+                        let seeds = last_checksum.unwrap_or(header_seed);
+                        let frame_bytes = frame.to_bytes();
+                        let mut computed = checksum(
+                            &frame_bytes[0..8],
+                            seeds.0,
+                            seeds.1,
+                            wal_header.is_big_endian,
+                        );
+                        computed = checksum(
+                            &frame_bytes[WAL_FRAME_HEADER_SIZE as usize..],
+                            computed.0,
+                            computed.1,
+                            wal_header.is_big_endian,
+                        );
+                        if computed.0 != frame.checksum1 || computed.1 != frame.checksum2 {
+                            eprintln!(
+                                "Primary: WAL checksum mismatch at offset {}, resetting stream",
+                                offset
+                            );
+                            sent_header = false;
+                            last_checksum = None;
+                            offset = WAL_HEADER_SIZE;
+                            break;
+                        }
+
+                        last_checksum = Some(computed);
+                        offset += WAL_FRAME_HEADER_SIZE + page_size;
+                        let packet = WalPacket {
+                            payload: Some(crate::pb::replication::wal_packet::Payload::FrameData(
+                                frame_bytes,
+                            )),
+                        };
+                        if let Err(e) = tx.send(Ok(packet)).await {
+                            eprintln!("Primary: Failed to send packet: {}", e);
+                            return;
+                        }
+                    }
+                }
             }
-            eprintln!("Primary: Reader task ending");
         });
 
         eprintln!("Primary: Returning stream response");

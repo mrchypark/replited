@@ -1,9 +1,11 @@
 use std::fs::{File, OpenOptions};
+use std::io::Cursor;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use crate::error::Result;
-use crate::sqlite::{WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE, checksum};
+use crate::sqlite::{WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE, WALHeader, checksum};
 use crate::sync::replication::WalPacket;
 use crate::sync::replication::wal_packet::Payload;
 
@@ -32,10 +34,25 @@ pub struct WalWriter {
     is_big_endian: bool,
     last_checksum: (u32, u32),
     frame_count: u32,
+    last_checkpoint: Instant,
+    frames_since_checkpoint: u32,
+    schema_dirty: bool,
+    checkpoint_frame_interval: u32,
+    checkpoint_time_interval: Duration,
 }
 
 impl WalWriter {
-    pub fn new(wal_path: PathBuf, page_size: u64) -> Result<Self> {
+    pub fn new(
+        wal_path: PathBuf,
+        page_size: u64,
+        checkpoint_frame_interval: u32,
+        checkpoint_time_interval: Duration,
+    ) -> Result<Self> {
+        // Clear any stale SHM to force WAL-index recovery with the new WAL stream.
+        let db_path_str = wal_path.to_str().unwrap().trim_end_matches("-wal");
+        let shm_path = format!("{}-shm", db_path_str);
+        let _ = std::fs::remove_file(&shm_path);
+
         // Truncate the WAL file to start fresh
         let file = OpenOptions::new()
             .create(true)
@@ -45,7 +62,6 @@ impl WalWriter {
             .open(&wal_path)?;
 
         // Derive db_path from wal_path (remove -wal suffix)
-        let db_path_str = wal_path.to_str().unwrap().trim_end_matches("-wal");
         let db_path = PathBuf::from(db_path_str);
 
         Ok(Self {
@@ -60,6 +76,11 @@ impl WalWriter {
             is_big_endian: false,
             last_checksum: (0, 0),
             frame_count: 0,
+            last_checkpoint: Instant::now(),
+            frames_since_checkpoint: 0,
+            schema_dirty: false,
+            checkpoint_frame_interval,
+            checkpoint_time_interval,
         })
     }
 
@@ -77,9 +98,13 @@ impl WalWriter {
         Ok(())
     }
 
-    fn checkpoint(&mut self) -> Result<()> {
+    pub fn checkpoint(&mut self) -> Result<()> {
         // Sync file first
         self.file.sync_all()?;
+
+        // Drop SHM so SQLite rebuilds WAL index, ensuring new schema visibility.
+        let shm_path = format!("{}-shm", self.db_path.to_string_lossy());
+        let _ = std::fs::remove_file(&shm_path);
 
         if self.conn.is_none() {
             // Open connection if not exists
@@ -101,7 +126,7 @@ impl WalWriter {
     }
 
     /// Initialize WAL with a header based on incoming Primary header,
-    /// but with fresh random salts for compatibility with local database.
+    /// but keep the Primary header verbatim so checksums stay valid.
     fn initialize_wal(&mut self, primary_header: &[u8]) -> Result<()> {
         if primary_header.len() != WAL_HEADER_SIZE as usize {
             return Err(crate::error::Error::SqliteInvalidWalHeaderError(
@@ -109,53 +134,18 @@ impl WalWriter {
             ));
         }
 
-        // Parse endianness from primary header
-        let magic = &primary_header[0..4];
-        self.is_big_endian = magic == [0x37, 0x7f, 0x06, 0x83];
-
-        // Parse page size from primary header
-        let page_size = u32::from_be_bytes(primary_header[8..12].try_into().unwrap());
-        self.page_size = page_size as u64;
-
-        // Generate random salts for local WAL
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u32;
-        self.salt1 = now ^ 0xDEADBEEF;
-        self.salt2 = now.wrapping_mul(0x12345678);
-
-        // Build our own WAL header
-        let mut header = vec![0u8; WAL_HEADER_SIZE as usize];
-
-        // Magic (use same endianness as primary)
-        header[0..4].copy_from_slice(magic);
-
-        // File format version (3007000)
-        header[4..8].copy_from_slice(&0x002DE218_u32.to_be_bytes());
-
-        // Page size
-        header[8..12].copy_from_slice(&(self.page_size as u32).to_be_bytes());
-
-        // Checkpoint sequence number (start at 1)
-        header[12..16].copy_from_slice(&1_u32.to_be_bytes());
-
-        // Salt values
-        header[16..20].copy_from_slice(&self.salt1.to_be_bytes());
-        header[20..24].copy_from_slice(&self.salt2.to_be_bytes());
-
-        // Calculate checksum for header (first 24 bytes)
-        let (s1, s2) = checksum(&header[0..24], 0, 0, self.is_big_endian);
-        header[24..28].copy_from_slice(&s1.to_be_bytes());
-        header[28..32].copy_from_slice(&s2.to_be_bytes());
-
-        // Initialize last_checksum with header checksum
-        self.last_checksum = (s1, s2);
+        // Parse and validate the incoming header
+        let mut cursor = Cursor::new(primary_header);
+        let wal_header = WALHeader::read_from(&mut cursor)?;
+        self.is_big_endian = wal_header.is_big_endian;
+        self.page_size = wal_header.page_size;
+        self.salt1 = wal_header.salt1;
+        self.salt2 = wal_header.salt2;
+        self.last_checksum = checksum(&primary_header[0..24], 0, 0, self.is_big_endian);
 
         // Write header to file
         self.file.seek(SeekFrom::Start(0))?;
-        self.file.write_all(&header)?;
+        self.file.write_all(primary_header)?;
         self.file.sync_all()?;
 
         self.initialized = true;
@@ -178,56 +168,6 @@ impl WalWriter {
         Ok(())
     }
 
-    /// Re-sign a frame with local salts and proper checksums
-    fn resign_frame(&mut self, primary_frame: &[u8]) -> Result<Vec<u8>> {
-        let frame_size = (WAL_FRAME_HEADER_SIZE + self.page_size) as usize;
-        if primary_frame.len() != frame_size {
-            return Err(crate::error::Error::SqliteInvalidWalHeaderError(
-                "Invalid frame size",
-            ));
-        }
-
-        // Parse frame header from primary
-        let page_num = u32::from_be_bytes(primary_frame[0..4].try_into().unwrap());
-        let db_size = u32::from_be_bytes(primary_frame[4..8].try_into().unwrap());
-
-        // Extract page data (after 24-byte frame header)
-        let page_data = &primary_frame[WAL_FRAME_HEADER_SIZE as usize..];
-
-        // Build new frame header with local salts
-        let mut frame_header = vec![0u8; WAL_FRAME_HEADER_SIZE as usize];
-        frame_header[0..4].copy_from_slice(&page_num.to_be_bytes());
-        frame_header[4..8].copy_from_slice(&db_size.to_be_bytes());
-        frame_header[8..12].copy_from_slice(&self.salt1.to_be_bytes());
-        frame_header[12..16].copy_from_slice(&self.salt2.to_be_bytes());
-        // Checksums will be filled after calculation
-
-        // Calculate checksum: chain from last checksum
-        // Checksum covers: frame header (first 8 bytes) + page data
-        let mut checksum_data = Vec::with_capacity(8 + page_data.len());
-        checksum_data.extend_from_slice(&frame_header[0..8]);
-        checksum_data.extend_from_slice(page_data);
-
-        let (s1, s2) = checksum(
-            &checksum_data,
-            self.last_checksum.0,
-            self.last_checksum.1,
-            self.is_big_endian,
-        );
-
-        frame_header[16..20].copy_from_slice(&s1.to_be_bytes());
-        frame_header[20..24].copy_from_slice(&s2.to_be_bytes());
-
-        // Update last checksum for next frame
-        self.last_checksum = (s1, s2);
-
-        // Combine header and page data
-        let mut resigned_frame = frame_header;
-        resigned_frame.extend_from_slice(page_data);
-
-        Ok(resigned_frame)
-    }
-
     fn write_frame(&mut self, data: Vec<u8>) -> Result<()> {
         // Check if this is a WAL header (32 bytes)
         if data.len() == WAL_HEADER_SIZE as usize {
@@ -243,8 +183,13 @@ impl WalWriter {
             ));
         }
 
-        // Re-sign the frame with local salts and checksums
-        let resigned_frame = self.resign_frame(&data)?;
+        // Validate frame length before writing it verbatim
+        let expected_len = (WAL_FRAME_HEADER_SIZE + self.page_size) as usize;
+        if data.len() != expected_len {
+            return Err(crate::error::Error::SqliteInvalidWalHeaderError(
+                "Invalid frame size",
+            ));
+        }
 
         self.frame_count += 1;
 
@@ -253,18 +198,44 @@ impl WalWriter {
         println!(
             "WalWriter: Writing resigned frame #{} (len={}) at offset {}",
             self.frame_count,
-            resigned_frame.len(),
+            data.len(),
             offset
         );
 
         self.file.seek(SeekFrom::End(0))?;
-        self.file.write_all(&resigned_frame)?;
+        self.file.write_all(&data)?;
         self.file.sync_all()?;
 
         println!(
             "WalWriter: Frame written, file len now={}",
             self.file.metadata()?.len()
         );
+
+        self.frames_since_checkpoint += 1;
+
+        // Track schema changes (page 1) and commits (db_size > 0).
+        let page_num = u32::from_be_bytes(data[0..4].try_into().unwrap_or([0; 4]));
+        let db_size = u32::from_be_bytes(data[4..8].try_into().unwrap_or([0; 4]));
+        let is_commit_frame = db_size > 0;
+
+        if page_num == 1 {
+            self.schema_dirty = true;
+        }
+
+        let should_checkpoint_now = self.schema_dirty && is_commit_frame;
+
+        // Heuristic: checkpoint periodically so readers can see schema/data without restarting.
+        let periodic_checkpoint = self.frames_since_checkpoint >= self.checkpoint_frame_interval
+            || self.last_checkpoint.elapsed() >= self.checkpoint_time_interval;
+
+        if should_checkpoint_now || periodic_checkpoint {
+            self.checkpoint()?;
+            self.frames_since_checkpoint = 0;
+            self.last_checkpoint = Instant::now();
+            if should_checkpoint_now {
+                self.schema_dirty = false;
+            }
+        }
 
         Ok(())
     }

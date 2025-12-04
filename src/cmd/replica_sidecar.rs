@@ -5,9 +5,11 @@ use log::info;
 use log::warn;
 use tokio::time::sleep;
 
+use crate::base::Generation;
 use crate::config::Config;
 use crate::config::RestoreOptions;
 use crate::config::StorageParams;
+use crate::database::WalGenerationPos;
 use crate::error::Result;
 use crate::sync::stream_client::StreamClient;
 
@@ -22,35 +24,85 @@ enum ReplicaState {
 
 pub struct ReplicaSidecar {
     config: Config,
+    force_restore: bool,
 }
 
 impl ReplicaSidecar {
-    pub fn try_create(config_path: &str) -> Result<Self> {
+    pub fn try_create(config_path: &str, force_restore: bool) -> Result<Self> {
         let config = Config::load(config_path)?;
         crate::log::init_log(config.log.clone())?;
-        Ok(Self { config })
+        Ok(Self {
+            config,
+            force_restore,
+        })
     }
 
-    fn get_local_wal_state(db_path: &str) -> Result<(String, u64, u64, u64)> {
+    fn read_generation(db_path: &str) -> Generation {
+        let file_path = std::path::Path::new(db_path);
+        let db_name = file_path.file_name().and_then(|p| p.to_str()).unwrap_or("");
+        let dir_path = match file_path.parent() {
+            Some(p) if p == std::path::Path::new("") => std::path::Path::new("."),
+            Some(p) => p,
+            None => std::path::Path::new("."),
+        };
+        let meta_dir = format!(
+            "{}/.{}-replited/",
+            dir_path.to_str().unwrap_or("."),
+            db_name
+        );
+        let generation_file = std::path::Path::new(&meta_dir).join("generation");
+
+        if let Ok(content) = std::fs::read_to_string(generation_file) {
+            if let Ok(parsed) = Generation::try_create(content.trim()) {
+                return parsed;
+            }
+        }
+
+        Generation::default()
+    }
+
+    fn get_local_wal_state(db_path: &str) -> Result<(WalGenerationPos, u64)> {
         let wal_path = format!("{}-wal", db_path);
         if !Path::new(&wal_path).exists() {
-            return Ok(("".to_string(), 0, 0, 4096)); // Default if no WAL
+            return Ok((
+                WalGenerationPos {
+                    generation: Self::read_generation(db_path),
+                    index: 0,
+                    offset: 0,
+                },
+                4096,
+            ));
         }
 
         let file_len = std::fs::metadata(&wal_path)?.len();
         if file_len == 0 {
-            return Ok(("".to_string(), 0, 0, 4096));
+            return Ok((
+                WalGenerationPos {
+                    generation: Self::read_generation(db_path),
+                    index: 0,
+                    offset: 0,
+                },
+                4096,
+            ));
         }
 
         let wal_header = crate::sqlite::WALHeader::read(&wal_path)?;
         let page_size = wal_header.page_size;
 
-        Ok(("".to_string(), 0, file_len, page_size))
+        Ok((
+            WalGenerationPos {
+                generation: Self::read_generation(db_path),
+                index: 0,
+                offset: file_len,
+            },
+            page_size,
+        ))
     }
 
     pub async fn run(&mut self) -> Result<()> {
         println!("ReplicaSidecar::run start");
         let mut state = ReplicaState::Empty;
+        let mut resume_pos: Option<WalGenerationPos> = None;
         println!("ReplicaSidecar::run accessing db_config");
         let db_config = &self.config.database[0]; // FIXME: Support multiple DBs?
         let db_path = &db_config.db;
@@ -78,17 +130,18 @@ impl ReplicaSidecar {
             match state {
                 ReplicaState::Empty => {
                     let path = std::path::Path::new(db_path);
-                    let should_restore = !path.exists();
+                    let should_restore = self.force_restore || !path.exists();
                     println!(
                         "ReplicaSidecar::run Empty state, exists: {}, should_restore: {}",
                         path.exists(),
                         should_restore
                     );
                     info!(
-                        "db_path: {:?}, exists: {}, should_restore: {}",
+                        "db_path: {:?}, exists: {}, should_restore: {}, force_restore: {}",
                         path,
                         path.exists(),
-                        should_restore
+                        should_restore,
+                        self.force_restore
                     );
 
                     if !should_restore {
@@ -106,6 +159,12 @@ impl ReplicaSidecar {
                             "Local DB not found at {}. Connecting to Primary to get restore config...",
                             db_path
                         );
+
+                        if self.force_restore && path.exists() {
+                            let _ = std::fs::remove_file(db_path);
+                            let _ = std::fs::remove_file(format!("{}-wal", db_path));
+                            let _ = std::fs::remove_file(format!("{}-shm", db_path));
+                        }
 
                         match StreamClient::connect(stream_config.addr.clone()).await {
                             Ok(client) => {
@@ -126,18 +185,26 @@ impl ReplicaSidecar {
                                             timestamp: "".to_string(),
                                         };
 
-                                        if let Err(e) = crate::sync::run_restore(
+                                        match crate::sync::run_restore(
                                             &restore_db_config,
                                             &restore_options,
                                         )
                                         .await
                                         {
-                                            warn!("Restore failed: {}. Retrying in 5s...", e);
-                                            sleep(Duration::from_secs(5)).await;
-                                            continue;
+                                            Ok(pos) => {
+                                                resume_pos = pos;
+                                                info!(
+                                                    "Bootstrap finished. Switching to Stream mode. resume_pos={:?}",
+                                                    resume_pos
+                                                );
+                                                state = ReplicaState::Streaming;
+                                            }
+                                            Err(e) => {
+                                                warn!("Restore failed: {}. Retrying in 5s...", e);
+                                                sleep(Duration::from_secs(5)).await;
+                                                continue;
+                                            }
                                         }
-                                        info!("Bootstrap finished. Switching to Stream mode.");
-                                        state = ReplicaState::Streaming;
                                     }
                                     Err(e) => {
                                         warn!(
@@ -161,18 +228,32 @@ impl ReplicaSidecar {
                 }
                 ReplicaState::Streaming => {
                     // 1. Get current position
-                    let (generation, index, offset, page_size) =
-                        Self::get_local_wal_state(db_path)?;
-                    info!("Resuming replication from offset: {}", offset);
+                    let (pos, page_size) = if let Some(p) = resume_pos.take() {
+                        let wal_page_size =
+                            crate::sqlite::WALHeader::read(&format!("{}-wal", db_path))
+                                .map(|h| h.page_size)
+                                .unwrap_or(4096);
+                        (p, wal_page_size)
+                    } else {
+                        Self::get_local_wal_state(db_path)?
+                    };
+
+                    info!(
+                        "Resuming replication from generation={}, index={}, offset={}, force_restore={}",
+                        pos.generation.as_str(),
+                        pos.index,
+                        pos.offset,
+                        self.force_restore
+                    );
 
                     info!("Connecting to Primary at {}", stream_config.addr);
                     match StreamClient::connect(stream_config.addr.clone()).await {
                         Ok(client) => {
                             let handshake = Handshake {
                                 db_name: db_config.db.clone(),
-                                generation,
-                                offset,
-                                index,
+                                generation: pos.generation.as_str().to_string(),
+                                offset: pos.offset,
+                                index: pos.index,
                             };
 
                             match client.stream_wal(handshake).await {
@@ -182,8 +263,13 @@ impl ReplicaSidecar {
                                     let mut writer = crate::sync::WalWriter::new(
                                         std::path::PathBuf::from(wal_path),
                                         page_size,
+                                        db_config.apply_checkpoint_frame_interval,
+                                        std::time::Duration::from_millis(
+                                            db_config.apply_checkpoint_interval_ms,
+                                        ),
                                     )?;
                                     eprintln!("Replica: WalWriter created.");
+                                    let mut timeout_streak = 0usize;
 
                                     loop {
                                         eprintln!("Replica: Waiting for message...");
@@ -196,26 +282,59 @@ impl ReplicaSidecar {
                                             Ok(Ok(Some(p))) => {
                                                 eprintln!("Replica: Received WAL packet");
                                                 info!("Received WAL packet");
+                                                timeout_streak = 0;
                                                 p
                                             }
                                             Ok(Ok(None)) => {
                                                 eprintln!("Replica: Stream ended");
+                                                if let Err(e) = writer.checkpoint() {
+                                                    warn!(
+                                                        "Checkpoint after stream end failed: {}",
+                                                        e
+                                                    );
+                                                }
                                                 break;
                                             }
                                             Ok(Err(e)) => {
                                                 eprintln!("Replica: Stream error: {}", e);
                                                 warn!("Stream error: {}", e);
+                                                if let Err(e) = writer.checkpoint() {
+                                                    warn!(
+                                                        "Checkpoint after stream error failed: {}",
+                                                        e
+                                                    );
+                                                }
                                                 break;
                                             }
                                             Err(_) => {
                                                 eprintln!("Replica: Stream timeout");
                                                 warn!("Stream timeout");
+                                                timeout_streak += 1;
+                                                if timeout_streak >= 5 {
+                                                    if let Err(e) = writer.checkpoint() {
+                                                        warn!(
+                                                            "Checkpoint after timeouts failed: {}",
+                                                            e
+                                                        );
+                                                    }
+                                                    timeout_streak = 0;
+                                                }
+                                                if timeout_streak >= 10 {
+                                                    // Force reconnect to catch up if Primary stopped sending.
+                                                    break;
+                                                }
                                                 continue;
                                             }
                                         };
 
                                         if let Err(e) = writer.apply(packet) {
                                             warn!("Failed to write WAL packet: {}", e);
+                                            if let Err(e) = writer.checkpoint() {
+                                                warn!(
+                                                    "Checkpoint after write failure failed: {}",
+                                                    e
+                                                );
+                                            }
                                             break;
                                         }
                                     }
