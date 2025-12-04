@@ -1,0 +1,17 @@
+# Runtime artifacts
+data.db*
+snapshot.db*
+replica.db*
+test.db*
+*.log
+logs/
+backup/
+replica_cwd/
+replica_logs/
+.data.db-replited/
+.test*/
+
+# Python
+__pycache__/
+*.pyc
+venv/

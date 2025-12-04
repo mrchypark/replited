@@ -29,6 +29,7 @@ pub fn init_operator(cfg: &StorageParams) -> Result<Operator> {
         StorageParams::Ftp(cfg) => build_operator(init_ftp_operator(cfg)?)?,
         StorageParams::Gcs(cfg) => build_operator(init_gcs_operator(cfg)?)?,
         StorageParams::S3(cfg) => build_operator(init_s3_operator(cfg)?)?,
+        StorageParams::Stream(_) => build_operator(services::Memory::default())?,
     };
 
     Ok(op)
@@ -120,9 +121,10 @@ fn new_storage_http_client() -> Result<HttpClient> {
 
     // Enable TCP keepalive if set.
     if let Ok(v) = env::var("_LITESYNC_INTERNAL_TCP_KEEPALIVE")
-        && let Ok(v) = v.parse::<u64>() {
-            builder = builder.tcp_keepalive(Duration::from_secs(v));
-        }
+        && let Ok(v) = v.parse::<u64>()
+    {
+        builder = builder.tcp_keepalive(Duration::from_secs(v));
+    }
 
     Ok(HttpClient::build(builder)?)
 }

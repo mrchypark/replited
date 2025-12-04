@@ -51,7 +51,7 @@ pub struct Replicate {
 }
 
 impl Replicate {
-    pub fn new(
+    pub async fn new(
         config: StorageConfig,
         db: String,
         index: usize,
@@ -167,7 +167,8 @@ impl Replicate {
     }
 
     async fn sync_wal(&mut self) -> Result<()> {
-        let mut reader = ShadowWalReader::try_create(self.position(), &self.info)?;
+        let pos = self.position();
+        let mut reader = ShadowWalReader::try_create(pos, &self.info)?;
 
         // Obtain initial position from shadow reader.
         // It may have moved to the next index if previous position was at the end.

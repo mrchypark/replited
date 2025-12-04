@@ -17,3 +17,4 @@ target/
 test.db
 .test_continuous/
 .test_battle/
+.test_env/

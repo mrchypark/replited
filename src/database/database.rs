@@ -88,7 +88,7 @@ pub struct Database {
     tx_connection: Option<Connection>,
 
     // for sync
-    sync_notifiers: Vec<Sender<ReplicateCommand>>,
+    sync_notifiers: Vec<Option<Sender<ReplicateCommand>>>,
     sync_handle: Vec<JoinHandle<()>>,
     syncs: Vec<Replicate>,
 }
@@ -220,26 +220,47 @@ impl Database {
     fn init_directory(config: &DbConfig) -> Result<String> {
         let file_path = PathBuf::from(&config.db);
         let db_name = file_path.file_name().unwrap().to_str().unwrap();
-        let dir_path = file_path.parent().unwrap_or_else(|| Path::new("."));
+        let dir_path = match file_path.parent() {
+            Some(p) if p == Path::new("") => Path::new("."),
+            Some(p) => p,
+            None => Path::new("."),
+        };
         let meta_dir = format!("{}/.{}-replited/", dir_path.to_str().unwrap(), db_name,);
-        fs::create_dir_all(&meta_dir)?;
+
+        let abs_meta_dir = if Path::new(&meta_dir).is_absolute() {
+            PathBuf::from(&meta_dir)
+        } else {
+            std::env::current_dir()?.join(&meta_dir)
+        };
+
+        info!("Creating meta dir at: {:?}", abs_meta_dir);
+        fs::create_dir_all(&abs_meta_dir)?;
 
         Ok(meta_dir)
     }
 
-    fn try_create(config: DbConfig) -> Result<(Self, Receiver<DbCommand>)> {
+    async fn try_create(config: DbConfig) -> Result<(Self, Receiver<DbCommand>)> {
         info!("start database with config: {:?}\n", config);
+        info!("CWD: {:?}", std::env::current_dir());
+        info!("Opening connection to {}", config.db);
+        println!("Database::try_create opening connection");
         let connection = Connection::open(&config.db)?;
+        println!("Database::try_create connection opened");
 
+        info!("Initializing params");
         Database::init_params(&config.db, &connection)?;
 
+        info!("Creating internal tables");
         Database::create_internal_tables(&connection)?;
 
         let page_size = connection.pragma_query_value(None, "page_size", |row| row.get(0))?;
         let wal_file = format!("{}-wal", config.db);
 
         // init path
+        info!("Initializing directory");
+        println!("Database::try_create init directory");
         let meta_dir = Database::init_directory(&config)?;
+        println!("Database::try_create meta_dir: {}", meta_dir);
 
         // init replicate
         let (db_notifier, db_receiver) = mpsc::channel(16);
@@ -257,6 +278,11 @@ impl Database {
             .unwrap()
             .to_string();
         for (index, replicate) in config.replicate.iter().enumerate() {
+            if let crate::config::StorageParams::Stream(_) = replicate.params {
+                sync_notifiers.push(None);
+                continue;
+            }
+            info!("Initializing replicate {}", index);
             let (sync_notifier, sync_receiver) = mpsc::channel(16);
             let s = Replicate::new(
                 replicate.clone(),
@@ -264,11 +290,12 @@ impl Database {
                 index,
                 db_notifier.clone(),
                 info.clone(),
-            )?;
+            )
+            .await?;
             syncs.push(s.clone());
             let h = Replicate::start(s, sync_receiver)?;
             sync_handle.push(h);
-            sync_notifiers.push(sync_notifier);
+            sync_notifiers.push(Some(sync_notifier));
         }
 
         let mut db = Self {
@@ -283,6 +310,7 @@ impl Database {
             syncs,
         };
 
+        info!("Acquiring read lock");
         db.acquire_read_lock()?;
 
         // If we have an existing shadow WAL, ensure the headers match.
@@ -440,9 +468,11 @@ impl Database {
         // notify the database has been changed
         if changed {
             let generation_pos = self.wal_generation_position()?;
-            self.sync_notifiers[0]
-                .send(ReplicateCommand::DbChanged(generation_pos))
-                .await?;
+            if let Some(notifier) = &self.sync_notifiers[0] {
+                notifier
+                    .send(ReplicateCommand::DbChanged(generation_pos))
+                    .await?;
+            }
         }
 
         debug!("sync db {} ok", self.config.db);
@@ -613,8 +643,8 @@ impl Database {
         if min == 0 {
             return Ok(());
         }
-        // Keep an extra WAL file.
-        min -= 1;
+        // Keep retained WAL files.
+        min = min.saturating_sub(self.config.wal_retention_count);
 
         // Remove all WAL files for the generation before the lowest index.
         let dir = shadow_wal_dir(&self.meta_dir, generation.as_str());
@@ -1110,12 +1140,14 @@ impl Database {
             compressed_data.len(),
             generation_pos
         );
-        self.sync_notifiers[index]
-            .send(ReplicateCommand::Snapshot((
-                generation_pos,
-                compressed_data,
-            )))
-            .await?;
+        if let Some(notifier) = &self.sync_notifiers[index] {
+            notifier
+                .send(ReplicateCommand::Snapshot((
+                    generation_pos,
+                    compressed_data,
+                )))
+                .await?;
+        }
         Ok(())
     }
 }
@@ -1127,7 +1159,7 @@ impl Drop for Database {
 }
 
 pub async fn run_database(config: DbConfig) -> Result<()> {
-    let (mut database, mut db_receiver) = match Database::try_create(config.clone()) {
+    let (mut database, mut db_receiver) = match Database::try_create(config.clone()).await {
         Ok((db, receiver)) => (db, receiver),
         Err(e) => {
             error!("run_database for {:?} error: {:?}", config, e);

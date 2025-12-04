@@ -49,7 +49,7 @@ impl ShadowWalReader {
         }
     }
 
-    fn new(pos: WalGenerationPos, info: &DatabaseInfo) -> Result<ShadowWalReader> {
+    pub fn new(pos: WalGenerationPos, info: &DatabaseInfo) -> Result<ShadowWalReader> {
         let file_name = shadow_wal_file(&info.meta_dir, pos.generation.as_str(), pos.index);
         let mut file = OpenOptions::new().read(true).open(file_name)?;
         let size = align_frame(info.page_size, file.metadata()?.size());
@@ -73,6 +73,10 @@ impl ShadowWalReader {
 
     pub fn position(&self) -> WalGenerationPos {
         self.position.clone()
+    }
+
+    pub fn left(&self) -> u64 {
+        self.left
     }
 }
 

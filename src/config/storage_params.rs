@@ -16,6 +16,8 @@ pub enum StorageParams {
     Ftp(Box<StorageFtpConfig>),
     Gcs(Box<StorageGcsConfig>),
     S3(Box<StorageS3Config>),
+    #[serde(rename = "stream")]
+    Stream(Box<StorageStreamConfig>),
 }
 
 impl StorageParams {
@@ -26,6 +28,7 @@ impl StorageParams {
             StorageParams::Ftp(s) => s.root.clone(),
             StorageParams::Gcs(s) => s.root.clone(),
             StorageParams::S3(s) => s.root.clone(),
+            StorageParams::Stream(_) => "".to_string(),
         }
     }
 }
@@ -55,6 +58,21 @@ impl Display for StorageParams {
                     v.bucket, v.root, v.endpoint
                 )
             }
+            StorageParams::Stream(v) => write!(f, "stream | addr={}", v.addr),
+        }
+    }
+}
+
+/// Config for storage backend stream.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageStreamConfig {
+    pub addr: String,
+}
+
+impl Default for StorageStreamConfig {
+    fn default() -> Self {
+        Self {
+            addr: "http://127.0.0.1:50051".to_string(),
         }
     }
 }

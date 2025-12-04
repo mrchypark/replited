@@ -80,6 +80,10 @@ impl Restore {
     ) -> Result<()> {
         let compressed_data = client.read_snapshot(snapshot).await?;
         let decompressed_data = decompressed_data(compressed_data)?;
+        println!(
+            "restore_snapshot: decompressed data size: {}",
+            decompressed_data.len()
+        );
 
         // Clean up existing WAL and SHM files to prevent corruption
         let wal_path = format!("{}-wal", path);
@@ -389,7 +393,6 @@ impl Restore {
         };
 
         let mut last_index = 0;
-        let mut last_offset = 0;
         let mut resume = false;
 
         if self.options.follow && fs::exists(&target_path)? {
@@ -463,13 +466,13 @@ impl Restore {
                 &latest_restore_info.snapshot,
                 &latest_restore_info.wal_segments,
                 &target_path,
-                0, // Force full WAL reconstruction from offset 0
+                last_index,
                 self.options.follow,
             )
             .await?;
 
         last_index = new_last_index;
-        last_offset = new_last_offset;
+        let last_offset = new_last_offset;
 
         // If follow mode, ensure we have a keepalive connection (either returned or new)
         let _keepalive_connection = if self.options.follow {

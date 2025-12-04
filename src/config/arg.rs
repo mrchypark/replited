@@ -17,6 +17,7 @@ pub struct Arg {
 #[derive(Subcommand, Clone, Debug)]
 pub enum ArgCommand {
     Replicate,
+    ReplicaSidecar,
 
     Restore(RestoreOptions),
 }

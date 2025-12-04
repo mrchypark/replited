@@ -201,12 +201,14 @@ impl StorageClient {
     async fn max_snapshot(&self, generation: &str) -> Result<Option<SnapshotInfo>> {
         let generation = Generation::try_create(generation)?;
         let snapshots_dir = snapshots_dir(&self.db_name, generation.as_str());
+        debug!("max_snapshot: listing snapshots in {}", snapshots_dir);
         let entries = self
             .operator
             .list_with(&snapshots_dir)
             .metakey(Metakey::ContentLength)
             .metakey(Metakey::LastModified)
             .await?;
+        debug!("max_snapshot: found {} entries", entries.len());
 
         let mut snapshot = None;
         let mut max_index = None;
@@ -348,7 +350,9 @@ impl StorageClient {
 
     pub async fn restore_info(&self, limit: Option<DateTime<Utc>>) -> Result<Option<RestoreInfo>> {
         let dir = remote_generations_dir(&self.db_name);
+        debug!("restore_info: listing generations in {}", dir);
         let entries = self.operator.list(&dir).await?;
+        debug!("restore_info: found {} entries", entries.len());
 
         let mut entry_with_generation = Vec::with_capacity(entries.len());
         for entry in entries {

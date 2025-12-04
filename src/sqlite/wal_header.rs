@@ -79,4 +79,8 @@ impl WALHeader {
 
         Self::read_from(&mut file)
     }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.data.clone()
+    }
 }

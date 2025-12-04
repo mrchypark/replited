@@ -62,6 +62,7 @@ build_error! {
     StoragePermissionDenied(52),
     StorageOther(53),
     InvalidPath(54),
+    StorageError(55),
 
     // database error
     SpawnDatabaseTaskError(80),

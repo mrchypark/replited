@@ -7,6 +7,7 @@ mod config;
 mod database;
 mod error;
 mod log;
+mod pb;
 mod sqlite;
 mod storage;
 mod sync;

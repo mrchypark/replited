@@ -39,4 +39,25 @@ impl WALFrame {
             checksum2,
         })
     }
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(self.data.len());
+        bytes.extend_from_slice(&self.page_num.to_be_bytes());
+        bytes.extend_from_slice(&self.db_size.to_be_bytes());
+        bytes.extend_from_slice(&self.salt1.to_be_bytes());
+        bytes.extend_from_slice(&self.salt2.to_be_bytes());
+        bytes.extend_from_slice(&self.checksum1.to_be_bytes());
+        bytes.extend_from_slice(&self.checksum2.to_be_bytes());
+        // The data field in WALFrame already includes the header space (WAL_FRAME_HEADER_SIZE)
+        // but read_exact read the header + page data into it.
+        // Wait, let's look at read() again.
+        // reader.read_exact(&mut data)?;
+        // data size is WAL_FRAME_HEADER_SIZE + page_size.
+        // So self.data contains the raw bytes of the frame including the header.
+        // However, the header fields are parsed from it.
+        // If we want to send the raw frame as it appears on disk, we can just return self.data.
+        // But wait, the parsed fields might be useful if we were constructing it, but here we are reading it.
+        // The read method reads the raw bytes into `data`.
+        // So `data` holds the exact on-disk representation.
+        self.data.clone()
+    }
 }

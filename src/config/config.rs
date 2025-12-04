@@ -5,6 +5,7 @@ use std::fmt::Formatter;
 use std::fs;
 
 use serde::Deserialize;
+use serde::Serialize;
 
 use super::StorageParams;
 use crate::error::Error;
@@ -14,8 +15,9 @@ const DEFAULT_MIN_CHECKPOINT_PAGE_NUMBER: u64 = 1000;
 const DEFAULT_MAX_CHECKPOINT_PAGE_NUMBER: u64 = 10000;
 const DEFAULT_TRUNCATE_PAGE_NUMBER: u64 = 500000;
 const DEFAULT_CHECKPOINT_INTERVAL_SECS: u64 = 60;
+const DEFAULT_WAL_RETENTION_COUNT: u64 = 10;
 
-#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     pub log: LogConfig,
 
@@ -62,13 +64,13 @@ impl Config {
 }
 
 /// Config for logging.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogConfig {
     pub level: LogLevel,
     pub dir: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LogLevel {
     Off,
     Error,
@@ -93,7 +95,7 @@ impl Display for LogConfig {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DbConfig {
     // db file full path
     pub db: String,
@@ -132,6 +134,11 @@ pub struct DbConfig {
     // better precision.
     #[serde(default = "default_checkpoint_interval_secs")]
     pub checkpoint_interval_secs: u64,
+
+    // Number of WAL files to retain in the local filesystem after replication.
+    // This allows for gap filling when a replica reconnects.
+    #[serde(default = "default_wal_retention_count")]
+    pub wal_retention_count: u64,
 }
 
 fn default_min_checkpoint_page_number() -> u64 {
@@ -150,6 +157,10 @@ fn default_checkpoint_interval_secs() -> u64 {
     DEFAULT_CHECKPOINT_INTERVAL_SECS
 }
 
+fn default_wal_retention_count() -> u64 {
+    DEFAULT_WAL_RETENTION_COUNT
+}
+
 impl Debug for DbConfig {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         f.debug_struct("ReplicateDbConfig")
@@ -165,6 +176,7 @@ impl Debug for DbConfig {
             )
             .field("truncate_page_number", &self.truncate_page_number)
             .field("checkpoint_interval_secs", &self.checkpoint_interval_secs)
+            .field("wal_retention_count", &self.wal_retention_count)
             .finish()
     }
 }
@@ -192,7 +204,7 @@ impl DbConfig {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageConfig {
     pub name: String,
     pub params: StorageParams,
