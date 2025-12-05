@@ -1,0 +1,36 @@
+name: Fuzzing
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup environment
+        uses: ./.github/actions/setup
+
+      - name: Install Rust Nightly
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+
+      - name: Fuzz Checksum
+        run: cargo +nightly fuzz run checksum -- -max_total_time=30
+
+      - name: Fuzz WAL Parser
+        run: cargo +nightly fuzz run wal_parser -- -max_total_time=30
+
+      - name: Fuzz Decompress
+        run: cargo +nightly fuzz run decompress -- -max_total_time=30
+
+      - name: Fuzz Path Parser
+        run: cargo +nightly fuzz run path_parser -- -max_total_time=30
