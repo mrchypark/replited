@@ -31,10 +31,6 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
             name: darwin-arm64
-          # Windows
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            name: windows-amd64
 
     runs-on: ${{ matrix.os }}
 
@@ -60,32 +56,28 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install protobuf
 
-      - name: Install protoc (Windows)
-        if: runner.os == 'Windows'
-        run: choco install protoc
-
       - name: Install cross-compilation tools (Linux ARM64)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
-          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libsqlite3-dev:arm64
+          sudo dpkg --add-architecture arm64
+          sudo sed -i 's/^deb /deb [arch=amd64] /' /etc/apt/sources.list
+          echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports $(lsb_release -cs) main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list
+          echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports $(lsb_release -cs)-updates main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev:arm64
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+          echo "PKG_CONFIG_SYSROOT_DIR=/usr/aarch64-linux-gnu" >> $GITHUB_ENV
+          echo "PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig" >> $GITHUB_ENV
 
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Prepare artifact (Unix)
-        if: runner.os != 'Windows'
+      - name: Prepare artifact
         run: |
           mkdir -p dist
           cp target/${{ matrix.target }}/release/replited dist/replited-${{ matrix.name }}
           chmod +x dist/replited-${{ matrix.name }}
-
-      - name: Prepare artifact (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path dist
-          Copy-Item "target/${{ matrix.target }}/release/replited.exe" "dist/replited-${{ matrix.name }}.exe"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
