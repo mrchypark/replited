@@ -5,6 +5,7 @@ package replication;
 service Replication {
   rpc StreamWal(Handshake) returns (stream WalPacket);
   rpc GetRestoreConfig(RestoreRequest) returns (RestoreConfig);
+  rpc StreamSnapshot(SnapshotRequest) returns (stream SnapshotResponse);
 }
 
 message RestoreRequest {
@@ -29,12 +30,32 @@ message Handshake {
   uint64 index = 4;
 }
 
-
-
 message Checkpoint {
   uint32 index = 1;
 }
 
 message Ack {
   bool success = 1;
+}
+
+message SnapshotRequest {
+  string db_name = 1;
+}
+
+message SnapshotResponse {
+  oneof payload {
+    bytes chunk = 1;
+    SnapshotError error = 2;
+  }
+}
+
+message SnapshotError {
+  enum Code {
+    UNKNOWN = 0;
+    BUSY = 1;
+    NOT_FOUND = 2;
+  }
+  Code code = 1;
+  string message = 2;
+  uint32 retry_after_ms = 3;
 }

@@ -40,6 +40,7 @@ See config sample in [sample.toml](./etc/sample.toml)
 | checkpoint_interval_secs | seconds between background checkpoints on primary |
 | apply_checkpoint_frame_interval | **replica-side**: WAL frames to buffer before checkpoint (default 128) |
 | apply_checkpoint_interval_ms | **replica-side**: max milliseconds between checkpoints (default 2000) |
+| max_concurrent_snapshots | max concurrent snapshot streams allowed (default 10) |
 
 ### Replicate Config
 | item  |  value    |
@@ -92,3 +93,11 @@ See config sample in [sample.toml](./etc/sample.toml)
 | params.access_key_id | access_key_id of this backend. |
 | params.secret_access_key | secret_access_key of this backend. |
 | params.root | root of this backend. |
+
+#### Stream Params
+| item  |  value    |
+| :---- | ---- |
+| params.type | "Stream" |
+| params.addr | gRPC server address (e.g., "0.0.0.0:50051" for server, "http://127.0.0.1:50051" for client) |
+
+**Note**: Stream replication does not require a storage backend (fs, s3, etc.) for initial snapshot restore. The replica can stream the snapshot directly from the primary.

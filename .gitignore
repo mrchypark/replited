@@ -18,3 +18,18 @@ test.db
 .test_continuous/
 .test_battle/
 .test_env/
+
+# Database files
+*.db
+*.db-shm
+*.db-wal
+*.db-replited/
+
+# Test artifacts
+tests/battle/logs/
+tests/battle/replica_*/
+tests/battle/backup/
+tests/battle/*.toml
+tests/battle/primary.db*
+tests/benchmarks/results/
+*.zst

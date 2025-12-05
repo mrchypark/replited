@@ -63,41 +63,13 @@ def cleanup():
 
 
 
-def create_snapshot(db_path: str, generation: str) -> bool:
-    """Create an initial snapshot for replica restore.
-    
-    Stream replication requires a snapshot in storage backend for initial restore.
-    This creates a compressed snapshot in the backup directory.
-    """
-    import subprocess
-    
-    # Checkpoint to flush WAL to DB
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-    cursor.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-    conn.close()
-    
-    # Create snapshot directory structure
-    snapshot_dir = Path(f"backup/{db_path}/generations/{generation}/snapshots")
-    snapshot_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Create compressed snapshot using lz4
-    snapshot_path = snapshot_dir / "0000000001_0000000000.snapshot.lz4"
-    try:
-        subprocess.check_call(["lz4", "-f", db_path, str(snapshot_path)], 
-                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        print(f"  Created snapshot at {snapshot_path}")
-        return True
-    except (subprocess.CalledProcessError, FileNotFoundError) as e:
-        print(f"  Warning: Failed to create snapshot: {e}")
-        return False
 
 
-def create_replica(replica_id: int, backup_abs_path: str, port: int = 50051) -> tuple:
+
+def create_replica(replica_id: int, port: int = 50051) -> tuple:
     """Create and start a replica in a separate directory.
     
-    Replica runs in its own directory but can access Primary's backup
-    via absolute path for snapshot restore.
+    Replica runs in its own directory and uses Direct Snapshot Streaming.
     """
     replica_cwd = Path(f"replica_{replica_id}")
     replica_cwd.mkdir(exist_ok=True)
@@ -116,13 +88,6 @@ max_checkpoint_page_number = 1000
 truncate_page_number = 50000
 checkpoint_interval_secs = 30
 wal_retention_count = 5
-
-# Storage backend with absolute path to access Primary's backup
-[[database.replicate]]
-name = "backup"
-[database.replicate.params]
-type = "fs"
-root = "{backup_abs_path}"
 
 [[database.replicate]]
 name = "stream-client"
@@ -185,8 +150,7 @@ def run_multi_replica_test(
         sync_differences=[],
         duration_seconds=0
     )
-    # Create Primary config with absolute backup path
-    backup_abs_path = str(Path("backup").resolve())
+    # Create Primary config (No storage backend!)
     primary_config = f"""
 [log]
 level = "Info"
@@ -199,12 +163,7 @@ max_checkpoint_page_number = 1000
 truncate_page_number = 50000
 checkpoint_interval_secs = 30
 wal_retention_count = 5
-
-[[database.replicate]]
-name = "backup"
-[database.replicate.params]
-type = "fs"
-root = "{backup_abs_path}"
+max_concurrent_snapshots = 5
 
 [[database.replicate]]
 name = "stream-server"
@@ -244,28 +203,15 @@ addr = "http://0.0.0.0:50051"
     conn.close()  # Close connection to allow checkpoint
     time.sleep(1)
     
-    # Read generation from Primary's metadata
-    gen_file = Path(".primary.db-replited/generation")
-    if gen_file.exists():
-        generation = gen_file.read_text().strip()
-    else:
-        generation = "00000000"  # Default if not created yet
-    
-    # Create snapshot for replica restore (required for stream replication)
-    print(f"\nCreating snapshot (generation: {generation})...")
-    if not create_snapshot("primary.db", generation):
-        print("Warning: Could not create snapshot. Replica restore may fail.")
-    
     # Reopen connection for writing
     conn = sqlite3.connect("primary.db")
     cursor = conn.cursor()
-    
-    # Start replicas with absolute backup path
+
+    # Start replicas
     print(f"\nStarting {num_replicas} replicas...")
-    backup_abs_path = str(Path("backup").resolve())
     replicas = []
     for i in range(num_replicas):
-        proc, cwd, log = create_replica(i, backup_abs_path)
+        proc, cwd, log = create_replica(i)
         replicas.append((proc, cwd, log))
         print(f"  Replica {i} started")
     

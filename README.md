@@ -78,15 +78,19 @@ command options:
 * `output`: which path will restored db saved
 
 ### Stream (primary + replica)
-- Primary: add a stream replicate target in config (`params.type = "stream"`, `addr = "127.0.0.1:50051"`) and run:
-  ```
+- **Primary**: Add a stream replicate target in config (`params.type = "stream"`, `addr = "0.0.0.0:50051"`).
+  ```bash
   replited --config primary.toml replicate
   ```
-- Replica: point to the primary stream endpoint in the replica config (`params.type = "stream"`, `addr = "http://127.0.0.1:50051"`) and run:
-  ```
+- **Replica**: Point to the primary stream endpoint in the replica config (`params.type = "stream"`, `addr = "http://127.0.0.1:50051"`).
+  ```bash
   replited --config replica.toml replica-sidecar --force-restore
   ```
-  The sidecar fetches the restore config, downloads the latest snapshot, then continuously applies streamed WAL frames. Schema changes are surfaced without restart thanks to automatic checkpoints and SHM rebuilds.
+  The sidecar will automatically:
+  1. Download the latest snapshot directly from the Primary (Direct Snapshot Streaming).
+  2. Switch to WAL streaming mode to apply real-time updates.
+  
+  **Note**: Direct Snapshot Streaming uses `zstd` for compression and does not require a shared storage backend.
 
 ## Stargazers over time
 [![Stargazers over time](https://starchart.cc/lichuang/replited.svg?variant=adaptive)](https://starchart.cc/lichuang/replited)

@@ -1,6 +1,6 @@
 [package]
 name = "replited"
-version = "0.2.8"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Replicate SQLite Daemon"
@@ -44,6 +44,7 @@ uuid = { version = "1.10.0", features = ["v7"] }
 tonic = "0.11"
 prost = "0.12"
 tokio-stream = "0.1"
+zstd = "0.13.3"
 
 [build-dependencies]
 tonic-build = "0.11"

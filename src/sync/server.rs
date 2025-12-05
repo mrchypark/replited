@@ -9,27 +9,43 @@ use tonic::{Request, Response, Status};
 
 use crate::config::{Config, DbConfig};
 use crate::pb::replication::replication_server::Replication;
-use crate::pb::replication::{Handshake, RestoreConfig, RestoreRequest, WalPacket};
+use crate::pb::replication::snapshot_error::Code;
+use crate::pb::replication::snapshot_response::Payload;
+use crate::pb::replication::{
+    Handshake, RestoreConfig, RestoreRequest, SnapshotError, SnapshotRequest, SnapshotResponse,
+    WalPacket,
+};
 use crate::sqlite::{
     WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE, WALFrame, WALHeader, align_frame, checksum,
 };
 
+use std::sync::Arc;
+use tokio::sync::Semaphore;
+
 pub struct ReplicationServer {
     db_paths: HashMap<String, PathBuf>,
     db_configs: HashMap<String, DbConfig>,
+    snapshot_semaphores: HashMap<String, Arc<Semaphore>>,
 }
 
 impl ReplicationServer {
     pub fn new(config: Config) -> Self {
         let mut db_paths = HashMap::new();
         let mut db_configs = HashMap::new();
+        let mut snapshot_semaphores = HashMap::new();
+
         for db in config.database {
             db_paths.insert(db.db.clone(), PathBuf::from(&db.db));
+            snapshot_semaphores.insert(
+                db.db.clone(),
+                Arc::new(Semaphore::new(db.max_concurrent_snapshots)),
+            );
             db_configs.insert(db.db.clone(), db);
         }
         Self {
             db_paths,
             db_configs,
+            snapshot_semaphores,
         }
     }
 }
@@ -219,6 +235,122 @@ impl Replication for ReplicationServer {
         });
 
         eprintln!("Primary: Returning stream response");
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
+    type StreamSnapshotStream = ReceiverStream<Result<SnapshotResponse, Status>>;
+
+    async fn stream_snapshot(
+        &self,
+        request: Request<SnapshotRequest>,
+    ) -> Result<Response<Self::StreamSnapshotStream>, Status> {
+        let req = request.into_inner();
+        let db_name = req.db_name.clone();
+
+        let semaphore = self
+            .snapshot_semaphores
+            .get(&db_name)
+            .ok_or_else(|| Status::not_found(format!("Database {} not found", db_name)))?
+            .clone();
+
+        let db_path = self
+            .db_paths
+            .get(&db_name)
+            .ok_or_else(|| Status::not_found(format!("Database {} not found", db_name)))?
+            .clone();
+
+        // Try acquire permit
+        let permit = match semaphore.try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                let (tx, rx) = mpsc::channel(1);
+                let _ = tx
+                    .send(Ok(SnapshotResponse {
+                        payload: Some(Payload::Error(SnapshotError {
+                            code: Code::Busy as i32,
+                            message: "Too many concurrent snapshots".to_string(),
+                            retry_after_ms: 1000,
+                        })),
+                    }))
+                    .await;
+                return Ok(Response::new(ReceiverStream::new(rx)));
+            }
+        };
+
+        let (tx, rx) = mpsc::channel(10);
+
+        tokio::spawn(async move {
+            let _permit = permit; // Hold permit until task finishes
+
+            // 1. Checkpoint (TRUNCATE) to flush WAL to DB
+            {
+                match rusqlite::Connection::open(&db_path) {
+                    Ok(conn) => {
+                        if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
+                            eprintln!("Primary: Checkpoint failed: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("Primary: Failed to open DB for checkpoint: {}", e);
+                    }
+                }
+            }
+
+            // 2. Create temp snapshot file (lz4)
+            let timestamp = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let snapshot_path = std::env::temp_dir().join(format!("snapshot_{}.zst", timestamp));
+
+            let compression_result = (|| -> std::io::Result<()> {
+                let mut source = std::fs::File::open(&db_path)?;
+                let mut target = std::fs::File::create(&snapshot_path)?;
+                zstd::stream::copy_encode(&mut source, &mut target, 3)?;
+                Ok(())
+            })();
+
+            match compression_result {
+                Ok(_) => {
+                    // 3. Stream file
+                    match std::fs::File::open(&snapshot_path) {
+                        Ok(mut f) => {
+                            let mut buffer = vec![0u8; 1024 * 1024]; // 1MB chunk
+                            loop {
+                                use std::io::Read;
+                                match f.read(&mut buffer) {
+                                    Ok(0) => break, // EOF
+                                    Ok(n) => {
+                                        let chunk = buffer[0..n].to_vec();
+                                        if let Err(_) = tx
+                                            .send(Ok(SnapshotResponse {
+                                                payload: Some(Payload::Chunk(chunk)),
+                                            }))
+                                            .await
+                                        {
+                                            break; // Receiver dropped
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Primary: Failed to read snapshot file: {}", e);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Primary: Failed to open snapshot file: {}", e);
+                        }
+                    }
+                    // Cleanup
+                    let _ = std::fs::remove_file(snapshot_path);
+                }
+                Err(e) => {
+                    eprintln!("Primary: zstd compression failed: {}", e);
+                }
+            }
+        });
+
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 }

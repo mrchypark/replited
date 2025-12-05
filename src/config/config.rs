@@ -18,6 +18,7 @@ const DEFAULT_CHECKPOINT_INTERVAL_SECS: u64 = 60;
 const DEFAULT_WAL_RETENTION_COUNT: u64 = 10;
 const DEFAULT_APPLY_CHECKPOINT_FRAME_INTERVAL: u32 = 128;
 const DEFAULT_APPLY_CHECKPOINT_INTERVAL_MS: u64 = 2000;
+const DEFAULT_MAX_CONCURRENT_SNAPSHOTS: usize = 5;
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
@@ -151,6 +152,11 @@ pub struct DbConfig {
     // This allows for gap filling when a replica reconnects.
     #[serde(default = "default_wal_retention_count")]
     pub wal_retention_count: u64,
+
+    // Maximum number of concurrent snapshot streams allowed.
+    // This protects the Primary from overload when many Replicas request snapshots simultaneously.
+    #[serde(default = "default_max_concurrent_snapshots")]
+    pub max_concurrent_snapshots: usize,
 }
 
 fn default_min_checkpoint_page_number() -> u64 {
@@ -179,6 +185,10 @@ fn default_apply_checkpoint_interval_ms() -> u64 {
 
 fn default_wal_retention_count() -> u64 {
     DEFAULT_WAL_RETENTION_COUNT
+}
+
+fn default_max_concurrent_snapshots() -> usize {
+    DEFAULT_MAX_CONCURRENT_SNAPSHOTS
 }
 
 impl Debug for DbConfig {

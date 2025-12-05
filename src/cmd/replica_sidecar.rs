@@ -168,9 +168,60 @@ impl ReplicaSidecar {
 
                         match StreamClient::connect(stream_config.addr.clone()).await {
                             Ok(client) => {
+                                println!("ReplicaSidecar::run Connected to Primary.");
+
+                                // 1. Try Direct Snapshot Streaming
                                 println!(
-                                    "ReplicaSidecar::run Connected to Primary. Requesting config..."
+                                    "ReplicaSidecar::run Attempting Direct Snapshot Streaming..."
                                 );
+                                let snapshot_path =
+                                    std::path::Path::new(db_path).with_extension("snapshot.zst");
+                                let direct_restore_success = match client
+                                    .download_snapshot(db_config.db.clone(), &snapshot_path)
+                                    .await
+                                {
+                                    Ok(_) => {
+                                        println!(
+                                            "ReplicaSidecar::run Snapshot downloaded. Decompressing..."
+                                        );
+                                        // Decompress zstd
+                                        let decompression_result = (|| -> std::io::Result<()> {
+                                            let mut source = std::fs::File::open(&snapshot_path)?;
+                                            let mut target = std::fs::File::create(db_path)?;
+                                            zstd::stream::copy_decode(&mut source, &mut target)?;
+                                            Ok(())
+                                        })(
+                                        );
+
+                                        if decompression_result.is_ok() {
+                                            let _ = std::fs::remove_file(snapshot_path);
+                                            println!(
+                                                "ReplicaSidecar::run Restore success. Switching to Streaming."
+                                            );
+                                            state = ReplicaState::Streaming;
+                                            true
+                                        } else {
+                                            warn!(
+                                                "Decompression failed: {:?}. Falling back to legacy restore...",
+                                                decompression_result.err()
+                                            );
+                                            false
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "Direct snapshot failed: {}. Falling back to legacy restore...",
+                                            e
+                                        );
+                                        false
+                                    }
+                                };
+
+                                if direct_restore_success {
+                                    continue;
+                                }
+
+                                println!("ReplicaSidecar::run Requesting legacy restore config...");
                                 match client.get_restore_config(db_config.db.clone()).await {
                                     Ok(restore_db_config) => {
                                         println!(

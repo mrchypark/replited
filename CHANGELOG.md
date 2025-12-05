@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 <!-- Release notes generated using configuration in .github/release.yml at main -->
 
+## [v0.3.0] - 2025-12-05
+
+### Features
+* feat: Implement Direct Snapshot Streaming. Replicas can now restore directly from the Primary via gRPC without a shared storage backend.
+* feat: Internalize compression using `zstd`. Replaced external `lz4` binary dependency with Rust `zstd` crate.
+* feat: Add concurrency control for snapshot streaming with `max_concurrent_snapshots` configuration.
+
+### Configuration
+* config: Stream replication no longer requires a storage backend (fs, s3, etc.) for initial snapshot restore.
+* config: Added `max_concurrent_snapshots` to `[[database]]` config (default: 10).
+
+### Fixes
+* fix: Resolve stack overflow issue in Primary server by moving large buffer allocations to heap.
+* fix: Remove validation that enforced storage backend presence for stream replication.
+
 ## [v0.2.0] - 2025-12-05
 
 ### Features
