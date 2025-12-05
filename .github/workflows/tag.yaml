@@ -1,0 +1,60 @@
+name: Tag on Version Change
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'Cargo.toml'
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Extract version from Cargo.toml
+        id: version
+        run: |
+          VERSION=$(grep '^version =' Cargo.toml | head -n 1 | sed 's/version = "//;s/"//')
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Check if tag already exists
+        id: check_tag
+        run: |
+          TAG="v${{ steps.version.outputs.version }}"
+          if git ls-remote --tags origin | grep -q "refs/tags/${TAG}$"; then
+            echo "Tag ${TAG} already exists. Skipping."
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "Tag ${TAG} does not exist. Will create."
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create and push new tag
+        if: steps.check_tag.outputs.exists == 'false'
+        run: |
+          TAG="v${{ steps.version.outputs.version }}"
+          echo "Creating and pushing tag ${TAG}..."
+          git tag "${TAG}"
+          git push origin "${TAG}"
+          echo "Tag ${TAG} pushed successfully."
+
+      - name: Trigger release workflow
+        if: steps.check_tag.outputs.exists == 'false'
+        run: |
+          TAG="v${{ steps.version.outputs.version }}"
+          echo "Triggering release workflow for ${TAG}..."
+          gh workflow run release.yml --ref ${TAG} -f tag=${TAG}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
