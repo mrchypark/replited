@@ -4,8 +4,10 @@ use std::fmt::Formatter;
 use std::time::SystemTimeError;
 
 use super::capture;
+#[cfg(feature = "storage")]
 use crate::database::DbCommand;
 use crate::error::Error;
+#[cfg(feature = "storage")]
 use crate::sync::ReplicateCommand;
 
 #[derive(thiserror::Error)]
@@ -81,6 +83,7 @@ impl From<std::num::ParseIntError> for Error {
     }
 }
 
+#[cfg(feature = "storage")]
 impl From<opendal::Error> for Error {
     fn from(e: opendal::Error) -> Error {
         Error::OpenDalError(format!("opendal error: {:?}", e.to_string()))
@@ -93,6 +96,7 @@ impl From<uuid::Error> for Error {
     }
 }
 
+#[cfg(feature = "storage")]
 impl From<tokio::sync::mpsc::error::SendError<ReplicateCommand>> for Error {
     fn from(e: tokio::sync::mpsc::error::SendError<ReplicateCommand>) -> Error {
         Error::TokioError(format!(
@@ -102,6 +106,7 @@ impl From<tokio::sync::mpsc::error::SendError<ReplicateCommand>> for Error {
     }
 }
 
+#[cfg(feature = "storage")]
 impl From<tokio::sync::mpsc::error::SendError<DbCommand>> for Error {
     fn from(e: tokio::sync::mpsc::error::SendError<DbCommand>) -> Error {
         Error::TokioError(format!("tokio send DbCommand error: {:?}", e.to_string()))

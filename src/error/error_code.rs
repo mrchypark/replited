@@ -74,6 +74,7 @@ build_error! {
 
     // 3rd crate error
     TokioError(100),
+    #[cfg(feature = "storage")]
     OpenDalError(101),
     UUIDError(102),
 

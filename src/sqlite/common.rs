@@ -41,6 +41,7 @@ impl CheckpointMode {
 
 // implementation of sqlite check algorithm
 pub fn checksum(data: &[u8], s1: u32, s2: u32, is_big_endian: bool) -> (u32, u32) {
+    assert_eq!(data.len() % 8, 0, "data length must be a multiple of 8");
     let mut i = 0;
     let mut s1: u32 = s1;
     let mut s2: u32 = s2;

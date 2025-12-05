@@ -1,21 +1,6 @@
-#![allow(dead_code)]
-#![allow(incomplete_features)]
-
-mod base;
-mod cmd;
-mod config;
-mod database;
-mod error;
-mod log;
-mod pb;
-mod sqlite;
-mod storage;
-mod sync;
-
 use clap::Parser;
-use config::Arg;
-
-use crate::cmd::command;
+use replited::cmd::command;
+use replited::config::Arg;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
