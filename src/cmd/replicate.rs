@@ -34,15 +34,37 @@ impl Command for Replicate {
             handles.push(handle);
 
             // Check for stream replication config
+            let mut has_stream = false;
+            let mut has_storage = false;
+
             for replicate in &database.replicate {
                 println!("Checking replicate: {:?}", replicate);
-                if let crate::config::StorageParams::Stream(s) = &replicate.params {
-                    println!("Found stream config: {:?}", s);
-                    db_paths.insert(database.db.clone(), database.db.clone());
-                    if stream_addr.is_none() {
-                        stream_addr = Some(s.addr.clone());
+                match &replicate.params {
+                    crate::config::StorageParams::Stream(s) => {
+                        println!("Found stream config: {:?}", s);
+                        has_stream = true;
+                        db_paths.insert(database.db.clone(), database.db.clone());
+                        if stream_addr.is_none() {
+                            stream_addr = Some(s.addr.clone());
+                        }
+                    }
+                    crate::config::StorageParams::Fs(_)
+                    | crate::config::StorageParams::S3(_)
+                    | crate::config::StorageParams::Gcs(_)
+                    | crate::config::StorageParams::Azb(_)
+                    | crate::config::StorageParams::Ftp(_) => {
+                        has_storage = true;
                     }
                 }
+            }
+
+            // Validate: stream replication requires a storage backend for initial snapshot
+            if has_stream && !has_storage {
+                return Err(crate::error::Error::InvalidConfig(format!(
+                    "Database '{}' has stream replication enabled but no storage backend. \
+                         Stream replication requires a storage backend (fs, s3, etc.) for initial snapshot restore.",
+                    database.db
+                )));
             }
         }
 
@@ -53,9 +75,13 @@ impl Command for Replicate {
                 use tonic::transport::Server;
 
                 let server = ReplicationServer::new(self.config.clone());
-                let addr = addr.parse().map_err(|e| {
+                // Strip http:// or https:// scheme for SocketAddr parsing
+                let addr_str = addr
+                    .trim_start_matches("http://")
+                    .trim_start_matches("https://");
+                let addr = addr_str.parse().map_err(|e| {
                     crate::error::Error::InvalidArg(format!("Invalid stream address: {}", e))
-                })?; // FIXME: map error properly
+                })?;
 
                 println!("Starting ReplicationServer at {}", addr);
                 log::info!("Starting ReplicationServer at {}", addr);

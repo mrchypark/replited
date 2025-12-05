@@ -200,6 +200,10 @@ impl ReplicaSidecar {
                                                 state = ReplicaState::Streaming;
                                             }
                                             Err(e) => {
+                                                println!(
+                                                    "ReplicaSidecar::run Restore failed: {}",
+                                                    e
+                                                );
                                                 warn!("Restore failed: {}. Retrying in 5s...", e);
                                                 sleep(Duration::from_secs(5)).await;
                                                 continue;

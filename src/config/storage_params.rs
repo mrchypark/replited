@@ -11,10 +11,15 @@ use crate::base::mask_string;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum StorageParams {
+    #[serde(rename = "azb", alias = "Azb")]
     Azb(Box<StorageAzblobConfig>),
+    #[serde(rename = "fs", alias = "Fs")]
     Fs(Box<StorageFsConfig>),
+    #[serde(rename = "ftp", alias = "Ftp")]
     Ftp(Box<StorageFtpConfig>),
+    #[serde(rename = "gcs", alias = "Gcs")]
     Gcs(Box<StorageGcsConfig>),
+    #[serde(rename = "s3", alias = "S3")]
     S3(Box<StorageS3Config>),
     #[serde(rename = "stream")]
     Stream(Box<StorageStreamConfig>),
