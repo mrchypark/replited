@@ -1,0 +1,23 @@
+[log]
+level = "Info"
+dir = "logs"
+
+[[database]]
+db = "primary.db"
+min_checkpoint_page_number = 100
+max_checkpoint_page_number = 1000
+truncate_page_number = 50000
+checkpoint_interval_secs = 30
+wal_retention_count = 5
+
+[[database.replicate]]
+name = "backup"
+[database.replicate.params]
+type = "fs"
+root = "./backup"
+
+[[database.replicate]]
+name = "stream-server"
+[database.replicate.params]
+type = "stream"
+addr = "http://0.0.0.0:50051"

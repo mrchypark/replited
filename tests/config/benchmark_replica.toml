@@ -1,0 +1,17 @@
+[log]
+level = "Info"
+dir = "logs"
+
+[[database]]
+db = "replica.db"
+min_checkpoint_page_number = 100
+max_checkpoint_page_number = 1000
+truncate_page_number = 50000
+checkpoint_interval_secs = 30
+wal_retention_count = 5
+
+[[database.replicate]]
+name = "stream-client"
+[database.replicate.params]
+type = "stream"
+addr = "http://127.0.0.1:50051"
