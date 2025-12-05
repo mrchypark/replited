@@ -18,3 +18,24 @@ path = "fuzz_targets/checksum.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "wal_parser"
+path = "fuzz_targets/wal_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decompress"
+path = "fuzz_targets/decompress.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "path_parser"
+path = "fuzz_targets/path_parser.rs"
+test = false
+doc = false
+bench = false
