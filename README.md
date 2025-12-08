@@ -1,7 +1,7 @@
 # replited(Replicate SQLITE Daemon)
 
-[![GitHub stars](https://img.shields.io/github/stars/lichuang/replited?label=Stars&logo=github)](https://github.com/lichuang/replited)
-[![GitHub forks](https://img.shields.io/github/forks/lichuang/replited?label=Forks&logo=github)](https://github.com/lichuang/replited)
+[![GitHub stars](https://img.shields.io/github/stars/mrchypark/replited?label=Stars&logo=github)](https://github.com/mrchypark/replited)
+[![GitHub forks](https://img.shields.io/github/forks/mrchypark/replited?label=Forks&logo=github)](https://github.com/mrchypark/replited)
 
 <!-- MarkdownTOC autolink="true" -->
 - [Introduction](#introduction)
@@ -26,9 +26,9 @@ Inspired by [Litestream](https://litestream.io/), with the power of [Rust](https
 
 | Type                       | Services                                                     |
 | -------------------------- | ------------------------------------------------------------ |
-| Standard Storage Protocols | ftp![CI](https://github.com/lichuang/replited/actions/workflows/ftp_integration_test.yml/badge.svg)                                    |
-| Object Storage Services    | [azblob] [gcs] <br> [s3]![CI](https://github.com/lichuang/replited/actions/workflows/s3_integration_test.yml/badge.svg) |
-| File Storage Services      | fs![CI](https://github.com/lichuang/replited/actions/workflows/fs_integration_test.yml/badge.svg)                                                          |
+| Standard Storage Protocols | ftp![CI](https://github.com/mrchypark/replited/actions/workflows/ftp_integration_test.yml/badge.svg)                                    |
+| Object Storage Services    | [azblob] [gcs] <br> [s3]![CI](https://github.com/mrchypark/replited/actions/workflows/s3_integration_test.yml/badge.svg) |
+| File Storage Services      | fs![CI](https://github.com/mrchypark/replited/actions/workflows/fs_integration_test.yml/badge.svg)                                                          |
 
 [azblob]: https://azure.microsoft.com/en-us/services/storage/blobs/
 [gcs]: https://cloud.google.com/storage
@@ -93,6 +93,6 @@ command options:
   **Note**: Direct Snapshot Streaming uses `zstd` for compression and does not require a shared storage backend.
 
 ## Stargazers over time
-[![Stargazers over time](https://starchart.cc/lichuang/replited.svg?variant=adaptive)](https://starchart.cc/lichuang/replited)
+[![Stargazers over time](https://starchart.cc/mrchypark/replited.svg?variant=adaptive)](https://starchart.cc/mrchypark/replited)
 
 ​                    
