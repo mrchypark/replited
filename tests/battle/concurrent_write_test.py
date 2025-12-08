@@ -38,17 +38,8 @@ class ConcurrentResult:
     errors: List[str]
 
 
-def cleanup():
-    """Clean up test artifacts."""
-    for f in ["primary.db", "primary.db-wal", "primary.db-shm"]:
-        if os.path.exists(f):
-            os.remove(f)
-    for d in [".primary.db-replited", "logs", "backup", "replica_cwd"]:
-        if os.path.exists(d):
-            shutil.rmtree(d)
-    os.makedirs("logs", exist_ok=True)
-    os.makedirs("backup", exist_ok=True)
 
+from test_utils import TestEnv, get_free_port, wait_for_port
 
 def writer_task(writer_id: int, num_writes: int, db_path: str) -> tuple:
     """Writer thread task."""
@@ -59,6 +50,8 @@ def writer_task(writer_id: int, num_writes: int, db_path: str) -> tuple:
     for i in range(num_writes):
         try:
             conn = sqlite3.connect(db_path, timeout=30.0)
+            # Disable autocheckpoint to prevent truncation
+            conn.execute("PRAGMA wal_autocheckpoint=100000")
             cursor = conn.cursor()
             cursor.execute(
                 "INSERT INTO concurrent_test (writer_id, write_seq, data) VALUES (?, ?, ?)",
@@ -76,13 +69,16 @@ def writer_task(writer_id: int, num_writes: int, db_path: str) -> tuple:
     
     return (writer_id, success, errors, error_msgs)
 
-
 def run_concurrent_test(
     num_writers: int = 10,
     writes_per_writer: int = 100
 ) -> ConcurrentResult:
     """Run concurrent write test."""
-    cleanup()
+    env = TestEnv("concurrent_write")
+    env.setup()
+    
+    PORT = get_free_port()
+    print(f"Selected dynamic port: {PORT}")
     
     result = ConcurrentResult(
         total_writes=num_writers * writes_per_writer,
@@ -95,18 +91,56 @@ def run_concurrent_test(
     )
     
     # Start Primary
-    primary_log = open("logs/primary_concurrent.log", "w")
+    primary_log_path = env.root / "primary.log"
+    primary_log = open(primary_log_path, "w")
+    
+    primary_config = f"""
+[log]
+level = "Info"
+dir = "logs"
+
+[[database]]
+db = "primary.db"
+max_concurrent_snapshots = 4
+wal_retention_secs = 86400
+wal_retention_count = 5 
+min_checkpoint_page_number = 100
+max_checkpoint_page_number = 1000
+
+[[database.replicate]]
+name = "stream-client"
+[database.replicate.params]
+type = "stream"
+addr = "127.0.0.1:{PORT}"
+"""
+    with open(env.primary_toml, "w") as f:
+        f.write(primary_config)
+
+    # Resolve binary path
+    replited_bin = REPLITED_BIN.resolve()
+
     primary = subprocess.Popen(
-        [str(REPLITED_BIN), "--config", str(CONFIG_DIR / "benchmark_primary.toml"), "replicate"],
+        [str(replited_bin), "--config", "primary.toml", "replicate"],
+        cwd=env.root,
         stdout=primary_log,
         stderr=subprocess.STDOUT
     )
-    time.sleep(2)
+    
+    print(f"Waiting for Primary to start on port {PORT}...")
+    if not wait_for_port(PORT, timeout=10):
+        result.errors.append("Primary failed to start")
+        primary.terminate()
+        primary.wait()
+        return result
     
     # Initialize database with WAL mode explicitly
-    conn = sqlite3.connect("primary.db")
+    # Use ABSOLUTE path for python sqlite3 connection
+    conn = sqlite3.connect(str(env.primary_db))
+    conn.execute("PRAGMA busy_timeout = 5000")
+    conn.execute("PRAGMA journal_mode=WAL")
+    # IMPORTANT: Increase autocheckpoint to prevent WAL truncation during test.
+    conn.execute("PRAGMA wal_autocheckpoint=100000")
     cursor = conn.cursor()
-    cursor.execute("PRAGMA journal_mode=WAL")
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS concurrent_test (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -121,16 +155,15 @@ def run_concurrent_test(
     conn.close()
     
     # Prepare Replica
-    replica_cwd = Path("replica_cwd")
-    replica_cwd.mkdir(exist_ok=True)
+    # replica_cwd is already created by env.setup()
     
-    config = """
+    config = f"""
 [log]
 level = "Info"
 dir = "logs"
 
 [[database]]
-db = "replica.db"
+db = "primary.db"
 min_checkpoint_page_number = 100
 max_checkpoint_page_number = 1000
 truncate_page_number = 50000
@@ -141,18 +174,20 @@ wal_retention_count = 5
 name = "stream-client"
 [database.replicate.params]
 type = "stream"
-addr = "http://127.0.0.1:50051"
+addr = "http://127.0.0.1:{PORT}"
 """
-    (replica_cwd / "replica.toml").write_text(config)
-    (replica_cwd / "logs").mkdir(exist_ok=True)
+    (env.replica_cwd / "replica.toml").write_text(config)
     
-    replica_log = open(replica_cwd / "replica.log", "w")
+    replica_log = open(env.root / "replica.log", "w")
     replica = subprocess.Popen(
-        [str(REPLITED_BIN), "--config", "replica.toml", "replica-sidecar", "--force-restore"],
-        cwd=str(replica_cwd),
+        [str(replited_bin), "--config", "replica.toml", "replica-sidecar", "--force-restore"],
+        cwd=str(env.replica_cwd),
         stdout=replica_log,
         stderr=subprocess.STDOUT
     )
+    
+    # Wait for restoration
+    time.sleep(5)
     time.sleep(3)
     
     print(f"Starting concurrent test: {num_writers} writers x {writes_per_writer} writes...")
@@ -162,7 +197,7 @@ addr = "http://127.0.0.1:50051"
         # Run concurrent writers
         with ThreadPoolExecutor(max_workers=num_writers) as executor:
             futures = [
-                executor.submit(writer_task, i, writes_per_writer, "primary.db")
+                executor.submit(writer_task, i, writes_per_writer, str(env.primary_db))
                 for i in range(num_writers)
             ]
             
@@ -176,38 +211,84 @@ addr = "http://127.0.0.1:50051"
         result.duration_seconds = time.time() - start_time
         
         # Verify replication
-        print("\nWaiting for replica sync...")
-        time.sleep(5)
+        print("\nWaiting for replica table creation...")
+        table_ready = False
+        for _ in range(30):
+            if env.replica_db.exists():
+                try:
+                    t_conn = sqlite3.connect(str(env.replica_db))
+                    t_cursor = t_conn.cursor()
+                    t_cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='concurrent_test'")
+                    if t_cursor.fetchone():
+                        t_conn.close()
+                        table_ready = True
+                        break
+                    t_conn.close()
+                except:
+                    pass
+            time.sleep(1)
+            
+        if not table_ready:
+            result.errors.append("Replica table never created")
         
-        # Check Primary
-        p_conn = sqlite3.connect("primary.db")
+        # Check Primary Count (Stable now)
+        p_conn = sqlite3.connect(str(env.primary_db))
         p_cursor = p_conn.cursor()
         p_cursor.execute("SELECT COUNT(*) FROM concurrent_test")
         primary_count = p_cursor.fetchone()[0]
         p_conn.close()
         
-        # Check Replica
-        r_path = replica_cwd / "replica.db"
-        if r_path.exists():
-            r_conn = sqlite3.connect(str(r_path))
-            r_cursor = r_conn.cursor()
-            r_cursor.execute("SELECT COUNT(*) FROM concurrent_test")
-            replica_count = r_cursor.fetchone()[0]
-            r_conn.close()
+        print(f"Primary has {primary_count} rows. Waiting for Replica to catch up...")
+        
+        # Poll for Data Sync
+        replica_count = 0
+        sync_timeout = 60 # seconds
+        for i in range(sync_timeout):
+            if env.replica_db.exists():
+                try:
+                    r_conn = sqlite3.connect(str(env.replica_db))
+                    r_cursor = r_conn.cursor()
+                    r_cursor.execute("SELECT COUNT(*) FROM concurrent_test")
+                    replica_count = r_cursor.fetchone()[0]
+                    r_conn.close()
+                    
+                    if replica_count == primary_count:
+                        print(f"Sync Complete! Replica has {replica_count} rows.")
+                        break
+                    
+                    if i % 5 == 0:
+                        print(f"Syncing... ({replica_count}/{primary_count})")
+                        
+                except Exception as e:
+                    pass
+            time.sleep(1)
             
-            print(f"Primary: {primary_count} rows, Replica: {replica_count} rows")
-            
-            result.missing_rows = primary_count - replica_count
-            if result.missing_rows <= 5:  # Allow small sync delay
-                result.replica_verified = True
+        print(f"Final Status - Primary: {primary_count}, Replica: {replica_count}")
+        result.missing_rows = primary_count - replica_count
+        
+        # Strict check: Must match exactly
+        if result.missing_rows == 0:
+            result.replica_verified = True
+        elif replica_count == 0:
+             result.errors.append("Replica likely not synced (0 rows)")
         else:
-            result.errors.append("Replica database not found")
+             result.errors.append(f"Replica incomplete: missing {result.missing_rows} rows")
         
     finally:
-        replica.terminate()
-        primary.terminate()
-        replica.wait()
-        primary.wait()
+        print("Stopping processes...")
+        if 'replica' in locals():
+            replica.terminate()
+            try:
+                replica.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                replica.kill()
+                
+        if 'primary' in locals():
+            primary.terminate()
+            try:
+                primary.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                primary.kill()
     
     return result
 
