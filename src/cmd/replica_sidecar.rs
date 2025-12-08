@@ -7,6 +7,7 @@ use tokio::time::sleep;
 
 use crate::base::Generation;
 use crate::config::Config;
+use crate::config::DbConfig;
 use crate::config::RestoreOptions;
 use crate::config::StorageParams;
 use crate::database::WalGenerationPos;
@@ -18,7 +19,7 @@ use crate::sync::replication::Handshake;
 #[derive(Debug)]
 enum ReplicaState {
     Empty,
-    Restoring,
+    Restoring, // Kept for enum compatibility, though logic merges it to Empty in previous code
     Streaming,
 }
 
@@ -100,16 +101,36 @@ impl ReplicaSidecar {
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        println!("ReplicaSidecar::run start");
+        let mut handles = vec![];
+
+        for db_config in &self.config.database {
+            let db_config = db_config.clone();
+            let force_restore = self.force_restore;
+
+            let handle = tokio::spawn(async move {
+                if let Err(e) = Self::run_single_db(db_config.clone(), force_restore).await {
+                    log::error!("ReplicaSidecar error for db {}: {}", db_config.db, e);
+                }
+            });
+            handles.push(handle);
+        }
+
+        for h in handles {
+            let _ = h.await;
+        }
+
+        Ok(())
+    }
+
+    async fn run_single_db(db_config: DbConfig, force_restore: bool) -> Result<()> {
+        println!("ReplicaSidecar::run_single_db start for {}", db_config.db);
         let mut state = ReplicaState::Empty;
         let mut resume_pos: Option<WalGenerationPos> = None;
-        println!("ReplicaSidecar::run accessing db_config");
-        let db_config = &self.config.database[0]; // FIXME: Support multiple DBs?
         let db_path = &db_config.db;
-        println!("ReplicaSidecar::run db_path: {}", db_path);
+        println!("ReplicaSidecar::run_single_db db_path: {}", db_path);
 
         // Find stream config
-        println!("ReplicaSidecar::run finding stream_config");
+        println!("ReplicaSidecar::run_single_db finding stream_config");
         let stream_config = db_config
             .replicate
             .iter()
@@ -123,16 +144,16 @@ impl ReplicaSidecar {
             .ok_or_else(|| {
                 crate::error::Error::InvalidConfig("No stream config found".to_string())
             })?;
-        println!("ReplicaSidecar::run stream_config found");
+        println!("ReplicaSidecar::run_single_db stream_config found");
 
         loop {
-            println!("ReplicaSidecar::run loop state: {:?}", state);
+            println!("ReplicaSidecar::run_single_db loop state: {:?}", state);
             match state {
                 ReplicaState::Empty => {
                     let path = std::path::Path::new(db_path);
-                    let should_restore = self.force_restore || !path.exists();
+                    let should_restore = force_restore || !path.exists();
                     println!(
-                        "ReplicaSidecar::run Empty state, exists: {}, should_restore: {}",
+                        "ReplicaSidecar::run_single_db Empty state, exists: {}, should_restore: {}",
                         path.exists(),
                         should_restore
                     );
@@ -141,11 +162,13 @@ impl ReplicaSidecar {
                         path,
                         path.exists(),
                         should_restore,
-                        self.force_restore
+                        force_restore
                     );
 
                     if !should_restore {
-                        println!("ReplicaSidecar::run Local DB found. Switching to Streaming.");
+                        println!(
+                            "ReplicaSidecar::run_single_db Local DB found. Switching to Streaming."
+                        );
                         info!(
                             "Local DB found at {}. Switching to Streaming mode.",
                             db_path
@@ -153,14 +176,14 @@ impl ReplicaSidecar {
                         state = ReplicaState::Streaming;
                     } else {
                         println!(
-                            "ReplicaSidecar::run Local DB not found. Connecting to Primary..."
+                            "ReplicaSidecar::run_single_db Local DB not found. Connecting to Primary..."
                         );
                         info!(
                             "Local DB not found at {}. Connecting to Primary to get restore config...",
                             db_path
                         );
 
-                        if self.force_restore && path.exists() {
+                        if force_restore && path.exists() {
                             let _ = std::fs::remove_file(db_path);
                             let _ = std::fs::remove_file(format!("{}-wal", db_path));
                             let _ = std::fs::remove_file(format!("{}-shm", db_path));
@@ -168,11 +191,11 @@ impl ReplicaSidecar {
 
                         match StreamClient::connect(stream_config.addr.clone()).await {
                             Ok(client) => {
-                                println!("ReplicaSidecar::run Connected to Primary.");
+                                println!("ReplicaSidecar::run_single_db Connected to Primary.");
 
                                 // 1. Try Direct Snapshot Streaming
                                 println!(
-                                    "ReplicaSidecar::run Attempting Direct Snapshot Streaming..."
+                                    "ReplicaSidecar::run_single_db Attempting Direct Snapshot Streaming..."
                                 );
                                 let snapshot_path =
                                     std::path::Path::new(db_path).with_extension("snapshot.zst");
@@ -182,7 +205,7 @@ impl ReplicaSidecar {
                                 {
                                     Ok(_) => {
                                         println!(
-                                            "ReplicaSidecar::run Snapshot downloaded. Decompressing..."
+                                            "ReplicaSidecar::run_single_db Snapshot downloaded. Decompressing..."
                                         );
                                         // Decompress zstd
                                         let decompression_result = (|| -> std::io::Result<()> {
@@ -196,7 +219,7 @@ impl ReplicaSidecar {
                                         if decompression_result.is_ok() {
                                             let _ = std::fs::remove_file(snapshot_path);
                                             println!(
-                                                "ReplicaSidecar::run Restore success. Switching to Streaming."
+                                                "ReplicaSidecar::run_single_db Restore success. Switching to Streaming."
                                             );
                                             state = ReplicaState::Streaming;
                                             true
@@ -221,11 +244,13 @@ impl ReplicaSidecar {
                                     continue;
                                 }
 
-                                println!("ReplicaSidecar::run Requesting legacy restore config...");
+                                println!(
+                                    "ReplicaSidecar::run_single_db Requesting legacy restore config..."
+                                );
                                 match client.get_restore_config(db_config.db.clone()).await {
                                     Ok(restore_db_config) => {
                                         println!(
-                                            "ReplicaSidecar::run Received restore config. Starting restore..."
+                                            "ReplicaSidecar::run_single_db Received restore config. Starting restore..."
                                         );
                                         info!("Received restore config. Starting restore...");
                                         let restore_options = RestoreOptions {
@@ -252,7 +277,7 @@ impl ReplicaSidecar {
                                             }
                                             Err(e) => {
                                                 println!(
-                                                    "ReplicaSidecar::run Restore failed: {}",
+                                                    "ReplicaSidecar::run_single_db Restore failed: {}",
                                                     e
                                                 );
                                                 warn!("Restore failed: {}. Retrying in 5s...", e);
@@ -298,7 +323,7 @@ impl ReplicaSidecar {
                         pos.generation.as_str(),
                         pos.index,
                         pos.offset,
-                        self.force_restore
+                        force_restore
                     );
 
                     info!("Connecting to Primary at {}", stream_config.addr);
@@ -327,7 +352,8 @@ impl ReplicaSidecar {
                                     let mut timeout_streak = 0usize;
 
                                     loop {
-                                        eprintln!("Replica: Waiting for message...");
+                                        // Epsom logging can be noisy since this loop runs for every packet
+                                        // eprintln!("Replica: Waiting for message...");
                                         let packet = match tokio::time::timeout(
                                             Duration::from_secs(2),
                                             stream.message(),

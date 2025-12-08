@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::Read;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
@@ -19,13 +21,14 @@ use crate::sqlite::{
     WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE, WALFrame, WALHeader, align_frame, checksum,
 };
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::Semaphore;
 
 pub struct ReplicationServer {
     db_paths: HashMap<String, PathBuf>,
     db_configs: HashMap<String, DbConfig>,
     snapshot_semaphores: HashMap<String, Arc<Semaphore>>,
+    _connections: Arc<Mutex<Vec<rusqlite::Connection>>>, // Keep connections open to pin WAL files
 }
 
 impl ReplicationServer {
@@ -33,19 +36,44 @@ impl ReplicationServer {
         let mut db_paths = HashMap::new();
         let mut db_configs = HashMap::new();
         let mut snapshot_semaphores = HashMap::new();
+        let mut _connections = Vec::new();
 
         for db in config.database {
-            db_paths.insert(db.db.clone(), PathBuf::from(&db.db));
+            let path = PathBuf::from(&db.db);
+            db_paths.insert(db.db.clone(), path.clone());
             snapshot_semaphores.insert(
                 db.db.clone(),
                 Arc::new(Semaphore::new(db.max_concurrent_snapshots)),
             );
             db_configs.insert(db.db.clone(), db);
+
+            // Open a persistent connection to pin the WAL file
+            if let Ok(conn) = rusqlite::Connection::open(&path) {
+                // Set WAL mode to ensure it's active
+                if let Err(e) = conn.pragma_update(None, "journal_mode", "WAL") {
+                    eprintln!(
+                        "Primary: Failed to set WAL mode for {}: {}",
+                        path.display(),
+                        e
+                    );
+                }
+                _connections.push(conn);
+                eprintln!(
+                    "Primary: Opened persistent connection for {}",
+                    path.display()
+                );
+            } else {
+                eprintln!(
+                    "Primary: Failed to open persistent connection for {}",
+                    path.display()
+                );
+            }
         }
         Self {
             db_paths,
             db_configs,
             snapshot_semaphores,
+            _connections: Arc::new(Mutex::new(_connections)),
         }
     }
 }
@@ -108,10 +136,13 @@ impl Replication for ReplicationServer {
 
             loop {
                 // Read WAL header to get page size (handle WAL reset)
-                let wal_header = match WALHeader::read(&wal_path) {
+                let mut wal_header = match crate::sqlite::WALHeader::read(&wal_path) {
                     Ok(h) => h,
                     Err(e) => {
-                        eprintln!("Primary: Failed to read WAL header: {}", e);
+                        eprintln!("Primary: Failed to read WAL header: {}.", e);
+                        // If we can't read header yet (e.g. empty file at start), we can't stream.
+                        // Retry loop or continue?
+                        // For simplicity, sleep and continue
                         sleep(Duration::from_millis(200)).await;
                         continue;
                     }
@@ -146,6 +177,79 @@ impl Replication for ReplicationServer {
                     offset = WAL_HEADER_SIZE;
                 }
 
+                // Check for WAL Truncation / Restart by Header Salt mismatch.
+                // Reading header is cheap (fs cache).
+                // If salt changes, the WAL has been reset even if size is similar.
+                // If we can't read the header (EOF), it's also a Reset (Empty file).
+                let mut header_buf = [0u8; 32];
+                let file_result = File::open(&wal_path);
+
+                if let Ok(mut file_handle) = file_result {
+                    match file_handle.read_exact(&mut header_buf) {
+                        Ok(_) => {
+                            // WALHeader::read always reads salts as Big Endian (swapped on LE machines).
+                            // We must match that behavior here to avoid false mismatches.
+                            let new_salt1 =
+                                u32::from_be_bytes(header_buf[16..20].try_into().unwrap());
+
+                            if new_salt1 != wal_header.salt1 {
+                                eprintln!(
+                                    "Primary: WAL Salt Changed! Old={:#x}, New={:#x}. Resetting...",
+                                    wal_header.salt1, new_salt1
+                                );
+                                // Reload header to update "current" salts
+                                let mut cursor = std::io::Cursor::new(&header_buf);
+                                if let Ok(new_header) =
+                                    crate::sqlite::WALHeader::read_from(&mut cursor)
+                                {
+                                    wal_header = new_header;
+                                } else {
+                                    // If parsing fails (e.g. bad magic), we MUST still update salt
+                                    // or we will loop forever thinking salt changed.
+                                    wal_header.salt1 = new_salt1;
+                                }
+
+                                offset = WAL_HEADER_SIZE;
+                                sent_header = false;
+                                last_checksum = None;
+                                continue;
+                            }
+                        }
+                        Err(e) => {
+                            // If we are expecting a valid WAL (offset > header), and can't read header -> Truncated/Deleted.
+                            if offset > WAL_HEADER_SIZE {
+                                eprintln!(
+                                    "Primary: Failed to read WAL Header ({}). Assuming Truncate/Reset.",
+                                    e
+                                );
+                                offset = WAL_HEADER_SIZE;
+                                sent_header = false;
+                                last_checksum = None;
+
+                                // Try to reload header if possible
+                                if let Ok(_) = file_handle.read_exact(&mut header_buf) {
+                                    let mut cursor = std::io::Cursor::new(&header_buf);
+                                    if let Ok(new_header) =
+                                        crate::sqlite::WALHeader::read_from(&mut cursor)
+                                    {
+                                        wal_header = new_header;
+                                    }
+                                }
+
+                                continue;
+                            }
+                        }
+                    }
+                } else if offset > WAL_HEADER_SIZE {
+                    // Start from scratch check
+                    eprintln!("Primary: Failed to open WAL file. Assuming Truncate/Reset.");
+                    offset = WAL_HEADER_SIZE;
+                    sent_header = false;
+                    last_checksum = None;
+                    sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+
                 let wal_len = match std::fs::metadata(&wal_path) {
                     Ok(meta) => align_frame(page_size, meta.len()),
                     Err(e) => {
@@ -155,7 +259,35 @@ impl Replication for ReplicationServer {
                     }
                 };
 
-                if wal_len <= offset {
+                if wal_len < offset {
+                    // WAL was truncated (Checkpoint ran) - Size Check.
+                    // This implies we missed data (gap in replication) unless we handle it.
+                    // Ideally we should trigger a Full Resync (Snapshot).
+                    // For now, we reset offset and hope the new data covers it, or warn loudly.
+                    eprintln!(
+                        "Primary: WAL Truncated! (len {} < offset {}). Resetting to header...",
+                        wal_len, offset
+                    );
+
+                    // Reset to header
+                    offset = WAL_HEADER_SIZE;
+                    sent_header = false;
+                    last_checksum = None;
+
+                    // Also update our cached header so we don't loop on salt check
+                    let mut head = [0u8; 32];
+                    if let Ok(_) = File::open(&wal_path).and_then(|mut f| f.read_exact(&mut head)) {
+                        let mut cursor = std::io::Cursor::new(&head);
+                        if let Ok(new_header) = crate::sqlite::WALHeader::read_from(&mut cursor) {
+                            wal_header = new_header;
+                        }
+                    }
+
+                    sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+
+                if wal_len == offset {
                     sleep(Duration::from_millis(100)).await;
                     continue;
                 }
@@ -186,11 +318,28 @@ impl Replication for ReplicationServer {
 
                         // Validate salt and checksum to avoid streaming partially written frames.
                         if frame.salt1 != wal_header.salt1 || frame.salt2 != wal_header.salt2 {
-                            eprintln!("Primary: WAL salt mismatch detected, resetting stream");
-                            sent_header = false;
-                            last_checksum = None;
-                            offset = WAL_HEADER_SIZE;
-                            break;
+                            // Check if the header has actually changed on disk
+                            let current_header =
+                                WALHeader::read(&wal_path).unwrap_or(wal_header.clone());
+                            if current_header.salt1 != wal_header.salt1
+                                || current_header.salt2 != wal_header.salt2
+                            {
+                                eprintln!(
+                                    "Primary: WAL header changed (new salt), resetting stream"
+                                );
+                                sent_header = false;
+                                last_checksum = None;
+                                offset = WAL_HEADER_SIZE;
+                                break;
+                            } else {
+                                // Header is same, so this frame is just garbage/stale data from previous usage.
+                                // Treat as EOF (waiting for overwrite).
+                                eprintln!(
+                                    "Primary: Encountered stale frame (salt mismatch) at offset {}, waiting for overwrite...",
+                                    offset
+                                );
+                                break;
+                            }
                         }
 
                         let seeds = last_checksum.unwrap_or(header_seed);
@@ -208,14 +357,26 @@ impl Replication for ReplicationServer {
                             wal_header.is_big_endian,
                         );
                         if computed.0 != frame.checksum1 || computed.1 != frame.checksum2 {
-                            eprintln!(
-                                "Primary: WAL checksum mismatch at offset {}, resetting stream",
-                                offset
-                            );
-                            sent_header = false;
-                            last_checksum = None;
-                            offset = WAL_HEADER_SIZE;
-                            break;
+                            // Similar check for checksum mismatch
+                            let current_header =
+                                WALHeader::read(&wal_path).unwrap_or(wal_header.clone());
+                            if current_header.salt1 != wal_header.salt1
+                                || current_header.salt2 != wal_header.salt2
+                            {
+                                eprintln!(
+                                    "Primary: WAL header changed (during checksum check), resetting stream"
+                                );
+                                sent_header = false;
+                                last_checksum = None;
+                                offset = WAL_HEADER_SIZE;
+                                break;
+                            } else {
+                                eprintln!(
+                                    "Primary: WAL checksum mismatch at offset {} (stale data?), waiting...",
+                                    offset
+                                );
+                                break;
+                            }
                         }
 
                         last_checksum = Some(computed);

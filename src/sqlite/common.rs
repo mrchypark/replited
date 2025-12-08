@@ -59,6 +59,7 @@ pub fn checksum(data: &[u8], s1: u32, s2: u32, is_big_endian: bool) -> (u32, u32
                 u32::from_le_bytes(bytes2.try_into().unwrap()),
             )
         };
+
         // use `wrapping_add` instead of `+` directly, or else will be overflow panic
         s1 = s1.wrapping_add(n1).wrapping_add(s2);
         s2 = s2.wrapping_add(n2).wrapping_add(s1);
