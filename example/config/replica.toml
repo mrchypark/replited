@@ -1,0 +1,19 @@
+[log]
+level = "Debug"
+dir = "/tmp/log"
+
+[[database]]
+db = "/pb_data/data.db"
+
+[[database.replicate]]
+name = "stream-primary"
+params.type = "stream"
+params.addr = "http://primary-replited:50051"
+
+[[database]]
+db = "/pb_data/auxiliary.db"
+
+[[database.replicate]]
+name = "stream-aux"
+params.type = "stream"
+params.addr = "http://primary-replited:50051"

@@ -32,4 +32,5 @@ tests/battle/backup/
 tests/battle/*.toml
 tests/battle/primary.db*
 tests/benchmarks/results/
+tests/output/
 *.zst

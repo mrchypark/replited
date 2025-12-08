@@ -1,0 +1,34 @@
+# Git
+.git
+.gitignore
+
+# Build Artifacts
+target/
+**/target/
+**/*.rs.bk
+
+# Test Artifacts & Logs
+tests/
+backup/
+logs/
+replica_cwd/
+.primary.db-replited/
+tmp/
+*.log
+
+# Fuzzing Artifacts
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/
+
+# Example Data (Heavy DBs)
+example/data/
+**/data.db
+**/data.db-wal
+**/data.db-shm
+**/*.db
+**/*.db-wal
+**/*.db-shm
+
+# OS
+.DS_Store
