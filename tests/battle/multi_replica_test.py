@@ -35,31 +35,7 @@ class MultiReplicaResult:
     duration_seconds: float
 
 
-def cleanup():
-    """Clean up test artifacts."""
-    for f in ["primary.db", "primary.db-wal", "primary.db-shm"]:
-        if os.path.exists(f):
-            os.remove(f)
-    for d in [".primary.db-replited", "logs", "backup"]:
-        if os.path.exists(d):
-            shutil.rmtree(d)
-    
-    # Clean replica directories (legacy)
-    for i in range(10):
-        replica_dir = f"replica_{i}"
-        if os.path.exists(replica_dir):
-            shutil.rmtree(replica_dir)
-    
-    # Clean replica files (new - same directory)
-    import glob
-    for f in glob.glob("replica_*.db*") + glob.glob("replica_*.toml") + glob.glob(".replica_*.db-replited"):
-        if os.path.isfile(f):
-            os.remove(f)
-        elif os.path.isdir(f):
-            shutil.rmtree(f)
-    
-    os.makedirs("logs", exist_ok=True)
-    os.makedirs("backup", exist_ok=True)
+from test_utils import cleanup
 
 
 

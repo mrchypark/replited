@@ -10,27 +10,39 @@ def verify_full_flow():
     print("\n=== Verifying Full Replication Flow (Steps 1-4) ===")
     
     # 1. Clean up
-    if os.path.exists("data.db"): os.remove("data.db")
-    if os.path.exists("data.db-wal"): os.remove("data.db-wal")
-    if os.path.exists("data.db-shm"): os.remove("data.db-shm")
-    if os.path.exists(".data.db-replited"): shutil.rmtree(".data.db-replited")
-    if os.path.exists("backup"): shutil.rmtree("backup")
-    if os.path.exists("replica_cwd"): shutil.rmtree("replica_cwd")
-    if os.path.exists("logs"): shutil.rmtree("logs")
-    os.makedirs("logs", exist_ok=True)
-    os.makedirs("backup", exist_ok=True)
+    from test_utils import cleanup
+    cleanup()
     
     # 2. Start Primary
     print("Starting Primary...")
+    
+    # Create primary.toml
+    primary_config = """
+[log]
+level = "Debug"
+dir = "logs"
+
+[[database]]
+db = "data.db"
+
+[[database.replicate]]
+name = "stream-server"
+[database.replicate.params]
+type = "stream"
+addr = "http://0.0.0.0:50051"
+"""
+    with open("primary.toml", "w") as f:
+        f.write(primary_config)
+
     primary_log = open("logs/primary.log", "w")
     primary_proc = subprocess.Popen(
-        ["../target/debug/replited", "--config", "primary.toml", "replicate"],
+        ["../target/release/replited", "--config", "primary.toml", "replicate"],
         stdout=primary_log,
         stderr=subprocess.STDOUT
     )
     
     try:
-        time.sleep(2) # Wait for start
+        time.sleep(5) # Wait for start
         
         # 3. Write initial data
         print("Writing initial data to Primary...")
@@ -92,7 +104,7 @@ def verify_full_flow():
         print("Restarting Primary...")
         primary_log = open("logs/primary_restart.log", "w")
         primary_proc = subprocess.Popen(
-            ["../target/debug/replited", "--config", "primary.toml", "replicate"],
+            ["../target/release/replited", "--config", "primary.toml", "replicate"],
             stdout=primary_log,
             stderr=subprocess.STDOUT
         )

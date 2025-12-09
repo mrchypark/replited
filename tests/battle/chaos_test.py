@@ -38,16 +38,7 @@ class ChaosResult:
     errors: List[str]
 
 
-def cleanup():
-    """Clean up test artifacts."""
-    for f in ["primary.db", "primary.db-wal", "primary.db-shm"]:
-        if os.path.exists(f):
-            os.remove(f)
-    for d in [".primary.db-replited", "logs", "backup", "replica_cwd"]:
-        if os.path.exists(d):
-            shutil.rmtree(d)
-    os.makedirs("logs", exist_ok=True)
-    os.makedirs("backup", exist_ok=True)
+from test_utils import cleanup
 
 
 def start_primary() -> subprocess.Popen:
@@ -84,7 +75,7 @@ level = "Info"
 dir = "logs"
 
 [[database]]
-db = "replica.db"
+db = "primary.db"
 min_checkpoint_page_number = 100
 max_checkpoint_page_number = 1000
 truncate_page_number = 50000
@@ -231,7 +222,7 @@ def run_chaos_test(
         time.sleep(5)  # Give replica time to catch up
         
         primary_count = get_row_count("primary.db")
-        replica_count = get_row_count(str(replica_cwd / "replica.db"))
+        replica_count = get_row_count(str(replica_cwd / "primary.db"))
         
         print(f"Primary rows: {primary_count}")
         print(f"Replica rows: {replica_count}")
