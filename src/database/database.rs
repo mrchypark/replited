@@ -140,7 +140,7 @@ impl Database {
                     Ok(())
                 })
             {
-                error!("set journal_mode=wal error: {:?}", e);
+                error!("set journal_mode=wal error: {e:?}");
                 continue;
             }
             try_num = 0;
@@ -149,8 +149,7 @@ impl Database {
         if try_num >= max_try_num {
             error!("try set journal_mode=wal failed");
             return Err(Error::SqliteError(format!(
-                "set journal_mode=wal for db {} failed",
-                db,
+                "set journal_mode=wal for db {db} failed",
             )));
         }
 
@@ -164,7 +163,7 @@ impl Database {
                     Ok(())
                 })
             {
-                error!("set wal_autocheckpoint=0 error: {:?}", e);
+                error!("set wal_autocheckpoint=0 error: {e:?}");
                 continue;
             }
             try_num = 0;
@@ -173,8 +172,7 @@ impl Database {
         if try_num >= max_try_num {
             error!("try set wal_autocheckpoint=0 failed");
             return Err(Error::SqliteError(format!(
-                "set wal_autocheckpoint=0 for db {} failed",
-                db,
+                "set wal_autocheckpoint=0 for db {db} failed",
             )));
         }
 
@@ -233,14 +231,14 @@ impl Database {
             std::env::current_dir()?.join(&meta_dir)
         };
 
-        info!("Creating meta dir at: {:?}", abs_meta_dir);
+        info!("Creating meta dir at: {abs_meta_dir:?}");
         fs::create_dir_all(&abs_meta_dir)?;
 
         Ok(meta_dir)
     }
 
     async fn try_create(config: DbConfig) -> Result<(Self, Receiver<DbCommand>)> {
-        info!("start database with config: {:?}\n", config);
+        info!("start database with config: {config:?}\n");
         info!("CWD: {:?}", std::env::current_dir());
         info!("Opening connection to {}", config.db);
         println!("Database::try_create opening connection");
@@ -260,7 +258,7 @@ impl Database {
         info!("Initializing directory");
         println!("Database::try_create init directory");
         let meta_dir = Database::init_directory(&config)?;
-        println!("Database::try_create meta_dir: {}", meta_dir);
+        println!("Database::try_create meta_dir: {meta_dir}");
 
         // init replicate
         let (db_notifier, db_receiver) = mpsc::channel(16);
@@ -282,7 +280,7 @@ impl Database {
                 sync_notifiers.push(None);
                 continue;
             }
-            info!("Initializing replicate {}", index);
+            info!("Initializing replicate {index}");
             let (sync_notifier, sync_receiver) = mpsc::channel(16);
             let s = Replicate::new(
                 replicate.clone(),
@@ -670,7 +668,7 @@ impl Database {
     }
 
     fn init_shadow_wal_file(&self, shadow_wal: &String) -> Result<u64> {
-        debug!("init_shadow_wal_file {}", shadow_wal);
+        debug!("init_shadow_wal_file {shadow_wal}");
 
         // read wal file header
         let wal_header = WALHeader::read(&self.wal_file)?;
@@ -699,7 +697,7 @@ impl Database {
         // write wal file header into shadow wal file
         shadow_wal_file.write_all(&wal_header.data)?;
         shadow_wal_file.flush()?;
-        debug!("create shadow wal file {}", shadow_wal);
+        debug!("create shadow wal file {shadow_wal}");
 
         // copy wal file frame into shadow wal file
         let (orig_size, new_size) = self.copy_to_shadow_wal(shadow_wal)?;
@@ -720,8 +718,7 @@ impl Database {
         let shadow_wal_file_metadata = fs::metadata(shadow_wal)?;
         let orig_shadow_wal_size = align_frame(self.page_size, shadow_wal_file_metadata.size());
         debug!(
-            "copy_to_shadow_wal orig_wal_size: {},  orig_shadow_wal_size: {}",
-            orig_wal_size, orig_shadow_wal_size
+            "copy_to_shadow_wal orig_wal_size: {orig_wal_size},  orig_shadow_wal_size: {orig_shadow_wal_size}"
         );
 
         // read shadow wal header
@@ -745,10 +742,10 @@ impl Database {
                 Ok(wal_frame) => wal_frame,
                 Err(e) => {
                     if e.code() == Error::UNEXPECTED_EOF_ERROR {
-                        debug!("copy_to_shadow_wal EOF at offset: {}", offset);
+                        debug!("copy_to_shadow_wal EOF at offset: {offset}");
                         break;
                     } else {
-                        error!("copy_to_shadow_wal error {} at offset {}", e, offset);
+                        error!("copy_to_shadow_wal error {e} at offset {offset}");
                         return Err(e);
                     }
                 }
@@ -876,7 +873,7 @@ impl Database {
             total_size += metadata.size();
             match parse_wal_path(&file_name) {
                 Err(e) => {
-                    debug!("invalid wal file {:?}, err:{:?}", file_name, e);
+                    debug!("invalid wal file {file_name:?}, err:{e:?}");
                     continue;
                 }
                 Ok(i) => {
@@ -1075,7 +1072,7 @@ impl Database {
         // forcing the checkpoint and restarting the WAL.
         //
         // See: https://www.sqlite.org/pragma.html#pragma_wal_checkpoint
-        let sql = format!("PRAGMA wal_checkpoint({})", mode);
+        let sql = format!("PRAGMA wal_checkpoint({mode})");
 
         let ret = self.connection.execute_batch(&sql);
 
@@ -1162,7 +1159,7 @@ pub async fn run_database(config: DbConfig) -> Result<()> {
     let (mut database, mut db_receiver) = match Database::try_create(config.clone()).await {
         Ok((db, receiver)) => (db, receiver),
         Err(e) => {
-            error!("run_database for {:?} error: {:?}", config, e);
+            error!("run_database for {config:?} error: {e:?}");
             return Err(e);
         }
     };

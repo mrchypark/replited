@@ -79,15 +79,15 @@ impl Debug for Error {
                 "\n\n<Backtrace disabled by default. Please use RUST_BACKTRACE=1 to enable> "
             ),
             Some(backtrace) => match backtrace {
-                ErrorCodeBacktrace::Symbols(backtrace) => write!(f, "\n\n{:?}", backtrace),
-                ErrorCodeBacktrace::Serialized(backtrace) => write!(f, "\n\n{}", backtrace),
+                ErrorCodeBacktrace::Symbols(backtrace) => write!(f, "\n\n{backtrace:?}"),
+                ErrorCodeBacktrace::Serialized(backtrace) => write!(f, "\n\n{backtrace}"),
                 ErrorCodeBacktrace::Address(backtrace) => {
                     let frames_address = backtrace
                         .frames()
                         .iter()
                         .map(|f| (f.ip() as usize, f.symbol_address() as usize))
                         .collect::<Vec<_>>();
-                    write!(f, "\n\n{:?}", frames_address)
+                    write!(f, "\n\n{frames_address:?}")
                 }
             },
         }

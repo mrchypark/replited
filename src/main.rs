@@ -5,7 +5,7 @@ use replited::config::Arg;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let arg = Arg::parse();
-    println!("arg: {:?}\n", arg);
+    println!("arg: {arg:?}\n");
 
     let mut cmd = command(arg)?;
 

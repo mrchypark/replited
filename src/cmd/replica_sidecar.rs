@@ -63,7 +63,7 @@ impl ReplicaSidecar {
     }
 
     fn get_local_wal_state(db_path: &str) -> Result<(WalGenerationPos, u64)> {
-        let wal_path = format!("{}-wal", db_path);
+        let wal_path = format!("{db_path}-wal");
         if !Path::new(&wal_path).exists() {
             return Ok((
                 WalGenerationPos {
@@ -127,7 +127,7 @@ impl ReplicaSidecar {
         let mut state = ReplicaState::Empty;
         let mut resume_pos: Option<WalGenerationPos> = None;
         let db_path = &db_config.db;
-        println!("ReplicaSidecar::run_single_db db_path: {}", db_path);
+        println!("ReplicaSidecar::run_single_db db_path: {db_path}");
 
         // Find stream config
         println!("ReplicaSidecar::run_single_db finding stream_config");
@@ -147,7 +147,7 @@ impl ReplicaSidecar {
         println!("ReplicaSidecar::run_single_db stream_config found");
 
         loop {
-            println!("ReplicaSidecar::run_single_db loop state: {:?}", state);
+            println!("ReplicaSidecar::run_single_db loop state: {state:?}");
             match state {
                 ReplicaState::Empty => {
                     let path = std::path::Path::new(db_path);
@@ -170,8 +170,7 @@ impl ReplicaSidecar {
                             "ReplicaSidecar::run_single_db Local DB found. Switching to Streaming."
                         );
                         info!(
-                            "Local DB found at {}. Switching to Streaming mode.",
-                            db_path
+                            "Local DB found at {db_path}. Switching to Streaming mode."
                         );
                         state = ReplicaState::Streaming;
                     } else {
@@ -179,14 +178,13 @@ impl ReplicaSidecar {
                             "ReplicaSidecar::run_single_db Local DB not found. Connecting to Primary..."
                         );
                         info!(
-                            "Local DB not found at {}. Connecting to Primary to get restore config...",
-                            db_path
+                            "Local DB not found at {db_path}. Connecting to Primary to get restore config..."
                         );
 
                         if force_restore && path.exists() {
                             let _ = std::fs::remove_file(db_path);
-                            let _ = std::fs::remove_file(format!("{}-wal", db_path));
-                            let _ = std::fs::remove_file(format!("{}-shm", db_path));
+                            let _ = std::fs::remove_file(format!("{db_path}-wal"));
+                            let _ = std::fs::remove_file(format!("{db_path}-shm"));
                         }
 
                         match StreamClient::connect(stream_config.addr.clone()).await {
@@ -233,8 +231,7 @@ impl ReplicaSidecar {
                                     }
                                     Err(e) => {
                                         warn!(
-                                            "Direct snapshot failed: {}. Falling back to legacy restore...",
-                                            e
+                                            "Direct snapshot failed: {e}. Falling back to legacy restore..."
                                         );
                                         false
                                     }
@@ -270,17 +267,15 @@ impl ReplicaSidecar {
                                             Ok(pos) => {
                                                 resume_pos = pos;
                                                 info!(
-                                                    "Bootstrap finished. Switching to Stream mode. resume_pos={:?}",
-                                                    resume_pos
+                                                    "Bootstrap finished. Switching to Stream mode. resume_pos={resume_pos:?}"
                                                 );
                                                 state = ReplicaState::Streaming;
                                             }
                                             Err(e) => {
                                                 println!(
-                                                    "ReplicaSidecar::run_single_db Restore failed: {}",
-                                                    e
+                                                    "ReplicaSidecar::run_single_db Restore failed: {e}"
                                                 );
-                                                warn!("Restore failed: {}. Retrying in 5s...", e);
+                                                warn!("Restore failed: {e}. Retrying in 5s...");
                                                 sleep(Duration::from_secs(5)).await;
                                                 continue;
                                             }
@@ -288,15 +283,14 @@ impl ReplicaSidecar {
                                     }
                                     Err(e) => {
                                         warn!(
-                                            "Failed to get restore config: {}. Retrying in 5s...",
-                                            e
+                                            "Failed to get restore config: {e}. Retrying in 5s..."
                                         );
                                         sleep(Duration::from_secs(5)).await;
                                     }
                                 }
                             }
                             Err(e) => {
-                                warn!("Failed to connect to Primary: {}. Retrying in 5s...", e);
+                                warn!("Failed to connect to Primary: {e}. Retrying in 5s...");
                                 sleep(Duration::from_secs(5)).await;
                             }
                         }
@@ -310,7 +304,7 @@ impl ReplicaSidecar {
                     // 1. Get current position
                     let (pos, page_size) = if let Some(p) = resume_pos.take() {
                         let wal_page_size =
-                            crate::sqlite::WALHeader::read(&format!("{}-wal", db_path))
+                            crate::sqlite::WALHeader::read(&format!("{db_path}-wal"))
                                 .map(|h| h.page_size)
                                 .unwrap_or(4096);
                         (p, wal_page_size)
@@ -339,7 +333,7 @@ impl ReplicaSidecar {
                             match client.stream_wal(handshake).await {
                                 Ok(mut stream) => {
                                     eprintln!("Replica: Stream connected. Creating WalWriter...");
-                                    let wal_path = format!("{}-wal", db_path);
+                                    let wal_path = format!("{db_path}-wal");
                                     let mut writer = crate::sync::WalWriter::new(
                                         std::path::PathBuf::from(wal_path),
                                         page_size,
@@ -370,19 +364,17 @@ impl ReplicaSidecar {
                                                 eprintln!("Replica: Stream ended");
                                                 if let Err(e) = writer.checkpoint() {
                                                     warn!(
-                                                        "Checkpoint after stream end failed: {}",
-                                                        e
+                                                        "Checkpoint after stream end failed: {e}"
                                                     );
                                                 }
                                                 break;
                                             }
                                             Ok(Err(e)) => {
-                                                eprintln!("Replica: Stream error: {}", e);
-                                                warn!("Stream error: {}", e);
+                                                eprintln!("Replica: Stream error: {e}");
+                                                warn!("Stream error: {e}");
                                                 if let Err(e) = writer.checkpoint() {
                                                     warn!(
-                                                        "Checkpoint after stream error failed: {}",
-                                                        e
+                                                        "Checkpoint after stream error failed: {e}"
                                                     );
                                                 }
                                                 break;
@@ -394,8 +386,7 @@ impl ReplicaSidecar {
                                                 if timeout_streak >= 5 {
                                                     if let Err(e) = writer.checkpoint() {
                                                         warn!(
-                                                            "Checkpoint after timeouts failed: {}",
-                                                            e
+                                                            "Checkpoint after timeouts failed: {e}"
                                                         );
                                                     }
                                                     timeout_streak = 0;
@@ -409,11 +400,10 @@ impl ReplicaSidecar {
                                         };
 
                                         if let Err(e) = writer.apply(packet) {
-                                            warn!("Failed to write WAL packet: {}", e);
+                                            warn!("Failed to write WAL packet: {e}");
                                             if let Err(e) = writer.checkpoint() {
                                                 warn!(
-                                                    "Checkpoint after write failure failed: {}",
-                                                    e
+                                                    "Checkpoint after write failure failed: {e}"
                                                 );
                                             }
                                             break;
@@ -422,13 +412,13 @@ impl ReplicaSidecar {
                                     warn!("Stream disconnected. Retrying...");
                                 }
                                 Err(e) => {
-                                    warn!("Failed to stream: {}. Retrying...", e);
+                                    warn!("Failed to stream: {e}. Retrying...");
                                     sleep(Duration::from_secs(1)).await;
                                 }
                             }
                         }
                         Err(e) => {
-                            warn!("Failed to connect: {}. Retrying...", e);
+                            warn!("Failed to connect: {e}. Retrying...");
                             sleep(Duration::from_secs(1)).await;
                         }
                     }

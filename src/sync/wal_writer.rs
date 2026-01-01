@@ -54,6 +54,7 @@ impl WalWriter {
 
         let file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&wal_path)?;
@@ -85,7 +86,7 @@ impl WalWriter {
                 let _ = c.pragma_update(None, "journal_mode", "WAL");
                 wal_writer.conn = Some(c);
             }
-            Err(e) => eprintln!("WalWriter: Failed to open pinned connection: {}", e),
+            Err(e) => eprintln!("WalWriter: Failed to open pinned connection: {e}"),
         }
 
         if wal_writer.file.metadata()?.len() >= 32 {
@@ -108,7 +109,7 @@ impl WalWriter {
             let len = wal_writer.file.metadata()?.len();
             if len > 32 {
                 let frames_len = len - 32;
-                let frame_size = WAL_FRAME_HEADER_SIZE as u64 + wal_writer.page_size;
+                let frame_size = WAL_FRAME_HEADER_SIZE + wal_writer.page_size;
                 wal_writer.frame_count = (frames_len / frame_size) as u32;
 
                 if wal_writer.frame_count > 0 {
@@ -132,7 +133,7 @@ impl WalWriter {
 
                     wal_writer.last_checksum = (c1, c2);
 
-                    println!("WalWriter: Recovered last_checksum=({:#x}, {:#x})", c1, c2);
+                    println!("WalWriter: Recovered last_checksum=({c1:#x}, {c2:#x})");
                 }
             }
 
@@ -205,17 +206,14 @@ impl WalWriter {
                 }) {
                     Ok(res) => {
                         res_passive = res;
-                        println!("WalWriter: Recovery PASSIVE Result: {:?}", res_passive);
+                        println!("WalWriter: Recovery PASSIVE Result: {res_passive:?}");
                     }
                     Err(e) => {
-                        eprintln!("WalWriter: Recovery PASSIVE Failed: {}", e);
+                        eprintln!("WalWriter: Recovery PASSIVE Failed: {e}");
                     }
                 }
             } else {
-                log::debug!(
-                    "WalWriter: Checkpoint healthy or no frames: {:?}",
-                    res_passive
-                );
+                log::debug!("WalWriter: Checkpoint healthy or no frames: {res_passive:?}");
             }
 
             // SAFETY: Only TRUNCATE if we are sure data was checkpointed or if WAL is truly empty.
@@ -263,7 +261,7 @@ impl WalWriter {
                         row.get::<_, i32>(2)?,
                     ))
                 })?;
-            println!("WalWriter: Checkpoint result: {:?}", res);
+            println!("WalWriter: Checkpoint result: {res:?}");
         }
 
         Ok(())
@@ -288,10 +286,7 @@ impl WalWriter {
             );
             // We use PASSIVE to be safe. If it fails, we risk data loss, but we can't keep old frames with new header.
             if let Err(e) = self.checkpoint() {
-                eprintln!(
-                    "WalWriter: Checkpoint failed during re-initialization: {}",
-                    e
-                );
+                eprintln!("WalWriter: Checkpoint failed during re-initialization: {e}");
             }
         }
 
@@ -363,7 +358,7 @@ impl WalWriter {
             if self.initialized {
                 println!("WalWriter: Performing safety checkpoint before WAL reset...");
                 if let Err(e) = self.checkpoint() {
-                    eprintln!("WalWriter: Safety checkpoint failed: {}", e);
+                    eprintln!("WalWriter: Safety checkpoint failed: {e}");
                     // We proceed anyway because we must accept the new header, possibly losing data is better than stuck stream?
                     // Ideally we should retry or fail hard.
                 }
@@ -414,10 +409,7 @@ impl WalWriter {
                     u32::from_le_bytes(header[28..32].try_into().unwrap())
                 };
                 self.last_checksum = (h_c1, h_c2);
-                println!(
-                    "WalWriter: Reset last_checksum to Header Checksum: ({}, {})",
-                    h_c1, h_c2
-                );
+                println!("WalWriter: Reset last_checksum to Header Checksum: ({h_c1}, {h_c2})");
 
                 offset = 32; // After restoring header, the next write starts at 32.
             } else {

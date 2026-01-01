@@ -15,7 +15,7 @@ pub struct StreamClient {
 impl StreamClient {
     pub async fn connect(addr: String) -> Result<Self> {
         let client = ReplicationClient::connect(addr).await.map_err(|e| {
-            crate::error::Error::StorageError(format!("Failed to connect to stream: {}", e))
+            crate::error::Error::StorageError(format!("Failed to connect to stream: {e}"))
         })?;
 
         Ok(Self { client })
@@ -24,7 +24,7 @@ impl StreamClient {
     pub async fn stream_wal(&self, handshake: Handshake) -> Result<Streaming<WalPacket>> {
         let mut client = self.client.clone();
         let response = client.stream_wal(handshake).await.map_err(|e| {
-            crate::error::Error::StorageError(format!("Failed to stream wal: {}", e))
+            crate::error::Error::StorageError(format!("Failed to stream wal: {e}"))
         })?;
         Ok(response.into_inner())
     }
@@ -37,11 +37,11 @@ impl StreamClient {
         req.set_timeout(std::time::Duration::from_secs(5));
 
         let response = client.get_restore_config(req).await.map_err(|e| {
-            crate::error::Error::StorageError(format!("Failed to get restore config: {}", e))
+            crate::error::Error::StorageError(format!("Failed to get restore config: {e}"))
         })?;
         let config_json = response.into_inner().config_json;
         let config: crate::config::DbConfig = serde_json::from_str(&config_json).map_err(|e| {
-            crate::error::Error::StorageError(format!("Failed to parse restore config: {}", e))
+            crate::error::Error::StorageError(format!("Failed to parse restore config: {e}"))
         })?;
         Ok(config)
     }
@@ -61,12 +61,12 @@ impl StreamClient {
                 .stream_snapshot(request)
                 .await
                 .map_err(|e| {
-                    crate::error::Error::StorageError(format!("Failed to stream snapshot: {}", e))
+                    crate::error::Error::StorageError(format!("Failed to stream snapshot: {e}"))
                 })?
                 .into_inner();
 
             let mut file = std::fs::File::create(output_path).map_err(|e| {
-                crate::error::Error::StorageError(format!("Failed to create snapshot file: {}", e))
+                crate::error::Error::StorageError(format!("Failed to create snapshot file: {e}"))
             })?;
 
             let mut retry_after = None;
@@ -74,15 +74,14 @@ impl StreamClient {
             while let Some(msg) = stream
                 .message()
                 .await
-                .map_err(|e| crate::error::Error::StorageError(format!("Stream error: {}", e)))?
+                .map_err(|e| crate::error::Error::StorageError(format!("Stream error: {e}")))?
             {
                 match msg.payload {
                     Some(crate::sync::replication::snapshot_response::Payload::Chunk(data)) => {
                         use std::io::Write;
                         file.write_all(&data).map_err(|e| {
                             crate::error::Error::StorageError(format!(
-                                "Failed to write snapshot: {}",
-                                e
+                                "Failed to write snapshot: {e}"
                             ))
                         })?;
                     }
@@ -104,8 +103,7 @@ impl StreamClient {
 
             if let Some(duration) = retry_after {
                 println!(
-                    "Primary busy, retrying snapshot download in {:?}...",
-                    duration
+                    "Primary busy, retrying snapshot download in {duration:?}..."
                 );
                 tokio::time::sleep(duration).await;
                 continue;

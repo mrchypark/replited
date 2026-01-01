@@ -33,8 +33,7 @@ impl Config {
             Ok(toml_str) => toml_str,
             Err(e) => {
                 return Err(Error::ReadConfigFail(format!(
-                    "read config file {} fail: {:?}",
-                    config_file, e,
+                    "read config file {config_file} fail: {e:?}",
                 )));
             }
         };
@@ -43,8 +42,7 @@ impl Config {
             Ok(config) => config,
             Err(e) => {
                 return Err(Error::ParseConfigFail(format!(
-                    "parse config file {} fail: {:?}",
-                    config_file, e,
+                    "parse config file {config_file} fail: {e:?}",
                 )));
             }
         };
@@ -259,5 +257,184 @@ impl Debug for StorageConfig {
             .field("name", &self.name)
             .field("params", &self.params)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::config::StorageFsConfig;
+
+    fn create_valid_storage_config() -> StorageConfig {
+        StorageConfig {
+            name: "test-storage".to_string(),
+            params: StorageParams::Fs(Box::new(StorageFsConfig {
+                root: "/tmp/replited".to_string(),
+            })),
+        }
+    }
+
+    fn create_valid_db_config() -> DbConfig {
+        DbConfig {
+            db: "/tmp/test.db".to_string(),
+            replicate: vec![create_valid_storage_config()],
+            min_checkpoint_page_number: DEFAULT_MIN_CHECKPOINT_PAGE_NUMBER,
+            max_checkpoint_page_number: DEFAULT_MAX_CHECKPOINT_PAGE_NUMBER,
+            truncate_page_number: DEFAULT_TRUNCATE_PAGE_NUMBER,
+            checkpoint_interval_secs: DEFAULT_CHECKPOINT_INTERVAL_SECS,
+            apply_checkpoint_frame_interval: DEFAULT_APPLY_CHECKPOINT_FRAME_INTERVAL,
+            apply_checkpoint_interval_ms: DEFAULT_APPLY_CHECKPOINT_INTERVAL_MS,
+            wal_retention_count: DEFAULT_WAL_RETENTION_COUNT,
+            max_concurrent_snapshots: DEFAULT_MAX_CONCURRENT_SNAPSHOTS,
+        }
+    }
+
+    // ========== LogConfig tests ==========
+
+    #[test]
+    fn test_log_config_default() {
+        let log_config = LogConfig::default();
+        assert_eq!(LogLevel::Info, log_config.level);
+        assert_eq!("/var/log/replited", log_config.dir);
+    }
+
+    #[test]
+    fn test_log_config_display() {
+        let log_config = LogConfig {
+            level: LogLevel::Debug,
+            dir: "/custom/log".to_string(),
+        };
+        let display = format!("{}", log_config);
+        assert!(display.contains("Debug"));
+        assert!(display.contains("/custom/log"));
+    }
+
+    // ========== DbConfig validation tests ==========
+
+    #[test]
+    fn test_db_config_validate_success() {
+        let config = create_valid_db_config();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_db_config_validate_empty_replicate() {
+        let mut config = create_valid_db_config();
+        config.replicate = vec![];
+
+        let result = config.validate();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_db_config_validate_min_checkpoint_zero() {
+        let mut config = create_valid_db_config();
+        config.min_checkpoint_page_number = 0;
+
+        let result = config.validate();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_db_config_validate_min_greater_than_max() {
+        let mut config = create_valid_db_config();
+        config.min_checkpoint_page_number = 10000;
+        config.max_checkpoint_page_number = 1000;
+
+        let result = config.validate();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_db_config_validate_apply_checkpoint_frame_interval_zero() {
+        let mut config = create_valid_db_config();
+        config.apply_checkpoint_frame_interval = 0;
+
+        let result = config.validate();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_db_config_validate_min_equals_max() {
+        // Edge case: min equals max should be valid
+        let mut config = create_valid_db_config();
+        config.min_checkpoint_page_number = 5000;
+        config.max_checkpoint_page_number = 5000;
+
+        assert!(config.validate().is_ok());
+    }
+
+    // ========== Default value function tests ==========
+
+    #[test]
+    fn test_default_values() {
+        assert_eq!(1000, default_min_checkpoint_page_number());
+        assert_eq!(10000, default_max_checkpoint_page_number());
+        assert_eq!(500000, default_truncate_page_number());
+        assert_eq!(60, default_checkpoint_interval_secs());
+        assert_eq!(128, default_apply_checkpoint_frame_interval());
+        assert_eq!(2000, default_apply_checkpoint_interval_ms());
+        assert_eq!(10, default_wal_retention_count());
+        assert_eq!(5, default_max_concurrent_snapshots());
+    }
+
+    // ========== Config validation tests ==========
+
+    #[test]
+    fn test_config_validate_empty_database() {
+        let config = Config {
+            log: LogConfig::default(),
+            database: vec![],
+        };
+
+        let result = config.validate();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_config_validate_with_valid_db() {
+        let config = Config {
+            log: LogConfig::default(),
+            database: vec![create_valid_db_config()],
+        };
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validate_propagates_db_error() {
+        let mut db_config = create_valid_db_config();
+        db_config.replicate = vec![]; // Invalid
+
+        let config = Config {
+            log: LogConfig::default(),
+            database: vec![db_config],
+        };
+
+        let result = config.validate();
+        assert!(result.is_err());
+    }
+
+    // ========== DbConfig Debug tests ==========
+
+    #[test]
+    fn test_db_config_debug_format() {
+        let config = create_valid_db_config();
+        let debug_str = format!("{:?}", config);
+
+        assert!(debug_str.contains("ReplicateDbConfig"));
+        assert!(debug_str.contains("/tmp/test.db"));
+    }
+
+    // ========== StorageConfig Debug tests ==========
+
+    #[test]
+    fn test_storage_config_debug_format() {
+        let config = create_valid_storage_config();
+        let debug_str = format!("{:?}", config);
+
+        assert!(debug_str.contains("StorageS3Config"));
+        assert!(debug_str.contains("test-storage"));
     }
 }

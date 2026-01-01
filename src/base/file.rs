@@ -22,7 +22,7 @@ pub fn path_base(path: &str) -> Result<String> {
     path_buf
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
-        .ok_or(Error::InvalidPath(format!("invalid path {}", path)))
+        .ok_or(Error::InvalidPath(format!("invalid path {path}")))
 }
 
 pub fn parent_dir(path: &str) -> Option<String> {
@@ -36,17 +36,17 @@ pub fn parse_wal_path(path: &str) -> Result<u64> {
     let base = path_base(path)?;
     let a = WAL_REGEX
         .captures(&base)
-        .ok_or(Error::InvalidPath(format!("invalid wal path {}", path)))?;
+        .ok_or(Error::InvalidPath(format!("invalid wal path {path}")))?;
     let a = a
         .get(1)
-        .ok_or(Error::InvalidPath(format!("invalid wal path {}", path)))?
+        .ok_or(Error::InvalidPath(format!("invalid wal path {path}")))?
         .as_str();
 
     Ok(a.parse::<u64>()?)
 }
 
 pub fn format_wal_path(index: u64) -> String {
-    format!("{:0>10}{}", index, WAL_EXTENDION)
+    format!("{index:0>10}{WAL_EXTENDION}")
 }
 
 pub fn parse_wal_segment_path(path: &str) -> Result<(u64, u64)> {
@@ -54,21 +54,18 @@ pub fn parse_wal_segment_path(path: &str) -> Result<(u64, u64)> {
     let a = WAL_SEGMENT_REGEX
         .captures(&base)
         .ok_or(Error::InvalidPath(format!(
-            "invalid wal segment path {}",
-            path
+            "invalid wal segment path {path}"
         )))?;
     let index = a
         .get(1)
         .ok_or(Error::InvalidPath(format!(
-            "invalid wal segment path {}",
-            path
+            "invalid wal segment path {path}"
         )))?
         .as_str();
     let offset = a
         .get(2)
         .ok_or(Error::InvalidPath(format!(
-            "invalid wal segment path {}",
-            path
+            "invalid wal segment path {path}"
         )))?
         .as_str();
 
@@ -84,21 +81,18 @@ pub fn parse_snapshot_path(path: &str) -> Result<(u64, u64)> {
     let a = SNAPSHOT_REGEX
         .captures(&base)
         .ok_or(Error::InvalidPath(format!(
-            "invalid snapshot path {}",
-            path
+            "invalid snapshot path {path}"
         )))?;
     let index = a
         .get(1)
         .ok_or(Error::InvalidPath(format!(
-            "invalid snapshot path {}",
-            path
+            "invalid snapshot path {path}"
         )))?
         .as_str();
     let offset = a
         .get(2)
         .ok_or(Error::InvalidPath(format!(
-            "invalid snapshot path {}",
-            path
+            "invalid snapshot path {path}"
         )))?
         .as_str();
 
@@ -106,7 +100,7 @@ pub fn parse_snapshot_path(path: &str) -> Result<(u64, u64)> {
 }
 
 pub fn format_snapshot_path(index: u64, offset: u64) -> String {
-    format!("{:0>10}_{:0>10}{}", index, offset, SNAPSHOT_EXTENDION)
+    format!("{index:0>10}_{offset:0>10}{SNAPSHOT_EXTENDION}")
 }
 
 pub fn local_generations_dir(meta_dir: &str) -> String {
@@ -177,7 +171,7 @@ pub fn walsegment_file(db: &str, generation: &str, index: u64, offset: u64) -> S
 }
 
 pub fn format_walsegment_path(index: u64, offset: u64) -> String {
-    format!("{:0>10}_{:0>10}{}", index, offset, WAL_SEGMENT_EXTENDION)
+    format!("{index:0>10}_{offset:0>10}{WAL_SEGMENT_EXTENDION}")
 }
 
 // returns the path of the name of the current generation.

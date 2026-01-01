@@ -18,7 +18,7 @@ enum OtherErrors {
 impl Display for OtherErrors {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         match self {
-            OtherErrors::AnyHow { error } => write!(f, "{}", error),
+            OtherErrors::AnyHow { error } => write!(f, "{error}"),
         }
     }
 }
@@ -26,14 +26,14 @@ impl Display for OtherErrors {
 impl Debug for OtherErrors {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         match self {
-            OtherErrors::AnyHow { error } => write!(f, "{:?}", error),
+            OtherErrors::AnyHow { error } => write!(f, "{error:?}"),
         }
     }
 }
 
 impl From<log::SetLoggerError> for Error {
     fn from(error: log::SetLoggerError) -> Self {
-        Error::InitLoggerError(format!("Set logger error: {}", error))
+        Error::InitLoggerError(format!("Set logger error: {error}"))
     }
 }
 
@@ -52,7 +52,7 @@ impl From<anyhow::Error> for Error {
 
 impl From<rusqlite::Error> for Error {
     fn from(error: rusqlite::Error) -> Self {
-        Error::SqliteError(format!("sqlite error: {}", error))
+        Error::SqliteError(format!("sqlite error: {error}"))
     }
 }
 

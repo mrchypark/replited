@@ -28,7 +28,7 @@ impl Command for Restore {
         for config in &self.config.database {
             if config.db == self.options.db {
                 let ret = run_restore(config, &self.options).await;
-                println!("restore result: {:?}", ret);
+                println!("restore result: {ret:?}");
                 return Ok(());
             }
         }

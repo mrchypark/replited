@@ -86,21 +86,21 @@ impl Restore {
         );
 
         // Clean up existing WAL and SHM files to prevent corruption
-        let wal_path = format!("{}-wal", path);
+        let wal_path = format!("{path}-wal");
         let _ = fs::remove_file(&wal_path);
-        let _ = fs::remove_file(format!("{}-shm", path));
+        let _ = fs::remove_file(format!("{path}-shm"));
 
         let mut file = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
-            .open(format!("{}.tmp", path))?;
+            .open(format!("{path}.tmp"))?;
 
         file.write_all(&decompressed_data)?;
         file.sync_all()?;
 
         // Verify integrity of the downloaded snapshot
-        let temp_path = format!("{}.tmp", path);
+        let temp_path = format!("{path}.tmp");
         {
             let conn = Connection::open(&temp_path)?;
             conn.pragma_query(None, "integrity_check", |row| {
@@ -108,7 +108,7 @@ impl Restore {
                 if s != "ok" {
                     return Err(rusqlite::Error::SqliteFailure(
                         rusqlite::ffi::Error::new(11), // SQLITE_CORRUPT
-                        Some(format!("Integrity check failed: {}", s)),
+                        Some(format!("Integrity check failed: {s}")),
                     ));
                 }
                 Ok(())
@@ -133,7 +133,7 @@ impl Restore {
             "restore db {} apply wal segments: {:?}",
             self.db, wal_segments
         );
-        let wal_file_name = format!("{}-wal", db_path);
+        let wal_file_name = format!("{db_path}-wal");
         let mut last_offset = 0;
 
         for (index, offsets) in wal_segments {
@@ -150,9 +150,7 @@ impl Restore {
                 };
 
                 // Filtering logic based on last_index and last_offset
-                if *index < last_index {
-                    continue;
-                } else if *index == last_index && *offset < last_offset {
+                if *index < last_index || (*index == last_index && *offset < last_offset) {
                     continue;
                 }
 
@@ -169,20 +167,18 @@ impl Restore {
             // prepare db wal before open db connection
             let should_truncate = *index > last_index;
 
-            if should_truncate {
-                if fs::metadata(&wal_file_name).is_ok() {
-                    // If we are about to truncate the WAL (new generation), we must ensure
-                    // the existing WAL is fully checkpointed into the DB.
-                    // Otherwise we lose data.
-                    let connection = Connection::open(db_path)?;
-                    if let Err(e) =
-                        connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_row| Ok(()))
-                    {
-                        error!("truncate checkpoint failed before new generation: {:?}", e);
-                        // We continue, hoping for the best? Or fail?
-                        // If checkpoint fails, we probably lose data.
-                        return Err(e.into());
-                    }
+            if should_truncate && fs::metadata(&wal_file_name).is_ok() {
+                // If we are about to truncate the WAL (new generation), we must ensure
+                // the existing WAL is fully checkpointed into the DB.
+                // Otherwise we lose data.
+                let connection = Connection::open(db_path)?;
+                if let Err(e) =
+                    connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_row| Ok(()))
+                {
+                    error!("truncate checkpoint failed before new generation: {e:?}");
+                    // We continue, hoping for the best? Or fail?
+                    // If checkpoint fails, we probably lose data.
+                    return Err(e.into());
                 }
             }
 
@@ -195,8 +191,7 @@ impl Restore {
                 );
             } else {
                 println!(
-                    "WAL file {} does not exist, should_truncate: {}",
-                    wal_file_name, should_truncate
+                    "WAL file {wal_file_name} does not exist, should_truncate: {should_truncate}"
                 );
             }
 
@@ -259,9 +254,9 @@ impl Restore {
 
             let mut new_segments = Vec::new();
             for segment in wal_segments {
-                if segment.index > last_index {
-                    new_segments.push(segment);
-                } else if segment.index == last_index && segment.offset >= last_offset {
+                if segment.index > last_index
+                    || (segment.index == last_index && segment.offset >= last_offset)
+                {
                     new_segments.push(segment);
                 }
             }
@@ -301,10 +296,7 @@ impl Restore {
 
                 last_index = new_last_index;
                 last_offset = new_last_offset;
-                println!(
-                    "applied updates up to index {}, offset {}",
-                    last_index, last_offset
-                );
+                println!("applied updates up to index {last_index}, offset {last_offset}");
             }
 
             // 2. Check for new generations (restarts)
@@ -354,11 +346,9 @@ impl Restore {
 
     pub async fn run(&self) -> Result<Option<crate::database::WalGenerationPos>> {
         // Ensure output path does not already exist.
-        if fs::exists(&self.options.output)? {
-            if !self.options.follow {
-                println!("db {} already exists but cannot overwrite", self.db);
-                return Err(Error::OverwriteDbError("cannot overwrite exist db"));
-            }
+        if fs::exists(&self.options.output)? && !self.options.follow {
+            println!("db {} already exists but cannot overwrite", self.db);
+            return Err(Error::OverwriteDbError("cannot overwrite exist db"));
         }
 
         let limit = if self.options.timestamp.is_empty() {
@@ -396,34 +386,33 @@ impl Restore {
         let mut resume = false;
 
         if self.options.follow && fs::exists(&target_path)? {
-            info!("db {} exists, trying to resume...", target_path);
+            info!("db {target_path} exists, trying to resume...");
             // Try to determine last_index and last_offset from WAL file
-            let wal_path = format!("{}-wal", target_path);
+            let wal_path = format!("{target_path}-wal");
             if let Ok(metadata) = fs::metadata(&wal_path) {
                 let current_offset = metadata.len();
                 let mut valid = false;
 
                 // Validate WAL file integrity
-                if current_offset > WAL_HEADER_SIZE as u64 {
+                if current_offset > WAL_HEADER_SIZE {
                     match WALHeader::read(&wal_path) {
                         Ok(header) => {
-                            let frame_size = WAL_FRAME_HEADER_SIZE as u64 + header.page_size;
-                            let remainder = (current_offset - WAL_HEADER_SIZE as u64) % frame_size;
+                            let frame_size = WAL_FRAME_HEADER_SIZE + header.page_size;
+                            let remainder = (current_offset - WAL_HEADER_SIZE) % frame_size;
                             if remainder == 0 {
                                 valid = true;
                             } else {
                                 warn!(
-                                    "WAL file {} has partial frame (remainder {}), deleting it",
-                                    wal_path, remainder
+                                    "WAL file {wal_path} has partial frame (remainder {remainder}), deleting it"
                                 );
                             }
                         }
                         Err(e) => {
-                            error!("Failed to read WAL header: {:?}, deleting WAL file", e);
+                            error!("Failed to read WAL header: {e:?}, deleting WAL file");
                         }
                     }
                 } else if current_offset > 0 {
-                    warn!("WAL file {} is too small for header, deleting it", wal_path);
+                    warn!("WAL file {wal_path} is too small for header, deleting it");
                 } else {
                     // Empty file is valid (start from 0)
                     valid = true;
@@ -431,7 +420,7 @@ impl Restore {
 
                 if !valid {
                     let _ = fs::remove_file(&wal_path);
-                    let shm_path = format!("{}-shm", target_path);
+                    let shm_path = format!("{target_path}-shm");
                     let _ = fs::remove_file(&shm_path);
                     // last_index and last_offset remain 0
                 } else {
@@ -444,10 +433,7 @@ impl Restore {
                         .max()
                         .unwrap_or(0);
 
-                    info!(
-                        "resuming from index {}, offset {}",
-                        last_index, current_offset
-                    );
+                    info!("resuming from index {last_index}, offset {current_offset}");
                     resume = true;
                 }
             }

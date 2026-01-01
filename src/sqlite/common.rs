@@ -117,13 +117,210 @@ pub(crate) fn from_be_bytes_at(data: &[u8], offset: usize) -> Result<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::align_frame;
-    use crate::error::Result;
+    use super::*;
+
+    // ========== align_frame tests ==========
 
     #[test]
-    fn test_align_frame() -> Result<()> {
-        assert_eq!(4152, align_frame(4096, 4152));
+    fn test_align_frame_at_header_boundary() {
+        // Exactly at header size should return header size
+        assert_eq!(WAL_HEADER_SIZE, align_frame(4096, WAL_HEADER_SIZE));
+    }
 
-        Ok(())
+    #[test]
+    fn test_align_frame_below_header() {
+        // Below header size should return 0
+        assert_eq!(0, align_frame(4096, 0));
+        assert_eq!(0, align_frame(4096, 16));
+        assert_eq!(0, align_frame(4096, 31));
+    }
+
+    #[test]
+    fn test_align_frame_first_frame() {
+        // First frame starts at header size (32)
+        let page_size = 4096;
+        let frame_size = WAL_FRAME_HEADER_SIZE + page_size;
+
+        // Offset within the first frame should align to header size
+        assert_eq!(
+            WAL_HEADER_SIZE,
+            align_frame(page_size, WAL_HEADER_SIZE + 100)
+        );
+        assert_eq!(
+            WAL_HEADER_SIZE,
+            align_frame(page_size, WAL_HEADER_SIZE + frame_size - 1)
+        );
+    }
+
+    #[test]
+    fn test_align_frame_second_frame() {
+        let page_size = 4096;
+        let frame_size = WAL_FRAME_HEADER_SIZE + page_size;
+        let second_frame_start = WAL_HEADER_SIZE + frame_size;
+
+        // Offset at second frame start
+        assert_eq!(
+            second_frame_start,
+            align_frame(page_size, second_frame_start)
+        );
+        // Offset within second frame
+        assert_eq!(
+            second_frame_start,
+            align_frame(page_size, second_frame_start + 1000)
+        );
+    }
+
+    #[test]
+    fn test_align_frame_various_page_sizes() {
+        for page_size in [1024u64, 2048, 4096, 8192, 16384, 32768, 65536] {
+            let frame_size = WAL_FRAME_HEADER_SIZE + page_size;
+
+            // At exact frame boundary
+            let exact_offset = WAL_HEADER_SIZE + frame_size * 5;
+            assert_eq!(exact_offset, align_frame(page_size, exact_offset));
+
+            // Just past frame boundary
+            assert_eq!(exact_offset, align_frame(page_size, exact_offset + 1));
+        }
+    }
+
+    // ========== checksum tests ==========
+
+    #[test]
+    fn test_checksum_empty_initial_seeds() {
+        // 8 bytes of zeros
+        let data = [0u8; 8];
+        let (s1, s2) = checksum(&data, 0, 0, false);
+        // With all zeros, the result depends on the algorithm
+        // s1 = 0 + 0 + 0 = 0, s2 = 0 + 0 + 0 = 0
+        assert_eq!((0, 0), (s1, s2));
+    }
+
+    #[test]
+    fn test_checksum_with_nonzero_seeds() {
+        let data = [0u8; 8];
+        let (s1, s2) = checksum(&data, 100, 200, false);
+        // With seeds but zero data:
+        // s1 = 100 + 0 + 200 = 300
+        // s2 = 200 + 0 + 300 = 500
+        assert_eq!(300, s1);
+        assert_eq!(500, s2);
+    }
+
+    #[test]
+    fn test_checksum_little_endian() {
+        // Test data: [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]
+        let data = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+        let (s1, s2) = checksum(&data, 0, 0, false);
+
+        // Little-endian: n1 = 0x04030201, n2 = 0x08070605
+        let n1 = u32::from_le_bytes([0x01, 0x02, 0x03, 0x04]);
+        let n2 = u32::from_le_bytes([0x05, 0x06, 0x07, 0x08]);
+
+        // s1 = 0 + n1 + 0 = n1
+        // s2 = 0 + n2 + s1 = n2 + n1
+        let expected_s1 = n1;
+        let expected_s2 = n2.wrapping_add(expected_s1);
+
+        assert_eq!(expected_s1, s1);
+        assert_eq!(expected_s2, s2);
+    }
+
+    #[test]
+    fn test_checksum_big_endian() {
+        let data = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+        let (s1, s2) = checksum(&data, 0, 0, true);
+
+        // Big-endian: n1 = 0x01020304, n2 = 0x05060708
+        let n1 = u32::from_be_bytes([0x01, 0x02, 0x03, 0x04]);
+        let n2 = u32::from_be_bytes([0x05, 0x06, 0x07, 0x08]);
+
+        let expected_s1 = n1;
+        let expected_s2 = n2.wrapping_add(expected_s1);
+
+        assert_eq!(expected_s1, s1);
+        assert_eq!(expected_s2, s2);
+    }
+
+    #[test]
+    fn test_checksum_multiple_iterations() {
+        // 24 bytes = 3 iterations of 8 bytes
+        let data = [0xFFu8; 24];
+        let (s1, s2) = checksum(&data, 0, 0, false);
+
+        // This should not panic (overflow is handled with wrapping_add)
+        // Just verify it produces consistent results
+        assert!(s1 > 0 || s2 > 0); // At least one should be non-zero
+    }
+
+    #[test]
+    fn test_checksum_wrapping_overflow() {
+        // Use max values to trigger overflow
+        let data = [0xFF; 8];
+        // Start with seeds near max
+        let (s1, s2) = checksum(&data, u32::MAX - 100, u32::MAX - 100, false);
+
+        // Should not panic due to wrapping_add
+        // Just verify it runs without panic
+        let _ = (s1, s2);
+    }
+
+    #[test]
+    fn test_checksum_consistency() {
+        let data = [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0];
+
+        // Same input should produce same output
+        let (s1_a, s2_a) = checksum(&data, 0, 0, false);
+        let (s1_b, s2_b) = checksum(&data, 0, 0, false);
+
+        assert_eq!(s1_a, s1_b);
+        assert_eq!(s2_a, s2_b);
+    }
+
+    #[test]
+    #[should_panic(expected = "data length must be a multiple of 8")]
+    fn test_checksum_invalid_length_panics() {
+        let data = [0u8; 7]; // Not a multiple of 8
+        checksum(&data, 0, 0, false);
+    }
+
+    // ========== CheckpointMode tests ==========
+
+    #[test]
+    fn test_checkpoint_mode_as_str() {
+        assert_eq!("PASSIVE", CheckpointMode::Passive.as_str());
+        assert_eq!("FULL", CheckpointMode::Full.as_str());
+        assert_eq!("RESTART", CheckpointMode::Restart.as_str());
+        assert_eq!("TRUNCATE", CheckpointMode::Truncate.as_str());
+    }
+
+    // ========== from_be_bytes_at tests ==========
+
+    #[test]
+    fn test_from_be_bytes_at_zero_offset() {
+        let data = [0x12, 0x34, 0x56, 0x78, 0x00, 0x00, 0x00, 0x00];
+        let result = from_be_bytes_at(&data, 0).unwrap();
+        assert_eq!(0x12345678, result);
+    }
+
+    #[test]
+    fn test_from_be_bytes_at_nonzero_offset() {
+        let data = [0x00, 0x00, 0x00, 0x00, 0xAB, 0xCD, 0xEF, 0x01];
+        let result = from_be_bytes_at(&data, 4).unwrap();
+        assert_eq!(0xABCDEF01, result);
+    }
+
+    #[test]
+    fn test_from_be_bytes_at_max_value() {
+        let data = [0xFF, 0xFF, 0xFF, 0xFF];
+        let result = from_be_bytes_at(&data, 0).unwrap();
+        assert_eq!(u32::MAX, result);
+    }
+
+    #[test]
+    fn test_from_be_bytes_at_min_value() {
+        let data = [0x00, 0x00, 0x00, 0x00];
+        let result = from_be_bytes_at(&data, 0).unwrap();
+        assert_eq!(0, result);
     }
 }

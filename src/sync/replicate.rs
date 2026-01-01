@@ -236,14 +236,14 @@ impl Replicate {
         match cmd {
             ReplicateCommand::DbChanged(pos) => {
                 if let Err(e) = self.sync(pos).await {
-                    error!("sync db error: {:?}", e);
+                    error!("sync db error: {e:?}");
                     // Clear last position if if an error occurs during sync.
                     self.reset_position();
                 }
             }
             ReplicateCommand::Snapshot((pos, compressed_data)) => {
                 if let Err(e) = self.sync_snapshot(pos, compressed_data).await {
-                    error!("sync db snapshot error: {:?}", e);
+                    error!("sync db snapshot error: {e:?}");
                 }
             }
         }

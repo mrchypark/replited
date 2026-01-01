@@ -36,10 +36,10 @@ impl Command for Replicate {
             // Check for stream replication config
 
             for replicate in &database.replicate {
-                println!("Checking replicate: {:?}", replicate);
+                println!("Checking replicate: {replicate:?}");
                 match &replicate.params {
                     crate::config::StorageParams::Stream(s) => {
-                        println!("Found stream config: {:?}", s);
+                        println!("Found stream config: {s:?}");
                         db_paths.insert(database.db.clone(), database.db.clone());
                         if stream_addr.is_none() {
                             stream_addr = Some(s.addr.clone());
@@ -66,19 +66,19 @@ impl Command for Replicate {
                     .trim_start_matches("http://")
                     .trim_start_matches("https://");
                 let addr = addr_str.parse().map_err(|e| {
-                    crate::error::Error::InvalidArg(format!("Invalid stream address: {}", e))
+                    crate::error::Error::InvalidArg(format!("Invalid stream address: {e}"))
                 })?;
 
-                println!("Starting ReplicationServer at {}", addr);
-                log::info!("Starting ReplicationServer at {}", addr);
+                println!("Starting ReplicationServer at {addr}");
+                log::info!("Starting ReplicationServer at {addr}");
                 let handle = tokio::spawn(async move {
-                    println!("ReplicationServer serving at {}", addr);
+                    println!("ReplicationServer serving at {addr}");
                     if let Err(e) = Server::builder()
                         .add_service(TonicReplicationServer::new(server))
                         .serve(addr)
                         .await
                     {
-                        log::error!("ReplicationServer error: {}", e);
+                        log::error!("ReplicationServer error: {e}");
                     }
                 });
                 handles.push(handle);

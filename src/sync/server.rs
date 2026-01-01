@@ -97,8 +97,8 @@ impl Replication for ReplicationServer {
         })?;
 
         let config_json = serde_json::to_string(db_config).map_err(|e| {
-            eprintln!("Primary: Failed to serialize config: {}", e);
-            Status::internal(format!("Failed to serialize config: {}", e))
+            eprintln!("Primary: Failed to serialize config: {e}");
+            Status::internal(format!("Failed to serialize config: {e}"))
         })?;
 
         eprintln!("Primary: Sending restore config");
@@ -139,7 +139,7 @@ impl Replication for ReplicationServer {
                 let mut wal_header = match crate::sqlite::WALHeader::read(&wal_path) {
                     Ok(h) => h,
                     Err(e) => {
-                        eprintln!("Primary: Failed to read WAL header: {}.", e);
+                        eprintln!("Primary: Failed to read WAL header: {e}.");
                         // If we can't read header yet (e.g. empty file at start), we can't stream.
                         // Retry loop or continue?
                         // For simplicity, sleep and continue
@@ -168,7 +168,7 @@ impl Replication for ReplicationServer {
                         )),
                     };
                     if let Err(e) = tx.send(Ok(header_packet)).await {
-                        eprintln!("Primary: Failed to send header: {}", e);
+                        eprintln!("Primary: Failed to send header: {e}");
                         return;
                     }
                     sent_header = true;
@@ -202,12 +202,11 @@ impl Replication for ReplicationServer {
                                 if let Ok(new_header) =
                                     crate::sqlite::WALHeader::read_from(&mut cursor)
                                 {
-                                    wal_header = new_header;
-                                } else {
-                                    // If parsing fails (e.g. bad magic), we MUST still update salt
-                                    // or we will loop forever thinking salt changed.
-                                    wal_header.salt1 = new_salt1;
+                                    // Update wal_header with the new header from disk
+                                    let _ = new_header; // Acknowledge read but header will be refreshed in next loop iteration
                                 }
+                                // Update salt to prevent infinite loop on salt mismatch
+                                wal_header.salt1 = new_salt1;
 
                                 offset = WAL_HEADER_SIZE;
                                 sent_header = false;
@@ -219,22 +218,13 @@ impl Replication for ReplicationServer {
                             // If we are expecting a valid WAL (offset > header), and can't read header -> Truncated/Deleted.
                             if offset > WAL_HEADER_SIZE {
                                 eprintln!(
-                                    "Primary: Failed to read WAL Header ({}). Assuming Truncate/Reset.",
-                                    e
+                                    "Primary: Failed to read WAL Header ({e}). Assuming Truncate/Reset."
                                 );
                                 offset = WAL_HEADER_SIZE;
                                 sent_header = false;
                                 last_checksum = None;
 
-                                // Try to reload header if possible
-                                if let Ok(_) = file_handle.read_exact(&mut header_buf) {
-                                    let mut cursor = std::io::Cursor::new(&header_buf);
-                                    if let Ok(new_header) =
-                                        crate::sqlite::WALHeader::read_from(&mut cursor)
-                                    {
-                                        wal_header = new_header;
-                                    }
-                                }
+                                // Header will be re-read at the start of the next loop iteration
 
                                 continue;
                             }
@@ -253,7 +243,7 @@ impl Replication for ReplicationServer {
                 let wal_len = match std::fs::metadata(&wal_path) {
                     Ok(meta) => align_frame(page_size, meta.len()),
                     Err(e) => {
-                        eprintln!("Primary: wal metadata error: {}", e);
+                        eprintln!("Primary: wal metadata error: {e}");
                         sleep(Duration::from_millis(200)).await;
                         continue;
                     }
@@ -265,8 +255,7 @@ impl Replication for ReplicationServer {
                     // Ideally we should trigger a Full Resync (Snapshot).
                     // For now, we reset offset and hope the new data covers it, or warn loudly.
                     eprintln!(
-                        "Primary: WAL Truncated! (len {} < offset {}). Resetting to header...",
-                        wal_len, offset
+                        "Primary: WAL Truncated! (len {wal_len} < offset {offset}). Resetting to header..."
                     );
 
                     // Reset to header
@@ -276,12 +265,8 @@ impl Replication for ReplicationServer {
 
                     // Also update our cached header so we don't loop on salt check
                     let mut head = [0u8; 32];
-                    if let Ok(_) = File::open(&wal_path).and_then(|mut f| f.read_exact(&mut head)) {
-                        let mut cursor = std::io::Cursor::new(&head);
-                        if let Ok(new_header) = crate::sqlite::WALHeader::read_from(&mut cursor) {
-                            wal_header = new_header;
-                        }
-                    }
+                    // Header will be re-read at the start of the next loop iteration
+                    let _ = File::open(&wal_path).and_then(|mut f| f.read_exact(&mut head));
 
                     sleep(Duration::from_millis(100)).await;
                     continue;
@@ -295,8 +280,7 @@ impl Replication for ReplicationServer {
                 if let Ok(meta) = std::fs::metadata(&wal_path) {
                     let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
                     eprintln!(
-                        "Primary: streaming wal tail offset {} -> {} (len {}), mtime={:?}",
-                        offset, wal_len, wal_len, mtime
+                        "Primary: streaming wal tail offset {offset} -> {wal_len} (len {wal_len}), mtime={mtime:?}"
                     );
                 }
 
@@ -311,7 +295,7 @@ impl Replication for ReplicationServer {
                         let frame = match WALFrame::read(&mut f, page_size) {
                             Ok(frame) => frame,
                             Err(e) => {
-                                eprintln!("Primary: WAL read error at offset {}: {}", offset, e);
+                                eprintln!("Primary: WAL read error at offset {offset}: {e}");
                                 break;
                             }
                         };
@@ -335,8 +319,7 @@ impl Replication for ReplicationServer {
                                 // Header is same, so this frame is just garbage/stale data from previous usage.
                                 // Treat as EOF (waiting for overwrite).
                                 eprintln!(
-                                    "Primary: Encountered stale frame (salt mismatch) at offset {}, waiting for overwrite...",
-                                    offset
+                                    "Primary: Encountered stale frame (salt mismatch) at offset {offset}, waiting for overwrite..."
                                 );
                                 break;
                             }
@@ -372,8 +355,7 @@ impl Replication for ReplicationServer {
                                 break;
                             } else {
                                 eprintln!(
-                                    "Primary: WAL checksum mismatch at offset {} (stale data?), waiting...",
-                                    offset
+                                    "Primary: WAL checksum mismatch at offset {offset} (stale data?), waiting..."
                                 );
                                 break;
                             }
@@ -387,7 +369,7 @@ impl Replication for ReplicationServer {
                             )),
                         };
                         if let Err(e) = tx.send(Ok(packet)).await {
-                            eprintln!("Primary: Failed to send packet: {}", e);
+                            eprintln!("Primary: Failed to send packet: {e}");
                             return;
                         }
                     }
@@ -411,13 +393,13 @@ impl Replication for ReplicationServer {
         let semaphore = self
             .snapshot_semaphores
             .get(&db_name)
-            .ok_or_else(|| Status::not_found(format!("Database {} not found", db_name)))?
+            .ok_or_else(|| Status::not_found(format!("Database {db_name} not found")))?
             .clone();
 
         let db_path = self
             .db_paths
             .get(&db_name)
-            .ok_or_else(|| Status::not_found(format!("Database {} not found", db_name)))?
+            .ok_or_else(|| Status::not_found(format!("Database {db_name} not found")))?
             .clone();
 
         // Try acquire permit
@@ -448,11 +430,11 @@ impl Replication for ReplicationServer {
                 match rusqlite::Connection::open(&db_path) {
                     Ok(conn) => {
                         if let Err(e) = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
-                            eprintln!("Primary: Checkpoint failed: {}", e);
+                            eprintln!("Primary: Checkpoint failed: {e}");
                         }
                     }
                     Err(e) => {
-                        eprintln!("Primary: Failed to open DB for checkpoint: {}", e);
+                        eprintln!("Primary: Failed to open DB for checkpoint: {e}");
                     }
                 }
             }
@@ -462,7 +444,7 @@ impl Replication for ReplicationServer {
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos();
-            let snapshot_path = std::env::temp_dir().join(format!("snapshot_{}.zst", timestamp));
+            let snapshot_path = std::env::temp_dir().join(format!("snapshot_{timestamp}.zst"));
 
             let compression_result = (|| -> std::io::Result<()> {
                 let mut source = std::fs::File::open(&db_path)?;
@@ -483,31 +465,32 @@ impl Replication for ReplicationServer {
                                     Ok(0) => break, // EOF
                                     Ok(n) => {
                                         let chunk = buffer[0..n].to_vec();
-                                        if let Err(_) = tx
+                                        if tx
                                             .send(Ok(SnapshotResponse {
                                                 payload: Some(Payload::Chunk(chunk)),
                                             }))
                                             .await
+                                            .is_err()
                                         {
                                             break; // Receiver dropped
                                         }
                                     }
                                     Err(e) => {
-                                        eprintln!("Primary: Failed to read snapshot file: {}", e);
+                                        eprintln!("Primary: Failed to read snapshot file: {e}");
                                         break;
                                     }
                                 }
                             }
                         }
                         Err(e) => {
-                            eprintln!("Primary: Failed to open snapshot file: {}", e);
+                            eprintln!("Primary: Failed to open snapshot file: {e}");
                         }
                     }
                     // Cleanup
                     let _ = std::fs::remove_file(snapshot_path);
                 }
                 Err(e) => {
-                    eprintln!("Primary: zstd compression failed: {}", e);
+                    eprintln!("Primary: zstd compression failed: {e}");
                 }
             }
         });

@@ -83,7 +83,7 @@ impl StorageClient {
         }
 
         if !exist {
-            debug!("create dir {}", base);
+            debug!("create dir {base}");
             self.operator.create_dir(&base).await?;
         }
 
@@ -101,7 +101,7 @@ impl StorageClient {
             pos.index,
             pos.offset,
         );
-        let temp_file = format!("{}.tmp", file);
+        let temp_file = format!("{file}.tmp");
 
         self.ensure_parent_exist(&file).await?;
 
@@ -122,7 +122,7 @@ impl StorageClient {
             pos.index,
             pos.offset,
         );
-        let temp_file = format!("{}.tmp", snapshot_file);
+        let temp_file = format!("{snapshot_file}.tmp");
         let snapshot_info = SnapshotInfo {
             generation: pos.generation.clone(),
             index: pos.index,
@@ -201,7 +201,7 @@ impl StorageClient {
     async fn max_snapshot(&self, generation: &str) -> Result<Option<SnapshotInfo>> {
         let generation = Generation::try_create(generation)?;
         let snapshots_dir = snapshots_dir(&self.db_name, generation.as_str());
-        debug!("max_snapshot: listing snapshots in {}", snapshots_dir);
+        debug!("max_snapshot: listing snapshots in {snapshots_dir}");
         let entries = self
             .operator
             .list_with(&snapshots_dir)
@@ -324,7 +324,7 @@ impl StorageClient {
                             wal_segment.index,
                             wal_segment.offset
                         );
-                        error!("{}", msg);
+                        error!("{msg}");
                         return Err(Error::InvalidWalSegmentError(msg));
                     }
                     offsets.push(wal_segment.offset);
@@ -337,7 +337,7 @@ impl StorageClient {
                             wal_segment.index,
                             wal_segment.offset
                         );
-                        error!("{}", msg);
+                        error!("{msg}");
                         return Err(Error::InvalidWalSegmentError(msg));
                     }
                     restore_wal_segments.insert(wal_segment.index, vec![wal_segment.offset]);
@@ -350,7 +350,7 @@ impl StorageClient {
 
     pub async fn restore_info(&self, limit: Option<DateTime<Utc>>) -> Result<Option<RestoreInfo>> {
         let dir = remote_generations_dir(&self.db_name);
-        debug!("restore_info: listing generations in {}", dir);
+        debug!("restore_info: listing generations in {dir}");
         let entries = self.operator.list(&dir).await?;
         debug!("restore_info: found {} entries", entries.len());
 
@@ -365,7 +365,7 @@ impl StorageClient {
             let generation = match Generation::try_create(&generation) {
                 Ok(generation) => generation,
                 Err(_e) => {
-                    error!("dir {} is not valid generation dir", generation,);
+                    error!("dir {generation} is not valid generation dir",);
                     continue;
                 }
             };
@@ -381,7 +381,7 @@ impl StorageClient {
                 Some(snapshot) => snapshot,
                 // if generation has no snapshot, ignore and skip to the next generation
                 None => {
-                    error!("dir {:?} has no snapshots", generation);
+                    error!("dir {generation:?} has no snapshots");
                     continue;
                 }
             };
