@@ -150,6 +150,7 @@ addr = "http://0.0.0.0:50051"
     Path("primary.toml").write_text(primary_config)
     
     # Start Primary
+    Path("logs").mkdir(exist_ok=True)
     primary_log = open("logs/primary_multi.log", "w")
     primary = subprocess.Popen(
         [str(REPLITED_BIN), "--config", "primary.toml", "replicate"],

@@ -1,6 +1,6 @@
 services:
   primary-pocketbase:
-    image: ghcr.io/muchobien/pocketbase:0.34.2
+    image: ghcr.io/muchobien/pocketbase:0.35.0
     container_name: primary-pocketbase
     volumes:
       - ./data/primary:/pb_data
@@ -33,7 +33,7 @@ services:
     command: ["-c", "/etc/replited.toml", "replicate"]
 
   replica-pocketbase:
-    image: ghcr.io/muchobien/pocketbase:0.34.2
+    image: ghcr.io/muchobien/pocketbase:0.35.0
     container_name: replica-pocketbase
     depends_on:
       replica-replited:
@@ -61,7 +61,7 @@ services:
       - ./config/replica.toml:/etc/replited.toml
     networks:
       - replited_net
-    command: ["-c", "/etc/replited.toml", "replica-sidecar"]
+    command: ["-c", "/etc/replited.toml", "replica-sidecar", "--force-restore"]
     healthcheck:
       test: ["CMD-SHELL", "test -f /pb_data/data.db"]
       interval: 1s

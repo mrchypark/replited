@@ -9,11 +9,6 @@ db = "/pb_data/data.db"
 name = "stream-primary"
 params.type = "stream"
 params.addr = "http://primary-replited:50051"
+apply_checkpoint_interval_ms = 100
 
-[[database]]
-db = "/pb_data/auxiliary.db"
 
-[[database.replicate]]
-name = "stream-aux"
-params.type = "stream"
-params.addr = "http://primary-replited:50051"

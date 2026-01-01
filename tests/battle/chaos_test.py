@@ -43,6 +43,7 @@ from test_utils import cleanup
 
 def start_primary() -> subprocess.Popen:
     """Start Primary process."""
+    Path("logs").mkdir(exist_ok=True)
     log = open("logs/primary_chaos.log", "a")
     proc = subprocess.Popen(
         [str(REPLITED_BIN), "--config", str(CONFIG_DIR / "benchmark_primary.toml"), "replicate"],
