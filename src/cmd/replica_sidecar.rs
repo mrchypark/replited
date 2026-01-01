@@ -129,6 +129,12 @@ impl ReplicaSidecar {
         let db_path = &db_config.db;
         println!("ReplicaSidecar::run_single_db db_path: {db_path}");
 
+        // Auto-Restore Safeguards
+        let mut consecutive_restore_count = 0;
+        let mut last_restore_time = std::time::Instant::now();
+        const MAX_AUTO_RESTORES: u32 = 5;
+        const RESTORE_RESET_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(60);
+
         // Find stream config
         println!("ReplicaSidecar::run_single_db finding stream_config");
         let stream_config = db_config
@@ -169,9 +175,7 @@ impl ReplicaSidecar {
                         println!(
                             "ReplicaSidecar::run_single_db Local DB found. Switching to Streaming."
                         );
-                        info!(
-                            "Local DB found at {db_path}. Switching to Streaming mode."
-                        );
+                        info!("Local DB found at {db_path}. Switching to Streaming mode.");
                         state = ReplicaState::Streaming;
                     } else {
                         println!(
@@ -372,6 +376,7 @@ impl ReplicaSidecar {
                                             Ok(Err(e)) => {
                                                 eprintln!("Replica: Stream error: {e}");
                                                 warn!("Stream error: {e}");
+
                                                 if let Err(e) = writer.checkpoint() {
                                                     warn!(
                                                         "Checkpoint after stream error failed: {e}"
@@ -388,6 +393,52 @@ impl ReplicaSidecar {
                                                         warn!(
                                                             "Checkpoint after timeouts failed: {e}"
                                                         );
+
+                                                        // CHECK WAL STUCK HERE (Timeout Block)
+                                                        if e.code()
+                                                            == crate::error::Error::WAL_STUCK
+                                                        {
+                                                            log::error!(
+                                                                "CRITICAL: WAL Stuck detected during timeout checkpoint."
+                                                            );
+
+                                                            // Update safeguards
+                                                            if last_restore_time.elapsed()
+                                                                > RESTORE_RESET_THRESHOLD
+                                                            {
+                                                                consecutive_restore_count = 0;
+                                                            }
+                                                            consecutive_restore_count += 1;
+                                                            last_restore_time =
+                                                                std::time::Instant::now();
+
+                                                            if consecutive_restore_count
+                                                                > MAX_AUTO_RESTORES
+                                                            {
+                                                                log::error!(
+                                                                    "FATAL: Auto-Restore limit exceeded ({MAX_AUTO_RESTORES}). Aborting."
+                                                                );
+                                                                panic!(
+                                                                    "Auto-Restore limit exceeded"
+                                                                );
+                                                            }
+
+                                                            log::warn!(
+                                                                "Initiating Emergency Auto-Restore (Attempt {consecutive_restore_count}/{MAX_AUTO_RESTORES})..."
+                                                            );
+                                                            println!(
+                                                                "Replica: WAL Stuck. Deleting DB to force restore..."
+                                                            );
+                                                            let _ = std::fs::remove_file(db_path);
+                                                            let _ = std::fs::remove_file(format!(
+                                                                "{db_path}-wal"
+                                                            ));
+                                                            let _ = std::fs::remove_file(format!(
+                                                                "{db_path}-shm"
+                                                            ));
+                                                            state = ReplicaState::Empty;
+                                                            break;
+                                                        }
                                                     }
                                                     timeout_streak = 0;
                                                 }
@@ -401,10 +452,44 @@ impl ReplicaSidecar {
 
                                         if let Err(e) = writer.apply(packet) {
                                             warn!("Failed to write WAL packet: {e}");
-                                            if let Err(e) = writer.checkpoint() {
-                                                warn!(
-                                                    "Checkpoint after write failure failed: {e}"
+
+                                            // CHECK WAL STUCK HERE
+                                            if e.code() == crate::error::Error::WAL_STUCK {
+                                                log::error!("CRITICAL: WAL Stuck detected.");
+
+                                                // Update safeguards
+                                                if last_restore_time.elapsed()
+                                                    > RESTORE_RESET_THRESHOLD
+                                                {
+                                                    consecutive_restore_count = 0;
+                                                }
+                                                consecutive_restore_count += 1;
+                                                last_restore_time = std::time::Instant::now();
+
+                                                if consecutive_restore_count > MAX_AUTO_RESTORES {
+                                                    log::error!(
+                                                        "FATAL: Auto-Restore limit exceeded ({MAX_AUTO_RESTORES}). Aborting to prevent infinite loop."
+                                                    );
+                                                    panic!("Auto-Restore limit exceeded");
+                                                }
+
+                                                log::warn!(
+                                                    "Initiating Emergency Auto-Restore (Attempt {consecutive_restore_count}/{MAX_AUTO_RESTORES})..."
                                                 );
+                                                println!(
+                                                    "Replica: WAL Stuck. Deleting DB to force restore..."
+                                                );
+                                                let _ = std::fs::remove_file(db_path);
+                                                let _ =
+                                                    std::fs::remove_file(format!("{db_path}-wal"));
+                                                let _ =
+                                                    std::fs::remove_file(format!("{db_path}-shm"));
+                                                state = ReplicaState::Empty;
+                                                break; // Break inner loop, outer loop will restart in Empty state
+                                            }
+
+                                            if let Err(e) = writer.checkpoint() {
+                                                warn!("Checkpoint after write failure failed: {e}");
                                             }
                                             break;
                                         }
