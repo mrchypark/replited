@@ -119,17 +119,9 @@ impl WalWriter {
                     wal_writer.file.read_exact(&mut frame_hdr)?;
 
                     // Read Checksum1 (offset 16) and Checksum2 (offset 20)
-                    let c1 = if wal_writer.is_big_endian {
-                        u32::from_be_bytes(frame_hdr[16..20].try_into().unwrap())
-                    } else {
-                        u32::from_le_bytes(frame_hdr[16..20].try_into().unwrap())
-                    };
-
-                    let c2 = if wal_writer.is_big_endian {
-                        u32::from_be_bytes(frame_hdr[20..24].try_into().unwrap())
-                    } else {
-                        u32::from_le_bytes(frame_hdr[20..24].try_into().unwrap())
-                    };
+                    // CRITICAL: Checksums are ALWAYS stored in BIG-ENDIAN per SQLite spec
+                    let c1 = u32::from_be_bytes(frame_hdr[16..20].try_into().unwrap());
+                    let c2 = u32::from_be_bytes(frame_hdr[20..24].try_into().unwrap());
 
                     wal_writer.last_checksum = (c1, c2);
 
@@ -178,14 +170,16 @@ impl WalWriter {
                     ))
                 })?;
 
-            // Conditional Recovery: If SQLite sees no frames (but we wrote some), Invalidate SHM
+            // Conditional Recovery: If SQLite sees fewer frames than we wrote, Invalidate SHM
+            // res_passive.1 is the number of valid frames in the WAL as per the SHM.
+            // If we wrote more frames than SQLite sees, the SHM is stale.
             if res_passive.0 == 0
-                && res_passive.1 == 0
-                && res_passive.2 == 0
+                && (res_passive.1 as u32) < self.frame_count
                 && self.frame_count > 0
             {
                 println!(
-                    "WalWriter: Stale SHM detected (frames written but not guarded). Forcing Recovery..."
+                    "WalWriter: Stale SHM detected (SQLite saw {} frames, we have {}). Forcing Recovery...",
+                    res_passive.1, self.frame_count
                 );
 
                 // Invalidate SHM Header
@@ -207,6 +201,18 @@ impl WalWriter {
                     Ok(res) => {
                         res_passive = res;
                         println!("WalWriter: Recovery PASSIVE Result: {res_passive:?}");
+
+                        // CRITICAL CHECK: Did recovery actually work?
+                        // If SQLite still sees fewer frames than we wrote, it means the frames are invalid/rejected.
+                        // We cannot proceed because we are drifting further apart.
+                        if (res_passive.1 as u32) < self.frame_count {
+                            println!(
+                                "WalWriter: Recovery FAILED. SQLite refused to accept frames. WAL is STUCK."
+                            );
+                            return Err(crate::error::Error::WalStuck(
+                                "Recovery failed, WAL stuck".to_string(),
+                            ));
+                        }
                     }
                     Err(e) => {
                         eprintln!("WalWriter: Recovery PASSIVE Failed: {e}");
@@ -325,16 +331,9 @@ impl WalWriter {
 
         // Initialize last_checksum from Header
         // This is needed if we decide to verify checksums locally, even if we don't rewrite them.
-        let h_c1 = if self.is_big_endian {
-            u32::from_be_bytes(header_bytes[24..28].try_into().unwrap())
-        } else {
-            u32::from_le_bytes(header_bytes[24..28].try_into().unwrap())
-        };
-        let h_c2 = if self.is_big_endian {
-            u32::from_be_bytes(header_bytes[28..32].try_into().unwrap())
-        } else {
-            u32::from_le_bytes(header_bytes[28..32].try_into().unwrap())
-        };
+        // CRITICAL: Checksums are ALWAYS stored in BIG-ENDIAN per SQLite spec
+        let h_c1 = u32::from_be_bytes(header_bytes[24..28].try_into().unwrap());
+        let h_c2 = u32::from_be_bytes(header_bytes[28..32].try_into().unwrap());
         self.last_checksum = (h_c1, h_c2);
 
         println!(
@@ -398,16 +397,9 @@ impl WalWriter {
                 // IMPORTANT: Reset last_checksum to Header Checksum.
                 // The new frame (physically first in file) must be checksummed against the header.
                 // The cached header already has the local salts and checksums.
-                let h_c1 = if self.is_big_endian {
-                    u32::from_be_bytes(header[24..28].try_into().unwrap())
-                } else {
-                    u32::from_le_bytes(header[24..28].try_into().unwrap())
-                };
-                let h_c2 = if self.is_big_endian {
-                    u32::from_be_bytes(header[28..32].try_into().unwrap())
-                } else {
-                    u32::from_le_bytes(header[28..32].try_into().unwrap())
-                };
+                // CRITICAL: Checksums are ALWAYS stored in BIG-ENDIAN per SQLite spec
+                let h_c1 = u32::from_be_bytes(header[24..28].try_into().unwrap());
+                let h_c2 = u32::from_be_bytes(header[28..32].try_into().unwrap());
                 self.last_checksum = (h_c1, h_c2);
                 println!("WalWriter: Reset last_checksum to Header Checksum: ({h_c1}, {h_c2})");
 
@@ -419,30 +411,25 @@ impl WalWriter {
             }
         }
 
-        // Clone data for modification/inspection
+        // PASS-THROUGH MODE:
+        // Write frames VERBATIM from Primary without any modification.
+        // The Primary already computed valid checksums for its WAL file.
+        // We copy the WAL Header (with its salts) and all frames as-is.
+        // This maintains checksum chain integrity from Primary.
+        if data.len() < WAL_FRAME_HEADER_SIZE as usize {
+            return Err(crate::error::Error::SqliteInvalidWalHeaderError(
+                "Invalid frame data size",
+            ));
+        }
+
         let frame_data = data;
 
-        // PASS-THROUGH MODE:
-        // We write the frame exactly as received from Primary.
-        // We do NOT re-sign with local salts.
-        // We do NOT recalculate checksums.
-        // We assume Primary's checksums are valid and linear.
-
-        // For debugging, we can extract the checksums from the frame to log them.
-        let c1 = if self.is_big_endian {
-            u32::from_be_bytes(frame_data[16..20].try_into().unwrap())
-        } else {
-            u32::from_le_bytes(frame_data[16..20].try_into().unwrap())
-        };
-        let c2 = if self.is_big_endian {
-            u32::from_be_bytes(frame_data[20..24].try_into().unwrap())
-        } else {
-            u32::from_le_bytes(frame_data[20..24].try_into().unwrap())
-        };
-        self.last_checksum = (c1, c2);
+        // Extract checksum from Primary frame for logging
+        let c1 = u32::from_be_bytes(frame_data[16..20].try_into().unwrap_or([0; 4]));
+        let c2 = u32::from_be_bytes(frame_data[20..24].try_into().unwrap_or([0; 4]));
 
         println!(
-            "WalWriter: Writing VERBATIM Frame #{} (len={}) Checksum=({:#x}, {:#x})",
+            "WalWriter: Writing VERBATIM Frame #{} (len={}) Primary Checksum=({:#x}, {:#x})",
             self.frame_count,
             frame_data.len(),
             c1,

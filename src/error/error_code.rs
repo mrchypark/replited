@@ -71,6 +71,7 @@ build_error! {
     WalReaderOffsetTooHighError(83),
     InvalidWalSegmentError(84),
     MismatchWalHeaderError(85),
+    WalStuck(86),
 
     // 3rd crate error
     TokioError(100),
