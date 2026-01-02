@@ -1,4 +1,5 @@
 mod common;
+mod schema_hash;
 mod wal_frame;
 mod wal_header;
 
@@ -11,5 +12,6 @@ pub use common::align_frame;
 pub use common::checksum;
 pub(crate) use common::from_be_bytes_at;
 pub use common::read_last_checksum;
+pub use schema_hash::compute_schema_hash;
 pub use wal_frame::WALFrame;
 pub use wal_header::WALHeader;
