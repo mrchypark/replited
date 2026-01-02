@@ -23,6 +23,10 @@ pub enum ArgCommand {
         /// Force full restore even if local DB exists (will delete existing db/wal/shm first)
         #[arg(long, default_value_t = false)]
         force_restore: bool,
+
+        /// Execute a child process (e.g. "pocketbase serve") and manage its lifecycle
+        #[arg(long)]
+        exec: Option<String>,
     },
 
     Restore(RestoreOptions),

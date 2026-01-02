@@ -15,9 +15,14 @@ pub trait Command {
 pub fn command(arg: Arg) -> Result<Box<dyn Command>> {
     match &arg.cmd {
         ArgCommand::Replicate => Ok(Replicate::try_create(&arg.config)?),
-        ArgCommand::ReplicaSidecar { force_restore } => Ok(Box::new(
-            super::ReplicaSidecar::try_create(&arg.config, *force_restore)?,
-        )),
+        ArgCommand::ReplicaSidecar {
+            force_restore,
+            exec,
+        } => Ok(Box::new(super::ReplicaSidecar::try_create(
+            &arg.config,
+            *force_restore,
+            exec.clone(),
+        )?)),
         ArgCommand::Restore(options) => Ok(Restore::try_create(&arg.config, options.clone())?),
     }
 }
