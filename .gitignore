@@ -26,6 +26,7 @@ test.db
 *.db-replited/
 
 # Test artifacts
+tests/battle/tests/
 tests/battle/logs/
 tests/battle/replica_*/
 tests/battle/backup/
@@ -34,3 +35,7 @@ tests/battle/primary.db*
 tests/benchmarks/results/
 tests/output/
 *.zst
+
+# Example data
+example/data/
+example/verify_output.txt
