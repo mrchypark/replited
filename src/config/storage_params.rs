@@ -72,12 +72,14 @@ impl Display for StorageParams {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageStreamConfig {
     pub addr: String,
+    pub remote_db_name: Option<String>,
 }
 
 impl Default for StorageStreamConfig {
     fn default() -> Self {
         Self {
             addr: "http://127.0.0.1:50051".to_string(),
+            remote_db_name: None,
         }
     }
 }
