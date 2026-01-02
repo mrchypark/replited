@@ -26,15 +26,128 @@ enum ReplicaState {
 pub struct ReplicaSidecar {
     config: Config,
     force_restore: bool,
+    exec: Option<String>,
+}
+
+use std::process::Stdio;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
+#[derive(Clone)]
+struct ProcessManager {
+    cmd: String,
+    child: Arc<Mutex<Option<tokio::process::Child>>>,
+    blockers: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ProcessManager {
+    fn new(cmd: String) -> Self {
+        Self {
+            cmd,
+            child: Arc::new(Mutex::new(None)),
+            blockers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    async fn start(&self) {
+        let mut child_lock = self.child.lock().await;
+        if child_lock.is_some() {
+            return;
+        }
+
+        info!("ProcessManager: Starting child process: {}", self.cmd);
+        let parts: Vec<&str> = self.cmd.split_whitespace().collect();
+        if parts.is_empty() {
+            return;
+        }
+
+        let mut command = tokio::process::Command::new(parts[0]);
+        if parts.len() > 1 {
+            command.args(&parts[1..]);
+        }
+
+        // Inherit stdout/stderr allowing logs to show up in replited output
+        command.stdout(Stdio::inherit());
+        command.stderr(Stdio::inherit());
+
+        match command.spawn() {
+            Ok(child) => {
+                *child_lock = Some(child);
+                info!("ProcessManager: Child process started.");
+            }
+            Err(e) => {
+                log::error!("ProcessManager: Failed to spawn child process: {}", e);
+            }
+        }
+    }
+
+    async fn stop(&self) {
+        let mut child_lock = self.child.lock().await;
+        if let Some(mut child) = child_lock.take() {
+            info!("ProcessManager: Stopping child process...");
+            // Try graceful kill first? Or just kill.
+            // PocketBase might need SIGINT or SIGTERM.
+            // start_kill() sends SIGKILL.
+            // On unix, we might want SIGTERM first.
+            // For now, use kill() which is SIGKILL on unix often, wait... tokio kill() is SIGKILL.
+            // Ideally we send SIGTERM. But tokio Command doesn't easily support signals cross-platform without logic.
+            // Let's rely on kill() for now to ensure it stops.
+            // TODO: Graceful shutdown if needed.
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            info!("ProcessManager: Child process stopped.");
+        }
+    }
+
+    async fn add_blocker(&self) {
+        let prev = self
+            .blockers
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if prev == 0 {
+            // First blocker, stop the process
+            self.stop().await;
+        }
+    }
+
+    async fn remove_blocker(&self) {
+        let prev = self
+            .blockers
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        if prev == 1 {
+            // Last blocker removed, start the process
+            self.start().await;
+        }
+    }
+
+    /// Restart the child process (for schema changes, etc.)
+    /// Only restarts if there are no active blockers.
+    async fn restart(&self) {
+        let blockers = self.blockers.load(std::sync::atomic::Ordering::SeqCst);
+        if blockers > 0 {
+            log::warn!(
+                "ProcessManager: Restart requested but blockers active ({}), skipping.",
+                blockers
+            );
+            return;
+        }
+        info!("ProcessManager: Restarting child process...");
+        self.stop().await;
+        self.start().await;
+    }
 }
 
 impl ReplicaSidecar {
-    pub fn try_create(config_path: &str, force_restore: bool) -> Result<Self> {
+    pub fn try_create(
+        config_path: &str,
+        force_restore: bool,
+        exec: Option<String>,
+    ) -> Result<Self> {
         let config = Config::load(config_path)?;
         crate::log::init_log(config.log.clone())?;
         Ok(Self {
             config,
             force_restore,
+            exec,
         })
     }
 
@@ -103,12 +216,22 @@ impl ReplicaSidecar {
     pub async fn run(&mut self) -> Result<()> {
         let mut handles = vec![];
 
+        // Initialize ProcessManager if exec command is provided
+        let process_manager = self.exec.clone().map(ProcessManager::new);
+
+        // If we have a process manager, start it initially (unless blocked immediately logic applies, but tasks start async)
+        // Actually, we want it running by default.
+        if let Some(pm) = &process_manager {
+            pm.start().await;
+        }
+
         for db_config in &self.config.database {
             let db_config = db_config.clone();
             let force_restore = self.force_restore;
+            let pm = process_manager.clone();
 
             let handle = tokio::spawn(async move {
-                if let Err(e) = Self::run_single_db(db_config.clone(), force_restore).await {
+                if let Err(e) = Self::run_single_db(db_config.clone(), force_restore, pm).await {
                     log::error!("ReplicaSidecar error for db {}: {}", db_config.db, e);
                 }
             });
@@ -122,7 +245,11 @@ impl ReplicaSidecar {
         Ok(())
     }
 
-    async fn run_single_db(db_config: DbConfig, force_restore: bool) -> Result<()> {
+    async fn run_single_db(
+        db_config: DbConfig,
+        mut force_restore: bool,
+        process_manager: Option<ProcessManager>,
+    ) -> Result<()> {
         println!("ReplicaSidecar::run_single_db start for {}", db_config.db);
         let mut state = ReplicaState::Empty;
         let mut resume_pos: Option<WalGenerationPos> = None;
@@ -134,6 +261,9 @@ impl ReplicaSidecar {
         let mut last_restore_time = std::time::Instant::now();
         const MAX_AUTO_RESTORES: u32 = 5;
         const RESTORE_RESET_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(60);
+
+        // Schema change detection
+        let mut last_schema_hash: Option<u64> = None;
 
         // Find stream config
         println!("ReplicaSidecar::run_single_db finding stream_config");
@@ -151,6 +281,11 @@ impl ReplicaSidecar {
                 crate::error::Error::InvalidConfig("No stream config found".to_string())
             })?;
         println!("ReplicaSidecar::run_single_db stream_config found");
+
+        let remote_db_name = stream_config
+            .remote_db_name
+            .clone()
+            .unwrap_or_else(|| db_config.db.clone());
 
         loop {
             println!("ReplicaSidecar::run_single_db loop state: {state:?}");
@@ -185,6 +320,12 @@ impl ReplicaSidecar {
                             "Local DB not found at {db_path}. Connecting to Primary to get restore config..."
                         );
 
+                        // BLOCKING START: Entire restore process should be atomic
+                        if let Some(pm) = &process_manager {
+                            pm.add_blocker().await;
+                        }
+
+                        // Cleanup existing files if forcing restore
                         if force_restore && path.exists() {
                             let _ = std::fs::remove_file(db_path);
                             let _ = std::fs::remove_file(format!("{db_path}-wal"));
@@ -202,7 +343,7 @@ impl ReplicaSidecar {
                                 let snapshot_path =
                                     std::path::Path::new(db_path).with_extension("snapshot.zst");
                                 let direct_restore_success = match client
-                                    .download_snapshot(db_config.db.clone(), &snapshot_path)
+                                    .download_snapshot(remote_db_name.clone(), &snapshot_path)
                                     .await
                                 {
                                     Ok(_) => {
@@ -224,6 +365,8 @@ impl ReplicaSidecar {
                                                 "ReplicaSidecar::run_single_db Restore success. Switching to Streaming."
                                             );
                                             state = ReplicaState::Streaming;
+                                            // Reset force_restore flag after successful restore
+                                            force_restore = false;
                                             true
                                         } else {
                                             warn!(
@@ -242,13 +385,17 @@ impl ReplicaSidecar {
                                 };
 
                                 if direct_restore_success {
+                                    // UNBLOCK: Success path
+                                    if let Some(pm) = &process_manager {
+                                        pm.remove_blocker().await;
+                                    }
                                     continue;
                                 }
 
                                 println!(
                                     "ReplicaSidecar::run_single_db Requesting legacy restore config..."
                                 );
-                                match client.get_restore_config(db_config.db.clone()).await {
+                                match client.get_restore_config(remote_db_name.clone()).await {
                                     Ok(restore_db_config) => {
                                         println!(
                                             "ReplicaSidecar::run_single_db Received restore config. Starting restore..."
@@ -274,29 +421,57 @@ impl ReplicaSidecar {
                                                     "Bootstrap finished. Switching to Stream mode. resume_pos={resume_pos:?}"
                                                 );
                                                 state = ReplicaState::Streaming;
+                                                // Reset force_restore flag
+                                                force_restore = false;
                                             }
                                             Err(e) => {
                                                 println!(
                                                     "ReplicaSidecar::run_single_db Restore failed: {e}"
                                                 );
                                                 warn!("Restore failed: {e}. Retrying in 5s...");
+                                                // UNBLOCK: Failure path
+                                                if let Some(pm) = &process_manager {
+                                                    pm.remove_blocker().await;
+                                                }
                                                 sleep(Duration::from_secs(5)).await;
                                                 continue;
                                             }
                                         }
                                     }
                                     Err(e) => {
+                                        println!(
+                                            "ReplicaSidecar::run_single_db Failed to get restore config: {e}"
+                                        );
                                         warn!(
                                             "Failed to get restore config: {e}. Retrying in 5s..."
                                         );
+                                        // UNBLOCK: Failure path
+                                        if let Some(pm) = &process_manager {
+                                            pm.remove_blocker().await;
+                                        }
                                         sleep(Duration::from_secs(5)).await;
+                                        // Continue loop to retry
+                                        continue;
                                     }
                                 }
                             }
                             Err(e) => {
+                                println!(
+                                    "ReplicaSidecar::run_single_db Failed to connect to Primary: {e}"
+                                );
                                 warn!("Failed to connect to Primary: {e}. Retrying in 5s...");
+                                // UNBLOCK: Failure path
+                                if let Some(pm) = &process_manager {
+                                    pm.remove_blocker().await;
+                                }
                                 sleep(Duration::from_secs(5)).await;
+                                continue;
                             }
+                        }
+
+                        // UNBLOCK: End of restore block (fallthrough or success without continue above)
+                        if let Some(pm) = &process_manager {
+                            pm.remove_blocker().await;
                         }
                     }
                 }
@@ -328,7 +503,7 @@ impl ReplicaSidecar {
                     match StreamClient::connect(stream_config.addr.clone()).await {
                         Ok(client) => {
                             let handshake = Handshake {
-                                db_name: db_config.db.clone(),
+                                db_name: remote_db_name.clone(),
                                 generation: pos.generation.as_str().to_string(),
                                 offset: pos.offset,
                                 index: pos.index,
@@ -402,6 +577,42 @@ impl ReplicaSidecar {
                                                                 "CRITICAL: WAL Stuck detected during timeout checkpoint."
                                                             );
 
+                                                            // FIRST: Try restarting child process to release locks
+                                                            if let Some(pm) = &process_manager {
+                                                                println!(
+                                                                    "Replica: WAL Stuck. Restarting child process to release locks..."
+                                                                );
+                                                                log::info!(
+                                                                    "WAL Stuck. Restarting child process to release locks..."
+                                                                );
+                                                                pm.restart().await;
+
+                                                                // Wait a moment for locks to be released
+                                                                sleep(Duration::from_millis(500))
+                                                                    .await;
+
+                                                                // Retry checkpoint after restart
+                                                                if let Err(retry_err) =
+                                                                    writer.checkpoint()
+                                                                {
+                                                                    log::warn!(
+                                                                        "Checkpoint still failed after child restart: {retry_err}"
+                                                                    );
+                                                                    // Continue to full restore below
+                                                                } else {
+                                                                    // Checkpoint succeeded after restart!
+                                                                    println!(
+                                                                        "Replica: Checkpoint succeeded after child process restart."
+                                                                    );
+                                                                    log::info!(
+                                                                        "Checkpoint succeeded after child process restart."
+                                                                    );
+                                                                    timeout_streak = 0;
+                                                                    continue;
+                                                                }
+                                                            }
+
+                                                            // SECOND: If restart didn't help, do full restore
                                                             // Update safeguards
                                                             if last_restore_time.elapsed()
                                                                 > RESTORE_RESET_THRESHOLD
@@ -416,28 +627,65 @@ impl ReplicaSidecar {
                                                                 > MAX_AUTO_RESTORES
                                                             {
                                                                 log::error!(
-                                                                    "FATAL: Auto-Restore limit exceeded ({MAX_AUTO_RESTORES}). Aborting."
+                                                                    "CRITICAL: Auto-restore limit reached ({MAX_AUTO_RESTORES}). Stopping to prevent loop."
                                                                 );
                                                                 panic!(
-                                                                    "Auto-Restore limit exceeded"
-                                                                );
+                                                                    "Auto-restore limit reached."
+                                                                ); // Let restart policy handle it or just stop
                                                             }
 
-                                                            log::warn!(
-                                                                "Initiating Emergency Auto-Restore (Attempt {consecutive_restore_count}/{MAX_AUTO_RESTORES})..."
-                                                            );
                                                             println!(
                                                                 "Replica: WAL Stuck. Deleting DB to force restore..."
                                                             );
-                                                            let _ = std::fs::remove_file(db_path);
-                                                            let _ = std::fs::remove_file(format!(
-                                                                "{db_path}-wal"
-                                                            ));
-                                                            let _ = std::fs::remove_file(format!(
-                                                                "{db_path}-shm"
-                                                            ));
+                                                            info!(
+                                                                "WAL Stuck. Deleting DB to force restore..."
+                                                            );
+
+                                                            // Simplify: Mark state as empty and force restore.
+                                                            // The Blocking/Deletion will be handled in the next loop iteration's Restore block.
                                                             state = ReplicaState::Empty;
-                                                            break;
+                                                            force_restore = true;
+
+                                                            // Next loop will see missing file and trigger restore (download)
+                                                            continue;
+                                                        }
+                                                    } else {
+                                                        // Checkpoint succeeded - check for schema changes
+                                                        if let Some(pm) = &process_manager {
+                                                            match crate::sqlite::compute_schema_hash(
+                                                                db_path,
+                                                            ) {
+                                                                Ok(new_hash) => {
+                                                                    if let Some(prev_hash) =
+                                                                        last_schema_hash
+                                                                    {
+                                                                        if prev_hash != new_hash {
+                                                                            println!(
+                                                                                "Replica: Schema changed (hash: {:x} -> {:x}). Restarting child process...",
+                                                                                prev_hash, new_hash
+                                                                            );
+                                                                            log::info!(
+                                                                                "Schema changed (hash: {:x} -> {:x}). Restarting child process...",
+                                                                                prev_hash,
+                                                                                new_hash
+                                                                            );
+                                                                            pm.restart().await;
+                                                                        }
+                                                                    } else {
+                                                                        println!(
+                                                                            "Replica: Initial schema hash: {:x}",
+                                                                            new_hash
+                                                                        );
+                                                                    }
+                                                                    last_schema_hash =
+                                                                        Some(new_hash);
+                                                                }
+                                                                Err(e) => {
+                                                                    log::warn!(
+                                                                        "Failed to compute schema hash: {e}"
+                                                                    );
+                                                                }
+                                                            }
                                                         }
                                                     }
                                                     timeout_streak = 0;
