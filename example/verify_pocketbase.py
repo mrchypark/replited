@@ -127,7 +127,8 @@ def verify():
         res = request("GET", f"{REPLICA_URL}/api/collections/notes/records/{record_id}")
         if res["status"] == 200:
             data = res["json"]
-            if data["title"] == "Hello Replication":
+            print(f"DEBUG: Received data: {data}")
+            if data.get("title") == "Hello Replication":
                 print("SUCCESS: Record found in Replica!")
                 return True
         elif res["status"] == 404:
