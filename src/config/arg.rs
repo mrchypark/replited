@@ -58,13 +58,11 @@ pub struct RestoreOptions {
 impl RestoreOptions {
     pub fn validate(&self) -> Result<()> {
         if self.db.is_empty() {
-            println!("restore MUST Specify db path in config");
             return Err(Error::InvalidArg("arg MUST Specify db path in config"));
         }
 
         if self.output.is_empty() {
-            println!("restore MUST Specify db output path");
-            return Err(Error::InvalidArg("arg MUST Specify db output pathg"));
+            return Err(Error::InvalidArg("arg MUST Specify db output path"));
         }
 
         Ok(())
