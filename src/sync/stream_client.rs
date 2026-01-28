@@ -23,9 +23,10 @@ impl StreamClient {
 
     pub async fn stream_wal(&self, handshake: Handshake) -> Result<Streaming<WalPacket>> {
         let mut client = self.client.clone();
-        let response = client.stream_wal(handshake).await.map_err(|e| {
-            crate::error::Error::StorageError(format!("Failed to stream wal: {e}"))
-        })?;
+        let response = client
+            .stream_wal(handshake)
+            .await
+            .map_err(|e| crate::error::Error::StorageError(format!("Failed to stream wal: {e}")))?;
         Ok(response.into_inner())
     }
 
@@ -102,9 +103,7 @@ impl StreamClient {
             }
 
             if let Some(duration) = retry_after {
-                println!(
-                    "Primary busy, retrying snapshot download in {duration:?}..."
-                );
+                log::warn!("Primary busy, retrying snapshot download in {duration:?}...");
                 tokio::time::sleep(duration).await;
                 continue;
             }

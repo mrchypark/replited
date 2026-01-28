@@ -74,10 +74,6 @@ impl ShadowWalReader {
     pub fn position(&self) -> WalGenerationPos {
         self.position.clone()
     }
-
-    pub fn left(&self) -> u64 {
-        self.left
-    }
 }
 
 impl Read for ShadowWalReader {
