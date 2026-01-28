@@ -80,20 +80,14 @@ pub fn parse_snapshot_path(path: &str) -> Result<(u64, u64)> {
     let base = path_base(path)?;
     let a = SNAPSHOT_REGEX
         .captures(&base)
-        .ok_or(Error::InvalidPath(format!(
-            "invalid snapshot path {path}"
-        )))?;
+        .ok_or(Error::InvalidPath(format!("invalid snapshot path {path}")))?;
     let index = a
         .get(1)
-        .ok_or(Error::InvalidPath(format!(
-            "invalid snapshot path {path}"
-        )))?
+        .ok_or(Error::InvalidPath(format!("invalid snapshot path {path}")))?
         .as_str();
     let offset = a
         .get(2)
-        .ok_or(Error::InvalidPath(format!(
-            "invalid snapshot path {path}"
-        )))?
+        .ok_or(Error::InvalidPath(format!("invalid snapshot path {path}")))?
         .as_str();
 
     Ok((index.parse::<u64>()?, offset.parse::<u64>()?))
