@@ -305,7 +305,7 @@ mod tests {
             level: LogLevel::Debug,
             dir: "/custom/log".to_string(),
         };
-        let display = format!("{}", log_config);
+        let display = format!("{log_config}");
         assert!(display.contains("Debug"));
         assert!(display.contains("/custom/log"));
     }
@@ -421,7 +421,7 @@ mod tests {
     #[test]
     fn test_db_config_debug_format() {
         let config = create_valid_db_config();
-        let debug_str = format!("{:?}", config);
+        let debug_str = format!("{config:?}");
 
         assert!(debug_str.contains("ReplicateDbConfig"));
         assert!(debug_str.contains("/tmp/test.db"));
@@ -432,7 +432,7 @@ mod tests {
     #[test]
     fn test_storage_config_debug_format() {
         let config = create_valid_storage_config();
-        let debug_str = format!("{:?}", config);
+        let debug_str = format!("{config:?}");
 
         assert!(debug_str.contains("StorageS3Config"));
         assert!(debug_str.contains("test-storage"));

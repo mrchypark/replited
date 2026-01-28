@@ -91,8 +91,8 @@ mod tests {
         // Checksum2
         frame[20..24].copy_from_slice(&checksum2.to_be_bytes());
         // Fill page data with pattern
-        for i in 24..frame.len() {
-            frame[i] = (i % 256) as u8;
+        for (i, byte) in frame.iter_mut().enumerate().skip(24) {
+            *byte = (i % 256) as u8;
         }
         frame
     }
