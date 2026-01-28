@@ -26,7 +26,6 @@ use crate::error::Result;
 #[derive(Debug, Clone)]
 pub struct StorageClient {
     operator: Operator,
-    root: String,
     db_path: String,
     db_name: String,
 }
@@ -62,7 +61,6 @@ pub struct RestoreInfo {
 impl StorageClient {
     pub fn try_create(db_path: String, config: StorageConfig) -> Result<Self> {
         Ok(Self {
-            root: config.params.root(),
             operator: init_operator(&config.params)?,
             db_name: path_base(&db_path)?,
             db_path,
