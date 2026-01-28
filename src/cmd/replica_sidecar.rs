@@ -1,11 +1,9 @@
-use std::path::Path;
 use std::time::Duration;
 
 use log::info;
 use log::warn;
 use tokio::time::sleep;
 
-use crate::base::Generation;
 use crate::config::Config;
 use crate::config::DbConfig;
 use crate::config::RestoreOptions;
@@ -16,10 +14,15 @@ use crate::sync::stream_client::StreamClient;
 
 use crate::sync::replication::Handshake;
 
+mod local_state;
+mod process_manager;
+
+use local_state::get_local_wal_state;
+use process_manager::ProcessManager;
+
 #[derive(Debug)]
 enum ReplicaState {
     Empty,
-    Restoring, // Kept for enum compatibility, though logic merges it to Empty in previous code
     Streaming,
 }
 
@@ -27,113 +30,6 @@ pub struct ReplicaSidecar {
     config: Config,
     force_restore: bool,
     exec: Option<String>,
-}
-
-use std::process::Stdio;
-use std::sync::Arc;
-use tokio::sync::Mutex;
-
-#[derive(Clone)]
-struct ProcessManager {
-    cmd: String,
-    child: Arc<Mutex<Option<tokio::process::Child>>>,
-    blockers: Arc<std::sync::atomic::AtomicUsize>,
-}
-
-impl ProcessManager {
-    fn new(cmd: String) -> Self {
-        Self {
-            cmd,
-            child: Arc::new(Mutex::new(None)),
-            blockers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-        }
-    }
-
-    async fn start(&self) {
-        let mut child_lock = self.child.lock().await;
-        if child_lock.is_some() {
-            return;
-        }
-
-        info!("ProcessManager: Starting child process: {}", self.cmd);
-        let parts: Vec<&str> = self.cmd.split_whitespace().collect();
-        if parts.is_empty() {
-            return;
-        }
-
-        let mut command = tokio::process::Command::new(parts[0]);
-        if parts.len() > 1 {
-            command.args(&parts[1..]);
-        }
-
-        // Inherit stdout/stderr allowing logs to show up in replited output
-        command.stdout(Stdio::inherit());
-        command.stderr(Stdio::inherit());
-
-        match command.spawn() {
-            Ok(child) => {
-                *child_lock = Some(child);
-                info!("ProcessManager: Child process started.");
-            }
-            Err(e) => {
-                log::error!("ProcessManager: Failed to spawn child process: {}", e);
-            }
-        }
-    }
-
-    async fn stop(&self) {
-        let mut child_lock = self.child.lock().await;
-        if let Some(mut child) = child_lock.take() {
-            info!("ProcessManager: Stopping child process...");
-            // Try graceful kill first? Or just kill.
-            // PocketBase might need SIGINT or SIGTERM.
-            // start_kill() sends SIGKILL.
-            // On unix, we might want SIGTERM first.
-            // For now, use kill() which is SIGKILL on unix often, wait... tokio kill() is SIGKILL.
-            // Ideally we send SIGTERM. But tokio Command doesn't easily support signals cross-platform without logic.
-            // Let's rely on kill() for now to ensure it stops.
-            // TODO: Graceful shutdown if needed.
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            info!("ProcessManager: Child process stopped.");
-        }
-    }
-
-    async fn add_blocker(&self) {
-        let prev = self
-            .blockers
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if prev == 0 {
-            // First blocker, stop the process
-            self.stop().await;
-        }
-    }
-
-    async fn remove_blocker(&self) {
-        let prev = self
-            .blockers
-            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        if prev == 1 {
-            // Last blocker removed, start the process
-            self.start().await;
-        }
-    }
-
-    /// Restart the child process (for schema changes, etc.)
-    /// Only restarts if there are no active blockers.
-    async fn restart(&self) {
-        let blockers = self.blockers.load(std::sync::atomic::Ordering::SeqCst);
-        if blockers > 0 {
-            log::warn!(
-                "ProcessManager: Restart requested but blockers active ({}), skipping.",
-                blockers
-            );
-            return;
-        }
-        info!("ProcessManager: Restarting child process...");
-        self.stop().await;
-        self.start().await;
-    }
 }
 
 impl ReplicaSidecar {
@@ -149,68 +45,6 @@ impl ReplicaSidecar {
             force_restore,
             exec,
         })
-    }
-
-    fn read_generation(db_path: &str) -> Generation {
-        let file_path = std::path::Path::new(db_path);
-        let db_name = file_path.file_name().and_then(|p| p.to_str()).unwrap_or("");
-        let dir_path = match file_path.parent() {
-            Some(p) if p == std::path::Path::new("") => std::path::Path::new("."),
-            Some(p) => p,
-            None => std::path::Path::new("."),
-        };
-        let meta_dir = format!(
-            "{}/.{}-replited/",
-            dir_path.to_str().unwrap_or("."),
-            db_name
-        );
-        let generation_file = std::path::Path::new(&meta_dir).join("generation");
-
-        if let Ok(content) = std::fs::read_to_string(generation_file) {
-            if let Ok(parsed) = Generation::try_create(content.trim()) {
-                return parsed;
-            }
-        }
-
-        Generation::default()
-    }
-
-    fn get_local_wal_state(db_path: &str) -> Result<(WalGenerationPos, u64)> {
-        let wal_path = format!("{db_path}-wal");
-        if !Path::new(&wal_path).exists() {
-            return Ok((
-                WalGenerationPos {
-                    generation: Self::read_generation(db_path),
-                    index: 0,
-                    offset: 0,
-                },
-                4096,
-            ));
-        }
-
-        let file_len = std::fs::metadata(&wal_path)?.len();
-        if file_len == 0 {
-            return Ok((
-                WalGenerationPos {
-                    generation: Self::read_generation(db_path),
-                    index: 0,
-                    offset: 0,
-                },
-                4096,
-            ));
-        }
-
-        let wal_header = crate::sqlite::WALHeader::read(&wal_path)?;
-        let page_size = wal_header.page_size;
-
-        Ok((
-            WalGenerationPos {
-                generation: Self::read_generation(db_path),
-                index: 0,
-                offset: file_len,
-            },
-            page_size,
-        ))
     }
 
     pub async fn run(&mut self) -> Result<()> {
@@ -250,11 +84,11 @@ impl ReplicaSidecar {
         mut force_restore: bool,
         process_manager: Option<ProcessManager>,
     ) -> Result<()> {
-        println!("ReplicaSidecar::run_single_db start for {}", db_config.db);
+        log::info!("ReplicaSidecar::run_single_db start for {}", db_config.db);
         let mut state = ReplicaState::Empty;
         let mut resume_pos: Option<WalGenerationPos> = None;
         let db_path = &db_config.db;
-        println!("ReplicaSidecar::run_single_db db_path: {db_path}");
+        log::debug!("ReplicaSidecar::run_single_db db_path: {db_path}");
 
         // Auto-Restore Safeguards
         let mut consecutive_restore_count = 0;
@@ -266,7 +100,7 @@ impl ReplicaSidecar {
         let mut last_schema_hash: Option<u64> = None;
 
         // Find stream config
-        println!("ReplicaSidecar::run_single_db finding stream_config");
+        log::debug!("ReplicaSidecar::run_single_db finding stream_config");
         let stream_config = db_config
             .replicate
             .iter()
@@ -280,7 +114,7 @@ impl ReplicaSidecar {
             .ok_or_else(|| {
                 crate::error::Error::InvalidConfig("No stream config found".to_string())
             })?;
-        println!("ReplicaSidecar::run_single_db stream_config found");
+        log::debug!("ReplicaSidecar::run_single_db stream_config found");
 
         let remote_db_name = stream_config
             .remote_db_name
@@ -288,12 +122,12 @@ impl ReplicaSidecar {
             .unwrap_or_else(|| db_config.db.clone());
 
         loop {
-            println!("ReplicaSidecar::run_single_db loop state: {state:?}");
+            log::debug!("ReplicaSidecar::run_single_db loop state: {state:?}");
             match state {
                 ReplicaState::Empty => {
                     let path = std::path::Path::new(db_path);
                     let should_restore = force_restore || !path.exists();
-                    println!(
+                    log::debug!(
                         "ReplicaSidecar::run_single_db Empty state, exists: {}, should_restore: {}",
                         path.exists(),
                         should_restore
@@ -307,13 +141,13 @@ impl ReplicaSidecar {
                     );
 
                     if !should_restore {
-                        println!(
+                        log::info!(
                             "ReplicaSidecar::run_single_db Local DB found. Switching to Streaming."
                         );
                         info!("Local DB found at {db_path}. Switching to Streaming mode.");
                         state = ReplicaState::Streaming;
                     } else {
-                        println!(
+                        log::info!(
                             "ReplicaSidecar::run_single_db Local DB not found. Connecting to Primary..."
                         );
                         info!(
@@ -334,10 +168,10 @@ impl ReplicaSidecar {
 
                         match StreamClient::connect(stream_config.addr.clone()).await {
                             Ok(client) => {
-                                println!("ReplicaSidecar::run_single_db Connected to Primary.");
+                                log::info!("ReplicaSidecar::run_single_db Connected to Primary.");
 
                                 // 1. Try Direct Snapshot Streaming
-                                println!(
+                                log::info!(
                                     "ReplicaSidecar::run_single_db Attempting Direct Snapshot Streaming..."
                                 );
                                 let snapshot_path =
@@ -347,7 +181,7 @@ impl ReplicaSidecar {
                                     .await
                                 {
                                     Ok(_) => {
-                                        println!(
+                                        log::info!(
                                             "ReplicaSidecar::run_single_db Snapshot downloaded. Decompressing..."
                                         );
                                         // Decompress zstd
@@ -361,7 +195,7 @@ impl ReplicaSidecar {
 
                                         if decompression_result.is_ok() {
                                             let _ = std::fs::remove_file(snapshot_path);
-                                            println!(
+                                            log::info!(
                                                 "ReplicaSidecar::run_single_db Restore success. Switching to Streaming."
                                             );
                                             state = ReplicaState::Streaming;
@@ -392,12 +226,12 @@ impl ReplicaSidecar {
                                     continue;
                                 }
 
-                                println!(
+                                log::info!(
                                     "ReplicaSidecar::run_single_db Requesting legacy restore config..."
                                 );
                                 match client.get_restore_config(remote_db_name.clone()).await {
                                     Ok(restore_db_config) => {
-                                        println!(
+                                        log::info!(
                                             "ReplicaSidecar::run_single_db Received restore config. Starting restore..."
                                         );
                                         info!("Received restore config. Starting restore...");
@@ -425,7 +259,7 @@ impl ReplicaSidecar {
                                                 force_restore = false;
                                             }
                                             Err(e) => {
-                                                println!(
+                                                log::error!(
                                                     "ReplicaSidecar::run_single_db Restore failed: {e}"
                                                 );
                                                 warn!("Restore failed: {e}. Retrying in 5s...");
@@ -439,7 +273,7 @@ impl ReplicaSidecar {
                                         }
                                     }
                                     Err(e) => {
-                                        println!(
+                                        log::error!(
                                             "ReplicaSidecar::run_single_db Failed to get restore config: {e}"
                                         );
                                         warn!(
@@ -456,7 +290,7 @@ impl ReplicaSidecar {
                                 }
                             }
                             Err(e) => {
-                                println!(
+                                log::error!(
                                     "ReplicaSidecar::run_single_db Failed to connect to Primary: {e}"
                                 );
                                 warn!("Failed to connect to Primary: {e}. Retrying in 5s...");
@@ -475,10 +309,6 @@ impl ReplicaSidecar {
                         }
                     }
                 }
-                ReplicaState::Restoring => {
-                    // Merged into Empty
-                    state = ReplicaState::Empty;
-                }
                 ReplicaState::Streaming => {
                     // 1. Get current position
                     let (pos, page_size) = if let Some(p) = resume_pos.take() {
@@ -488,7 +318,7 @@ impl ReplicaSidecar {
                                 .unwrap_or(4096);
                         (p, wal_page_size)
                     } else {
-                        Self::get_local_wal_state(db_path)?
+                        get_local_wal_state(db_path)?
                     };
 
                     info!(
@@ -511,7 +341,7 @@ impl ReplicaSidecar {
 
                             match client.stream_wal(handshake).await {
                                 Ok(mut stream) => {
-                                    eprintln!("Replica: Stream connected. Creating WalWriter...");
+                                    log::info!("Replica: Stream connected. Creating WalWriter...");
                                     let wal_path = format!("{db_path}-wal");
                                     let mut writer = crate::sync::WalWriter::new(
                                         std::path::PathBuf::from(wal_path),
@@ -521,12 +351,11 @@ impl ReplicaSidecar {
                                             db_config.apply_checkpoint_interval_ms,
                                         ),
                                     )?;
-                                    eprintln!("Replica: WalWriter created.");
+                                    log::debug!("Replica: WalWriter created.");
                                     let mut timeout_streak = 0usize;
 
                                     loop {
-                                        // Epsom logging can be noisy since this loop runs for every packet
-                                        // eprintln!("Replica: Waiting for message...");
+                                        // Logging can be noisy since this loop runs for every packet.
                                         let packet = match tokio::time::timeout(
                                             Duration::from_secs(2),
                                             stream.message(),
@@ -534,13 +363,13 @@ impl ReplicaSidecar {
                                         .await
                                         {
                                             Ok(Ok(Some(p))) => {
-                                                eprintln!("Replica: Received WAL packet");
+                                                log::debug!("Replica: Received WAL packet");
                                                 info!("Received WAL packet");
                                                 timeout_streak = 0;
                                                 p
                                             }
                                             Ok(Ok(None)) => {
-                                                eprintln!("Replica: Stream ended");
+                                                log::warn!("Replica: Stream ended");
                                                 if let Err(e) = writer.checkpoint() {
                                                     warn!(
                                                         "Checkpoint after stream end failed: {e}"
@@ -549,7 +378,7 @@ impl ReplicaSidecar {
                                                 break;
                                             }
                                             Ok(Err(e)) => {
-                                                eprintln!("Replica: Stream error: {e}");
+                                                log::error!("Replica: Stream error: {e}");
                                                 warn!("Stream error: {e}");
 
                                                 if let Err(e) = writer.checkpoint() {
@@ -560,7 +389,7 @@ impl ReplicaSidecar {
                                                 break;
                                             }
                                             Err(_) => {
-                                                eprintln!("Replica: Stream timeout");
+                                                log::warn!("Replica: Stream timeout");
                                                 warn!("Stream timeout");
                                                 timeout_streak += 1;
                                                 if timeout_streak >= 5 {
@@ -579,9 +408,6 @@ impl ReplicaSidecar {
 
                                                             // FIRST: Try restarting child process to release locks
                                                             if let Some(pm) = &process_manager {
-                                                                println!(
-                                                                    "Replica: WAL Stuck. Restarting child process to release locks..."
-                                                                );
                                                                 log::info!(
                                                                     "WAL Stuck. Restarting child process to release locks..."
                                                                 );
@@ -601,9 +427,6 @@ impl ReplicaSidecar {
                                                                     // Continue to full restore below
                                                                 } else {
                                                                     // Checkpoint succeeded after restart!
-                                                                    println!(
-                                                                        "Replica: Checkpoint succeeded after child process restart."
-                                                                    );
                                                                     log::info!(
                                                                         "Checkpoint succeeded after child process restart."
                                                                     );
@@ -634,9 +457,6 @@ impl ReplicaSidecar {
                                                                 ); // Let restart policy handle it or just stop
                                                             }
 
-                                                            println!(
-                                                                "Replica: WAL Stuck. Deleting DB to force restore..."
-                                                            );
                                                             info!(
                                                                 "WAL Stuck. Deleting DB to force restore..."
                                                             );
@@ -660,21 +480,14 @@ impl ReplicaSidecar {
                                                                         last_schema_hash
                                                                     {
                                                                         if prev_hash != new_hash {
-                                                                            println!(
-                                                                                "Replica: Schema changed (hash: {:x} -> {:x}). Restarting child process...",
-                                                                                prev_hash, new_hash
-                                                                            );
                                                                             log::info!(
-                                                                                "Schema changed (hash: {:x} -> {:x}). Restarting child process...",
-                                                                                prev_hash,
-                                                                                new_hash
+                                                                                "Schema changed (hash: {prev_hash:x} -> {new_hash:x}). Restarting child process..."
                                                                             );
                                                                             pm.restart().await;
                                                                         }
                                                                     } else {
-                                                                        println!(
-                                                                            "Replica: Initial schema hash: {:x}",
-                                                                            new_hash
+                                                                        log::info!(
+                                                                            "Replica: Initial schema hash: {new_hash:x}"
                                                                         );
                                                                     }
                                                                     last_schema_hash =
@@ -724,7 +537,7 @@ impl ReplicaSidecar {
                                                 log::warn!(
                                                     "Initiating Emergency Auto-Restore (Attempt {consecutive_restore_count}/{MAX_AUTO_RESTORES})..."
                                                 );
-                                                println!(
+                                                log::warn!(
                                                     "Replica: WAL Stuck. Deleting DB to force restore..."
                                                 );
                                                 let _ = std::fs::remove_file(db_path);
