@@ -11,7 +11,10 @@
 - [Config](#config)
 - [Sub commands](#sub-commands)
 	- [Replicate](#replicate)
-  - [Restore](#restore)
+  	- [Restore](#restore)
+	- [Stream (primary + replica)](#stream-primary--replica)
+		- [⚠️ Important: Replica is Read-Only](#-important-replica-is-read-only)
+		- [Replica Checkpoint Tuning](#replica-checkpoint-tuning)
   <!-- /MarkdownTOC -->
 
 ## Introduction
@@ -89,8 +92,203 @@ command options:
   The sidecar will automatically:
   1. Download the latest snapshot directly from the Primary (Direct Snapshot Streaming).
   2. Switch to WAL streaming mode to apply real-time updates.
-  
+
   **Note**: Direct Snapshot Streaming uses `zstd` for compression and does not require a shared storage backend.
+
+#### ⚠️ Important: Replica is Read-Only
+
+**The replica database is read-only by design.** Writing to the replica will cause:
+- **Data divergence**: Replica will have writes that primary doesn't know about
+- **Replication failure**: WAL checksums will mismatch, causing replication to stop
+- **Data corruption**: In extreme cases, the entire replication stream may become corrupted
+
+**Do NOT write to the replica database.** If you need to write, write to the primary instead.
+
+For automatic write blocking, use **Child Process Mode** with `--exec` flag:
+```bash
+replited replica-sidecar --exec "/path/to/your-app serve"
+```
+This ensures your application only connects to the replica when it's safe to read.
+
+#### Replica Checkpoint Tuning
+
+WAL checkpoint tuning is **critical for performance** and **data visibility on replicas**. Proper tuning ensures:
+
+- New schema changes are visible to readers without restarting
+- Write-heavy workloads don't overwhelm the replica
+- Data propagates to readers in a timely manner
+
+| Setting | Default | Recommended | Description |
+|---------|---------|-------------|-------------|
+| `apply_checkpoint_frame_interval` | 128 | 10-50 | Frames to buffer before checkpoint |
+| `apply_checkpoint_interval_ms` | 2000 | 100-500 | Max milliseconds between checkpoints |
+
+**Example Production Configuration**:
+```toml
+[[database]]
+db = "/data/replica.db"
+
+# Aggressive checkpoint for low-latency replication
+apply_checkpoint_frame_interval = 10
+apply_checkpoint_interval_ms = 100
+
+[[database.replicate]]
+name = "stream"
+[database.replicate.params]
+type = "stream"
+addr = "http://primary:50051"
+remote_db_name = "/data/primary.db"
+```
+
+**Trade-offs**:
+- Lower values = faster data visibility, higher I/O
+- Higher values = better throughput, slower propagation
+- For high-write workloads: start with `frame_interval=50`, `interval_ms=500`
+- For read-heavy workloads: use defaults or higher values
+
+---
+
+## Integration with Frameworks
+
+### PocketBase Integration
+
+replited is fully compatible with PocketBase using the **Child Process Mode**:
+
+```bash
+# Primary: Run replited replicate alongside PocketBase
+replited --config primary.toml replicate
+
+# Replica: Use --exec to run PocketBase under replited supervision
+replited --config replica.toml replica-sidecar \
+  --exec "pocketbase serve --http=0.0.0.0:8090 --dir=/pb_data"
+```
+
+**PocketBase Configuration Notes**:
+- PocketBase uses WAL mode by default with `?_pragma=journal_mode(WAL)`
+- Connection pool: `DataMaxOpenConns: 10`, `DataMaxIdleConns: 5`
+- Busy timeout: 10 seconds (`?_pragma=busy_timeout(10000)`)
+
+**Example PocketBase Primary Config**:
+```toml
+[log]
+level = "Info"
+dir = "/var/log/replited"
+
+[[database]]
+db = "/pb_data/data.db"
+
+[[database.replicate]]
+name = "stream-primary"
+[database.replicate.params]
+type = "stream"
+addr = "0.0.0.0:50051"
+```
+
+**Example PocketBase Replica Config**:
+```toml
+[log]
+level = "Info"
+dir = "/var/log/replited"
+
+[[database]]
+db = "/pb_data/replica/data.db"
+
+# Checkpoint tuning for responsive replicas
+apply_checkpoint_frame_interval = 10
+apply_checkpoint_interval_ms = 100
+
+[[database.replicate]]
+name = "stream-primary"
+[database.replicate.params]
+type = "stream"
+addr = "http://primary-replited:50051"
+remote_db_name = "/pb_data/data.db"
+```
+
+**Known Issues**:
+- PocketBase may report "database is locked" under high concurrent load (see [Issue #875](https://github.com/pocketbase/pocketbase/issues/875))
+- Solution: Use Child Process Mode to ensure proper shutdown sequencing
+
+### TrailBase Integration
+
+TrailBase is built on Rust + SQLite + V8, with explicit WAL mode support:
+
+```bash
+# Primary: Run replited replicate alongside TrailBase
+replited --config primary.toml replicate
+
+# Replica: Use --exec to run TrailBase under replited supervision
+replited --config replica.toml replica-sidecar \
+  --exec "trailbase serve --config /etc/trailbase/config.textproto"
+```
+
+**TrailBase Configuration Notes**:
+- Uses `config.textproto` for configuration
+- Supports multiple independent SQLite databases
+- Uses `deadpool-sqlite` for connection pooling
+- WAL mode is explicitly enabled
+
+**Example TrailBase Primary Config** (`config.textproto`):
+```protobuf
+databases {
+  name: "main"
+  path: "data/main.db"
+}
+
+server {
+  addr: "0.0.0.0:4000"
+}
+```
+
+**Example replited Primary Config** (`primary.toml`):
+```toml
+[log]
+level = "Info"
+dir = "/var/log/replited"
+
+[[database]]
+db = "/path/to/trailbase/data/main.db"
+
+[[database.replicate]]
+name = "stream-primary"
+[database.replicate.params]
+type = "stream"
+addr = "0.0.0.0:50051"
+```
+
+**Example replited Replica Config** (`replica.toml`):
+```toml
+[log]
+level = "Info"
+dir = "/var/log/replited"
+
+[[database]]
+db = "/path/to/replica/data/main.db"
+
+# Checkpoint tuning for responsive replicas
+apply_checkpoint_frame_interval = 10
+apply_checkpoint_interval_ms = 100
+
+[[database.replicate]]
+name = "stream-primary"
+[database.replicate.params]
+type = "stream"
+addr = "http://primary-replited:50051"
+remote_db_name = "/path/to/trailbase/data/main.db"
+```
+
+---
+
+## Troubleshooting
+
+### Common Issues
+
+| Symptom | Cause | Solution |
+|---------|-------|----------|
+| "database is locked" | High concurrent access | Increase `busy_timeout`, use connection pooling |
+| Replication lag > 30s | Checkpoint too infrequent | Decrease `apply_checkpoint_interval_ms` |
+| WAL file growing huge | Checkpoints not running | Check checkpoint settings, force manual checkpoint |
+| Schema changes not visible | SHM not rebuilt | Restart replica or wait for DDL-triggered checkpoint |
 
 ## Stargazers over time
 [![Stargazers over time](https://starchart.cc/lichuang/replited.svg?variant=adaptive)](https://starchart.cc/lichuang/replited)
