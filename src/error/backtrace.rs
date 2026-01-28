@@ -7,14 +7,6 @@ use crate::error::ErrorCodeBacktrace;
 // 0: not specified 1: disable 2: enable
 pub static USER_SET_ENABLE_BACKTRACE: AtomicUsize = AtomicUsize::new(0);
 
-pub fn set_backtrace(switch: bool) {
-    if switch {
-        USER_SET_ENABLE_BACKTRACE.store(2, Ordering::Relaxed);
-    } else {
-        USER_SET_ENABLE_BACKTRACE.store(1, Ordering::Relaxed);
-    }
-}
-
 fn enable_rust_backtrace() -> bool {
     match USER_SET_ENABLE_BACKTRACE.load(Ordering::Relaxed) {
         0 => {}
