@@ -23,7 +23,6 @@ use tokio::select;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::Sender;
-use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
 use crate::base::Generation;
@@ -59,6 +58,10 @@ const MAX_WAL_INDEX: u64 = 0x7FFFFFFF;
 // Default DB settings.
 const DEFAULT_MONITOR_INTERVAL: Duration = Duration::from_secs(1);
 
+mod checkpoint;
+mod init;
+mod snapshot;
+
 #[derive(Clone, Debug)]
 pub enum DbCommand {
     Snapshot(usize),
@@ -89,7 +92,6 @@ pub struct Database {
 
     // for sync
     sync_notifiers: Vec<Option<Sender<ReplicateCommand>>>,
-    sync_handle: Vec<JoinHandle<()>>,
     syncs: Vec<Replicate>,
 }
 
@@ -116,7 +118,6 @@ impl WalGenerationPos {
 struct SyncInfo {
     pub generation: Generation,
     pub db_mod_time: Option<SystemTime>,
-    pub index: u64,
     pub wal_size: u64,
     pub shadow_wal_file: String,
     pub shadow_wal_size: u64,
@@ -125,73 +126,6 @@ struct SyncInfo {
 }
 
 impl Database {
-    fn init_params(db: &str, connection: &Connection) -> Result<()> {
-        let max_try_num = 10;
-        // busy timeout
-        connection.busy_timeout(Duration::from_secs(1))?;
-
-        let mut try_num = 0;
-        while try_num < max_try_num {
-            try_num += 1;
-            // PRAGMA journal_mode = wal;
-            if let Err(e) =
-                connection.pragma_update_and_check(None, "journal_mode", "WAL", |_param| {
-                    // println!("journal_mode param: {:?}\n", param);
-                    Ok(())
-                })
-            {
-                error!("set journal_mode=wal error: {e:?}");
-                continue;
-            }
-            try_num = 0;
-            break;
-        }
-        if try_num >= max_try_num {
-            error!("try set journal_mode=wal failed");
-            return Err(Error::SqliteError(format!(
-                "set journal_mode=wal for db {db} failed",
-            )));
-        }
-
-        let mut try_num = 0;
-        while try_num < max_try_num {
-            try_num += 1;
-            // PRAGMA wal_autocheckpoint = 0;
-            if let Err(e) =
-                connection.pragma_update_and_check(None, "wal_autocheckpoint", "0", |_param| {
-                    // println!("wal_autocheckpoint param: {:?}\n", param);
-                    Ok(())
-                })
-            {
-                error!("set wal_autocheckpoint=0 error: {e:?}");
-                continue;
-            }
-            try_num = 0;
-            break;
-        }
-        if try_num >= max_try_num {
-            error!("try set wal_autocheckpoint=0 failed");
-            return Err(Error::SqliteError(format!(
-                "set wal_autocheckpoint=0 for db {db} failed",
-            )));
-        }
-
-        Ok(())
-    }
-
-    fn create_internal_tables(connection: &Connection) -> Result<()> {
-        connection.execute(
-            "CREATE TABLE IF NOT EXISTS _replited_seq (id INTEGER PRIMARY KEY, seq INTEGER);",
-            (),
-        )?;
-
-        connection.execute(
-            "CREATE TABLE IF NOT EXISTS _replited_lock (id INTEGER);",
-            (),
-        )?;
-        Ok(())
-    }
-
     // acquire_read_lock begins a read transaction on the database to prevent checkpointing.
     fn acquire_read_lock(&mut self) -> Result<()> {
         if self.tx_connection.is_none() {
@@ -214,127 +148,6 @@ impl Database {
         Ok(())
     }
 
-    // init replited directory
-    fn init_directory(config: &DbConfig) -> Result<String> {
-        let file_path = PathBuf::from(&config.db);
-        let db_name = file_path.file_name().unwrap().to_str().unwrap();
-        let dir_path = match file_path.parent() {
-            Some(p) if p == Path::new("") => Path::new("."),
-            Some(p) => p,
-            None => Path::new("."),
-        };
-        let meta_dir = format!("{}/.{}-replited/", dir_path.to_str().unwrap(), db_name,);
-
-        let abs_meta_dir = if Path::new(&meta_dir).is_absolute() {
-            PathBuf::from(&meta_dir)
-        } else {
-            std::env::current_dir()?.join(&meta_dir)
-        };
-
-        info!("Creating meta dir at: {abs_meta_dir:?}");
-        fs::create_dir_all(&abs_meta_dir)?;
-
-        Ok(meta_dir)
-    }
-
-    async fn try_create(config: DbConfig) -> Result<(Self, Receiver<DbCommand>)> {
-        info!("start database with config: {config:?}\n");
-        info!("CWD: {:?}", std::env::current_dir());
-        info!("Opening connection to {}", config.db);
-        println!("Database::try_create opening connection");
-        let connection = Connection::open(&config.db)?;
-        println!("Database::try_create connection opened");
-
-        info!("Initializing params");
-        Database::init_params(&config.db, &connection)?;
-
-        info!("Creating internal tables");
-        Database::create_internal_tables(&connection)?;
-
-        let page_size = connection.pragma_query_value(None, "page_size", |row| row.get(0))?;
-        let wal_file = format!("{}-wal", config.db);
-
-        // init path
-        info!("Initializing directory");
-        println!("Database::try_create init directory");
-        let meta_dir = Database::init_directory(&config)?;
-        println!("Database::try_create meta_dir: {meta_dir}");
-
-        // init replicate
-        let (db_notifier, db_receiver) = mpsc::channel(16);
-        let mut sync_handle = Vec::with_capacity(config.replicate.len());
-        let mut sync_notifiers = Vec::with_capacity(config.replicate.len());
-        let mut syncs = Vec::with_capacity(config.replicate.len());
-        let info = DatabaseInfo {
-            meta_dir: meta_dir.clone(),
-            page_size,
-        };
-        let db = Path::new(&config.db)
-            .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_string();
-        for (index, replicate) in config.replicate.iter().enumerate() {
-            if let crate::config::StorageParams::Stream(_) = replicate.params {
-                sync_notifiers.push(None);
-                continue;
-            }
-            info!("Initializing replicate {index}");
-            let (sync_notifier, sync_receiver) = mpsc::channel(16);
-            let s = Replicate::new(
-                replicate.clone(),
-                db.clone(),
-                index,
-                db_notifier.clone(),
-                info.clone(),
-            )
-            .await?;
-            syncs.push(s.clone());
-            let h = Replicate::start(s, sync_receiver)?;
-            sync_handle.push(h);
-            sync_notifiers.push(Some(sync_notifier));
-        }
-
-        let mut db = Self {
-            config: config.clone(),
-            connection,
-            meta_dir,
-            wal_file,
-            page_size,
-            tx_connection: None,
-            sync_notifiers,
-            sync_handle,
-            syncs,
-        };
-
-        info!("Acquiring read lock");
-        db.acquire_read_lock()?;
-
-        // If we have an existing shadow WAL, ensure the headers match.
-        if let Err(err) = db.verify_header_match() {
-            debug!(
-                "db {} cannot determine last wal position, error: {:?}, clearing generation",
-                db.config.db, err
-            );
-
-            if let Err(e) = fs::remove_file(generation_file_path(&db.meta_dir)) {
-                error!("db {} remove generation file error: {:?}", db.config.db, e);
-            }
-        }
-
-        // Clean up previous generations.
-        if let Err(e) = db.clean() {
-            error!(
-                "db {} clean previous generations error {:?} when startup",
-                db.config.db, e
-            );
-            return Err(e);
-        }
-
-        Ok((db, db_receiver))
-    }
-
     // verify if primary wal and last shadow wal header match
     fn verify_header_match(&self) -> Result<()> {
         let generation = self.current_generation()?;
@@ -355,60 +168,6 @@ impl Database {
         }
 
         Ok(())
-    }
-
-    fn calc_wal_size(&self, n: u64) -> u64 {
-        WAL_HEADER_SIZE + (WAL_FRAME_HEADER_SIZE + self.page_size) * n
-    }
-
-    fn decide_checkpoint_mode(
-        &self,
-        orig_wal_size: u64,
-        new_wal_size: u64,
-        info: &SyncInfo,
-    ) -> Option<CheckpointMode> {
-        // If WAL size is great than max threshold, force checkpoint.
-        // If WAL size is greater than min threshold, attempt checkpoint.
-        if self.config.truncate_page_number > 0
-            && orig_wal_size >= self.calc_wal_size(self.config.truncate_page_number)
-        {
-            debug!(
-                "checkpoint by orig_wal_size({}) > truncate_page_number({})",
-                orig_wal_size, self.config.truncate_page_number
-            );
-            return Some(CheckpointMode::Truncate);
-        } else if self.config.max_checkpoint_page_number > 0
-            && new_wal_size >= self.calc_wal_size(self.config.max_checkpoint_page_number)
-        {
-            debug!(
-                "checkpoint by new_wal_size({}) > max_checkpoint_page_number({})",
-                new_wal_size, self.config.max_checkpoint_page_number
-            );
-            return Some(CheckpointMode::Restart);
-        } else if new_wal_size >= self.calc_wal_size(self.config.min_checkpoint_page_number) {
-            debug!(
-                "checkpoint by new_wal_size({}) > min_checkpoint_page_number({})",
-                new_wal_size, self.config.min_checkpoint_page_number
-            );
-            return Some(CheckpointMode::Passive);
-        } else if self.config.checkpoint_interval_secs > 0
-            && let Some(db_mod_time) = &info.db_mod_time
-        {
-            let now = SystemTime::now();
-
-            if let Ok(duration) = now.duration_since(*db_mod_time)
-                && duration.as_secs() > self.config.checkpoint_interval_secs
-                && new_wal_size > self.calc_wal_size(1)
-            {
-                debug!(
-                    "checkpoint by db_mod_time > checkpoint_interval_secs({})",
-                    self.config.checkpoint_interval_secs
-                );
-                return Some(CheckpointMode::Passive);
-            }
-        }
-
-        None
     }
 
     // copy pending data from wal to shadow wal
@@ -995,155 +754,9 @@ impl Database {
         Ok(info)
     }
 
-    fn checkpoint(&mut self, mode: CheckpointMode) -> Result<()> {
-        let generation = self.current_generation()?;
-
-        self.do_checkpoint(&generation, mode.as_str())
-    }
-
-    // checkpoint performs a checkpoint on the WAL file and initializes a
-    // new shadow WAL file.
-    fn do_checkpoint(&mut self, generation: &str, mode: &str) -> Result<()> {
-        // Try getting a checkpoint lock, will fail during snapshots.
-
-        let shadow_wal_file = self.current_shadow_wal_file(generation)?;
-
-        // Read WAL header before checkpoint to check if it has been restarted.
-        let wal_header1 = WALHeader::read(&self.wal_file)?;
-
-        // Copy shadow WAL before checkpoint to copy as much as possible.
-        let (orig_size, new_size) = self.copy_to_shadow_wal(&shadow_wal_file)?;
-        debug!(
-            "db {} do_checkpoint copy_to_shadow_wal: {}, {}",
-            self.config.db, orig_size, new_size
-        );
-
-        // Execute checkpoint and immediately issue a write to the WAL to ensure
-        // a new page is written.
-        self.exec_checkpoint(mode)?;
-
-        self.connection.execute(
-            "INSERT INTO _replited_seq (id, seq) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET seq = seq + 1;",
-            (),
-        )?;
-
-        // If WAL hasn't been restarted, exit.
-        let wal_header2 = WALHeader::read(&self.wal_file)?;
-        if wal_header1 == wal_header2 {
-            return Ok(());
-        }
-
-        // Start a transaction. This will be promoted immediately after.
-        let mut connection = Connection::open(&self.config.db)?;
-        let mut tx = connection.transaction()?;
-        tx.set_drop_behavior(DropBehavior::Rollback);
-
-        // Insert into the lock table to promote to a write tx. The lock table
-        // insert will never actually occur because our tx will be rolled back,
-        // however, it will ensure our tx grabs the write lock. Unfortunately,
-        // we can't call "BEGIN IMMEDIATE" as we are already in a transaction.
-        tx.execute("INSERT INTO _replited_lock (id) VALUES (1);", ())?;
-
-        // Copy the end of the previous WAL before starting a new shadow WAL.
-        let (orig_size, new_size) = self.copy_to_shadow_wal(&shadow_wal_file)?;
-        debug!(
-            "db {} do_checkpoint after checkpoint copy_to_shadow_wal: {}, {}",
-            self.config.db, orig_size, new_size
-        );
-
-        // Parse index of current shadow WAL file.
-        let index = parse_wal_path(&shadow_wal_file)?;
-
-        // Start a new shadow WAL file with next index.
-        let new_shadow_wal_file = self.shadow_wal_file(generation, index + 1);
-        self.init_shadow_wal_file(&new_shadow_wal_file)?;
-
-        Ok(())
-    }
-
-    fn exec_checkpoint(&mut self, mode: &str) -> Result<()> {
-        // Ensure the read lock has been removed before issuing a checkpoint.
-        // We defer the re-acquire to ensure it occurs even on an early return.
-        self.release_read_lock()?;
-
-        // A non-forced checkpoint is issued as "PASSIVE". This will only checkpoint
-        // if there are not pending transactions. A forced checkpoint ("RESTART")
-        // will wait for pending transactions to end & block new transactions before
-        // forcing the checkpoint and restarting the WAL.
-        //
-        // See: https://www.sqlite.org/pragma.html#pragma_wal_checkpoint
-        let sql = format!("PRAGMA wal_checkpoint({mode})");
-
-        let ret = self.connection.execute_batch(&sql);
-
-        // Reacquire the read lock immediately after the checkpoint.
-        self.acquire_read_lock()?;
-
-        ret?;
-
-        Ok(())
-    }
-
     pub async fn handle_db_command(&mut self, cmd: DbCommand) -> Result<()> {
         match cmd {
             DbCommand::Snapshot(i) => self.handle_db_snapshot_command(i).await?,
-        }
-        Ok(())
-    }
-
-    async fn snapshot(&mut self) -> Result<(Vec<u8>, WalGenerationPos)> {
-        // Issue a PASSIVE checkpoint to flush pages to disk.
-        // We use PASSIVE because TRUNCATE would delete the WAL header, causing create_generation to fail.
-        // With PASSIVE, the new generation will start with the existing WAL header and frames.
-        // The snapshot will contain the DB state including those frames.
-        // Restoring will re-apply those frames, which is safe.
-        self.checkpoint(CheckpointMode::Passive)?;
-
-        // Acquire a read lock on the database during snapshot to prevent external checkpoints
-        // and ensure the DB file is stable while we compress it.
-        self.acquire_read_lock()?;
-
-        // Obtain current position.
-        let pos = self.wal_generation_position()?;
-        if pos.is_empty() {
-            return Err(Error::NoGenerationError("no generation"));
-        }
-
-        info!("db {} snapshot created, pos: {:?}", self.config.db, pos);
-
-        // compress db file
-        let compressed_data = compress_file(&self.config.db)?;
-
-        // Release lock is handled by caller or Drop?
-        // acquire_read_lock sets self.tx_connection.
-        // We should probably release it?
-        // But the original code didn't release it explicitly in snapshot().
-        // It seems `handle_db_snapshot_command` doesn't release it either.
-        // Wait, `acquire_read_lock` keeps the transaction open.
-        // If we don't release it, no one can checkpoint!
-        // The original code relied on `Drop`? No, `Connection` drop rolls back?
-        // `self.tx_connection` is stored in `Database`.
-        // We MUST release the lock.
-        self.release_read_lock()?;
-
-        Ok((compressed_data.to_owned(), pos))
-    }
-
-    async fn handle_db_snapshot_command(&mut self, index: usize) -> Result<()> {
-        let (compressed_data, generation_pos) = self.snapshot().await?;
-        debug!(
-            "db {} snapshot {} data of pos {:?}",
-            self.config.db,
-            compressed_data.len(),
-            generation_pos
-        );
-        if let Some(notifier) = &self.sync_notifiers[index] {
-            notifier
-                .send(ReplicateCommand::Snapshot((
-                    generation_pos,
-                    compressed_data,
-                )))
-                .await?;
         }
         Ok(())
     }
