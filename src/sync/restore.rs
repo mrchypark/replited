@@ -1,6 +1,4 @@
 use std::fs;
-use std::fs::OpenOptions;
-use std::io::Write;
 
 use log::debug;
 use log::error;
@@ -9,7 +7,6 @@ use log::warn;
 use rusqlite::Connection;
 use tempfile::NamedTempFile;
 
-use crate::base::decompressed_data;
 use crate::base::parent_dir;
 use crate::config::DbConfig;
 use crate::config::RestoreOptions;
@@ -18,13 +15,11 @@ use crate::error::Error;
 use crate::error::Result;
 use crate::sqlite::{WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE, WALHeader};
 use crate::storage::RestoreInfo;
-use crate::storage::RestoreWalSegments;
-use crate::storage::SnapshotInfo;
 use crate::storage::StorageClient;
-use crate::storage::WalSegmentInfo;
-use std::io::{Seek, SeekFrom};
 
-static WAL_CHECKPOINT_PASSIVE: &str = "PRAGMA wal_checkpoint(PASSIVE);";
+mod apply_wal;
+mod follow;
+mod snapshot;
 
 struct Restore {
     db: String,
@@ -72,282 +67,9 @@ impl Restore {
         Ok(latest_restore_info)
     }
 
-    async fn restore_snapshot(
-        &self,
-        client: &StorageClient,
-        snapshot: &SnapshotInfo,
-        path: &str,
-    ) -> Result<()> {
-        let compressed_data = client.read_snapshot(snapshot).await?;
-        let decompressed_data = decompressed_data(compressed_data)?;
-        println!(
-            "restore_snapshot: decompressed data size: {}",
-            decompressed_data.len()
-        );
-
-        // Clean up existing WAL and SHM files to prevent corruption
-        let wal_path = format!("{path}-wal");
-        let _ = fs::remove_file(&wal_path);
-        let _ = fs::remove_file(format!("{path}-shm"));
-
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(format!("{path}.tmp"))?;
-
-        file.write_all(&decompressed_data)?;
-        file.sync_all()?;
-
-        // Verify integrity of the downloaded snapshot
-        let temp_path = format!("{path}.tmp");
-        {
-            let conn = Connection::open(&temp_path)?;
-            conn.pragma_query(None, "integrity_check", |row| {
-                let s: String = row.get(0)?;
-                if s != "ok" {
-                    return Err(rusqlite::Error::SqliteFailure(
-                        rusqlite::ffi::Error::new(11), // SQLITE_CORRUPT
-                        Some(format!("Integrity check failed: {s}")),
-                    ));
-                }
-                Ok(())
-            })?;
-        }
-
-        fs::rename(temp_path, path)?;
-
-        Ok(())
-    }
-
-    async fn apply_wal_frames(
-        &self,
-        client: &StorageClient,
-        snapshot: &SnapshotInfo,
-        wal_segments: &RestoreWalSegments,
-        db_path: &str,
-        mut last_index: u64,
-        keep_alive: bool,
-    ) -> Result<(u64, u64, Option<Connection>)> {
-        debug!(
-            "restore db {} apply wal segments: {:?}",
-            self.db, wal_segments
-        );
-        let wal_file_name = format!("{db_path}-wal");
-        let mut last_offset = 0;
-
-        for (index, offsets) in wal_segments {
-            let mut wal_decompressed_data = Vec::new();
-            let mut start_offset: Option<u64> = None;
-
-            for offset in offsets {
-                let wal_segment = WalSegmentInfo {
-                    generation: snapshot.generation.clone(),
-                    index: *index,
-                    offset: *offset,
-                    size: 0,
-                    created_at: chrono::Utc::now(),
-                };
-
-                // Filtering logic based on last_index and last_offset
-                if *index < last_index || (*index == last_index && *offset < last_offset) {
-                    continue;
-                }
-
-                if start_offset.is_none() {
-                    start_offset = Some(*offset);
-                }
-
-                let compressed_data = client.read_wal_segment(&wal_segment).await?;
-                let data = decompressed_data(compressed_data)?;
-                wal_decompressed_data.extend_from_slice(&data);
-                last_offset = offset + data.len() as u64;
-            }
-
-            // prepare db wal before open db connection
-            let should_truncate = *index > last_index;
-
-            if should_truncate && fs::metadata(&wal_file_name).is_ok() {
-                // If we are about to truncate the WAL (new generation), we must ensure
-                // the existing WAL is fully checkpointed into the DB.
-                // Otherwise we lose data.
-                let connection = Connection::open(db_path)?;
-                if let Err(e) =
-                    connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_row| Ok(()))
-                {
-                    error!("truncate checkpoint failed before new generation: {e:?}");
-                    // We continue, hoping for the best? Or fail?
-                    // If checkpoint fails, we probably lose data.
-                    return Err(e.into());
-                }
-            }
-
-            if let Ok(metadata) = fs::metadata(&wal_file_name) {
-                println!(
-                    "WAL file {} size: {}, should_truncate: {}",
-                    wal_file_name,
-                    metadata.len(),
-                    should_truncate
-                );
-            } else {
-                println!(
-                    "WAL file {wal_file_name} does not exist, should_truncate: {should_truncate}"
-                );
-            }
-
-            let mut wal_file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(should_truncate)
-                .open(&wal_file_name)?;
-
-            if let Some(start) = start_offset {
-                wal_file.seek(SeekFrom::Start(start))?;
-            } else {
-                // If no segments applied, maybe we shouldn't write?
-                // But we might have truncated?
-                // If should_truncate is true, we truncated to 0.
-                // So seek(0) is fine.
-                // If should_truncate is false, and no segments.
-                // We do nothing.
-                if !wal_decompressed_data.is_empty() {
-                    wal_file.seek(SeekFrom::End(0))?; // Fallback? Or Error?
-                }
-            }
-
-            if !wal_decompressed_data.is_empty() {
-                wal_file.write_all(&wal_decompressed_data)?;
-                wal_file.sync_all()?;
-            }
-
-            last_index = *index;
-
-            // Force SHM deletion to trigger recovery and update mxFrame
-            // let shm_path = format!("{}-shm", db_path);
-            // let _ = fs::remove_file(&shm_path);
-
-            if keep_alive {
-                let connection = Connection::open(db_path)?;
-                return Ok((last_index, last_offset, Some(connection)));
-            }
-            // connection is dropped here if not returned
-        }
-
-        Ok((last_index, last_offset, None))
-    }
-
-    async fn follow_loop(
-        &self,
-        mut current_client: StorageClient,
-        mut current_snapshot: SnapshotInfo,
-        mut last_index: u64,
-        mut last_offset: u64,
-    ) -> Result<()> {
-        println!("entering follow mode...");
-        loop {
-            tokio::time::sleep(tokio::time::Duration::from_secs(self.options.interval)).await;
-
-            // 1. Check for new WAL segments in current generation
-            let wal_segments = current_client
-                .wal_segments(current_snapshot.generation.as_str())
-                .await?;
-
-            let mut new_segments = Vec::new();
-            for segment in wal_segments {
-                if segment.index > last_index
-                    || (segment.index == last_index && segment.offset >= last_offset)
-                {
-                    new_segments.push(segment);
-                }
-            }
-
-            if !new_segments.is_empty() {
-                // Sort and group segments
-                new_segments.sort_by(|a, b| {
-                    let ordering = a.index.partial_cmp(&b.index).unwrap();
-                    if ordering.is_eq() {
-                        a.offset.partial_cmp(&b.offset).unwrap()
-                    } else {
-                        ordering
-                    }
-                });
-
-                let mut restore_wal_segments: std::collections::BTreeMap<u64, Vec<u64>> =
-                    std::collections::BTreeMap::new();
-                for segment in new_segments {
-                    restore_wal_segments
-                        .entry(segment.index)
-                        .or_default()
-                        .push(segment.offset);
-                }
-                let restore_wal_segments: RestoreWalSegments =
-                    restore_wal_segments.into_iter().collect();
-
-                let (new_last_index, new_last_offset, _) = self
-                    .apply_wal_frames(
-                        &current_client,
-                        &current_snapshot,
-                        &restore_wal_segments,
-                        &self.options.output,
-                        last_index,
-                        false,
-                    )
-                    .await?;
-
-                last_index = new_last_index;
-                last_offset = new_last_offset;
-                println!("applied updates up to index {last_index}, offset {last_offset}");
-            }
-
-            // 2. Check for new generations (restarts)
-            // This is a simplified check. In a real scenario, we might need to handle generation switch more robustly.
-            // For now, we check if a newer snapshot exists.
-            if let Some((latest_info, client)) = self.decide_restore_info(None).await? {
-                if latest_info.snapshot.generation > current_snapshot.generation {
-                    println!(
-                        "detected new generation: {:?}",
-                        latest_info.snapshot.generation
-                    );
-                    // Switch to new generation
-                    // Note: This might require re-applying the snapshot if it's a full snapshot.
-                    // For simplicity in this iteration, we assume we can just switch and continue applying WALs
-                    // IF the new generation is compatible. However, usually a new generation means a new snapshot.
-                    // So we should probably re-restore the snapshot?
-                    // But that would overwrite the DB.
-                    // Correct approach for "follow" across generations:
-                    // If new generation starts with a snapshot, we might need to apply it?
-                    // But applying a full snapshot on an active DB is dangerous/impossible if it's open.
-                    // "Follow" mode usually implies applying WALs.
-                    // If the new generation has a base snapshot, we might be able to skip it if we have the data?
-                    // Let's assume for now we just switch context and look for WALs.
-
-                    current_client = client;
-                    current_snapshot = latest_info.snapshot;
-
-                    // If there are WAL segments in the new generation, apply them.
-                    // If there are WAL segments in the new generation, apply them.
-                    let (new_last_index, new_last_offset, _) = self
-                        .apply_wal_frames(
-                            &current_client,
-                            &current_snapshot,
-                            &latest_info.wal_segments,
-                            &self.options.output,
-                            current_snapshot.offset, // Start fresh for new generation
-                            false,
-                        )
-                        .await?;
-                    last_index = new_last_index;
-                    last_offset = new_last_offset;
-                    println!("switched to new generation and applied updates");
-                }
-            }
-        }
-    }
-
     pub async fn run(&self) -> Result<Option<crate::database::WalGenerationPos>> {
         // Ensure output path does not already exist.
         if fs::exists(&self.options.output)? && !self.options.follow {
-            println!("db {} already exists but cannot overwrite", self.db);
             return Err(Error::OverwriteDbError("cannot overwrite exist db"));
         }
 
@@ -481,7 +203,7 @@ impl Restore {
             // and we don't care about WAL history for non-follow mode.
         }
 
-        println!(
+        info!(
             "restore db {} to {} success",
             self.options.db, self.options.output
         );
