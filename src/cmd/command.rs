@@ -4,9 +4,6 @@ use crate::config::Arg;
 use crate::config::ArgCommand;
 use crate::error::Result;
 
-pub const REPLICATE_CMD: &str = "replicate";
-pub const RESTORE_CMD: &str = "restore";
-
 #[async_trait::async_trait]
 pub trait Command {
     async fn run(&mut self) -> Result<()>;

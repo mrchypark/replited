@@ -1,6 +1,7 @@
 use super::command::Command;
 use crate::config::Config;
 use crate::config::RestoreOptions;
+use crate::error::Error;
 use crate::error::Result;
 use crate::log::init_log;
 use crate::sync::run_restore;
@@ -27,14 +28,14 @@ impl Command for Restore {
 
         for config in &self.config.database {
             if config.db == self.options.db {
-                let ret = run_restore(config, &self.options).await;
-                println!("restore result: {ret:?}");
+                run_restore(config, &self.options).await?;
                 return Ok(());
             }
         }
 
-        println!("cannot find db {} in config file", self.options.db);
-
-        Ok(())
+        Err(Error::InvalidArg(format!(
+            "cannot find db {} in config file",
+            self.options.db
+        )))
     }
 }
