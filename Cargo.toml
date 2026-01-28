@@ -66,5 +66,6 @@ path = "src/lib.rs"
 [[bin]]
 name = "replited"
 path = "src/main.rs"
+required-features = ["storage"]
 doctest = false
 test = true
