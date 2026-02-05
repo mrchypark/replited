@@ -1,3 +1,4 @@
+use std::cmp;
 use std::fs;
 use std::fs::File;
 use std::fs::OpenOptions;
@@ -9,7 +10,9 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
+use std::thread::sleep as thread_sleep;
 use std::time::Duration;
+use std::time::Instant;
 use std::time::SystemTime;
 
 use log::debug;
@@ -44,10 +47,11 @@ use crate::sqlite::WAL_HEADER_SIZE;
 use crate::sqlite::WALFrame;
 use crate::sqlite::WALHeader;
 use crate::sqlite::align_frame;
-use crate::sqlite::checksum;
-use crate::sqlite::read_last_checksum;
 use crate::sync::Replicate;
 use crate::sync::ReplicateCommand;
+use crate::sync::replica_progress;
+use crate::sync::replica_progress::REPLICA_ACTIVE_TTL;
+use crate::sync::replica_progress::ReplicaProgressSnapshot;
 
 const GENERATION_LEN: usize = 32;
 
@@ -57,10 +61,12 @@ const MAX_WAL_INDEX: u64 = 0x7FFFFFFF;
 
 // Default DB settings.
 const DEFAULT_MONITOR_INTERVAL: Duration = Duration::from_secs(1);
+const RETENTION_LOG_INTERVAL: Duration = Duration::from_secs(30);
 
 mod checkpoint;
 mod init;
 mod snapshot;
+pub use snapshot::{SnapshotStreamData, snapshot_for_stream};
 
 #[derive(Clone, Debug)]
 pub enum DbCommand {
@@ -93,6 +99,10 @@ pub struct Database {
     // for sync
     sync_notifiers: Vec<Option<Sender<ReplicateCommand>>>,
     syncs: Vec<Replicate>,
+
+    last_retention_log: Option<Instant>,
+    last_retention_floor: Option<u64>,
+    last_retention_tail: Option<u64>,
 }
 
 // position info of wal for a generation
@@ -289,11 +299,18 @@ impl Database {
     async fn create_generation(&mut self) -> Result<Generation> {
         let generation = Generation::new();
 
-        // create a temp file to write new generation
-        let temp_file = NamedTempFile::new()?;
-        let temp_file_name = temp_file.path().to_str().unwrap().to_string();
+        // NOTE: Temp file must be created in the same filesystem as the final
+        // generation file (eg. Docker bind mounts) to avoid EXDEV.
+        let generation_file = generation_file_path(&self.meta_dir);
+        let generation_file_path = Path::new(&generation_file);
+        let dest_dir = generation_file_path
+            .parent()
+            .unwrap_or_else(|| Path::new(&self.meta_dir));
+        fs::create_dir_all(dest_dir)?;
 
-        fs::write(&temp_file_name, generation.as_str())?;
+        // Create temp file in destination directory.
+        let temp_file = NamedTempFile::new_in(dest_dir)?;
+        fs::write(temp_file.path(), generation.as_str())?;
 
         // create new directory.
         let dir = generation_dir(&self.meta_dir, generation.as_str());
@@ -303,8 +320,7 @@ impl Database {
         self.init_shadow_wal_file(&self.shadow_wal_file(generation.as_str(), 0))?;
 
         // rename the temp file to generation file
-        let generation_file = generation_file_path(&self.meta_dir);
-        fs::rename(&temp_file_name, &generation_file)?;
+        fs::rename(temp_file.path(), &generation_file)?;
 
         // Remove old generations.
         self.clean()?;
@@ -313,8 +329,11 @@ impl Database {
     }
 
     // copies pending bytes from the real WAL to the shadow WAL.
-    fn sync_wal(&self, info: &SyncInfo) -> Result<(u64, u64)> {
-        let (orig_size, new_size) = self.copy_to_shadow_wal(&info.shadow_wal_file)?;
+    fn sync_wal(&mut self, info: &SyncInfo) -> Result<(u64, u64)> {
+        self.acquire_read_lock()?;
+        let result = self.copy_to_shadow_wal(&info.shadow_wal_file);
+        self.release_read_lock()?;
+        let (orig_size, new_size) = result?;
         debug!(
             "db {} sync_wal copy_to_shadow_wal: {}, {}",
             self.config.db, orig_size, new_size
@@ -371,37 +390,89 @@ impl Database {
     }
 
     // removes WAL files that have been replicated.
-    fn clean_wal(&self) -> Result<()> {
+    fn clean_wal(&mut self) -> Result<()> {
         let generation = self.current_generation()?;
+        if generation.is_empty() {
+            return Ok(());
+        }
 
-        let mut min = None;
+        let current_generation = Generation::try_create(&generation)?;
+        let (tail_index, _total_size) = self.current_shadow_index(generation.as_str())?;
+
+        let mut min_sync_index = None;
         for sync in &self.syncs {
-            // let sync = sync.read().await;
             let mut position = sync.position();
             if position.generation.as_str() != generation {
                 position = WalGenerationPos::default();
             }
-            match min {
-                None => min = Some(position.index),
-                Some(m) => {
-                    if position.index < m {
-                        min = Some(position.index);
+            match min_sync_index {
+                None => min_sync_index = Some(position.index),
+                Some(min) => {
+                    if position.index < min {
+                        min_sync_index = Some(position.index);
                     }
                 }
             }
         }
 
-        // Skip if our lowest index is too small.
-        let mut min = match min {
-            None => return Ok(()),
-            Some(min) => min,
+        let mut retention_floor = match min_sync_index {
+            Some(min) => {
+                if min == 0 {
+                    Some(0)
+                } else {
+                    Some(min.saturating_sub(self.config.wal_retention_count))
+                }
+            }
+            None => {
+                if tail_index == 0 {
+                    Some(0)
+                } else {
+                    Some(tail_index.saturating_sub(self.config.wal_retention_count))
+                }
+            }
         };
 
-        if min == 0 {
+        let active_snapshot = replica_progress::active_snapshot(
+            &self.config.db,
+            &current_generation,
+            REPLICA_ACTIVE_TTL,
+        );
+        let mut stream_floor = None;
+        if let Some(min_acked) = active_snapshot.min_acked_index {
+            stream_floor = Some(min_acked);
+        }
+        if let Some(min_lease) = active_snapshot.min_lease_index {
+            stream_floor = Some(match stream_floor {
+                Some(current) => current.min(min_lease),
+                None => min_lease,
+            });
+        }
+        if let Some(stream_floor_index) = stream_floor {
+            let cap_floor = tail_index.saturating_sub(self.config.wal_retention_count);
+            let capped_stream_floor = cmp::max(stream_floor_index, cap_floor);
+            retention_floor = Some(match retention_floor {
+                Some(current) => current.min(capped_stream_floor),
+                None => capped_stream_floor,
+            });
+        }
+
+        let retention_floor = retention_floor.unwrap_or(0);
+        replica_progress::update_retention(
+            &self.config.db,
+            &current_generation,
+            retention_floor,
+            tail_index,
+        );
+        self.maybe_log_retention(
+            generation.as_str(),
+            tail_index,
+            retention_floor,
+            &active_snapshot,
+        );
+
+        if retention_floor == 0 {
             return Ok(());
         }
-        // Keep retained WAL files.
-        min = min.saturating_sub(self.config.wal_retention_count);
 
         // Remove all WAL files for the generation before the lowest index.
         let dir = shadow_wal_dir(&self.meta_dir, generation.as_str());
@@ -411,7 +482,7 @@ impl Database {
         for entry in fs::read_dir(&dir)?.flatten() {
             let file_name = entry.file_name().as_os_str().to_str().unwrap().to_string();
             let index = parse_wal_path(&file_name)?;
-            if index >= min {
+            if index >= retention_floor {
                 continue;
             }
             let path = Path::new(&dir)
@@ -424,6 +495,69 @@ impl Database {
         }
 
         Ok(())
+    }
+
+    fn maybe_log_retention(
+        &mut self,
+        generation: &str,
+        tail_index: u64,
+        retention_floor: u64,
+        snapshot: &ReplicaProgressSnapshot,
+    ) {
+        let now = Instant::now();
+        let log_due = match self.last_retention_log {
+            None => true,
+            Some(last) => now.duration_since(last) >= RETENTION_LOG_INTERVAL,
+        };
+        let floor_changed = self.last_retention_floor != Some(retention_floor)
+            || self.last_retention_tail != Some(tail_index);
+        if !(log_due || floor_changed) {
+            return;
+        }
+
+        self.last_retention_log = Some(now);
+        self.last_retention_floor = Some(retention_floor);
+        self.last_retention_tail = Some(tail_index);
+
+        info!(
+            "db {} retention generation {} floor {} tail {} active_replicas {}",
+            self.config.db,
+            generation,
+            retention_floor,
+            tail_index,
+            snapshot.entries.len(),
+        );
+
+        for entry in &snapshot.entries {
+            if let Some(acked) = &entry.acked {
+                let lag = tail_index.saturating_sub(acked.index);
+                let age = entry.ack_age_secs.unwrap_or(0);
+                info!(
+                    "db {} replica {} lag_index {} acked {}:{}:{} ack_age_s {}",
+                    self.config.db,
+                    entry.replica_id,
+                    lag,
+                    acked.generation.as_str(),
+                    acked.index,
+                    acked.offset,
+                    age,
+                );
+            }
+            if let Some(lease) = &entry.lease {
+                let lag = tail_index.saturating_sub(lease.index);
+                let age = entry.lease_age_secs.unwrap_or(0);
+                info!(
+                    "db {} replica {} lease_lag_index {} lease {}:{}:{} lease_age_s {}",
+                    self.config.db,
+                    entry.replica_id,
+                    lag,
+                    lease.generation.as_str(),
+                    lease.index,
+                    lease.offset,
+                    age,
+                );
+            }
+        }
     }
 
     fn init_shadow_wal_file(&self, shadow_wal: &String) -> Result<u64> {
@@ -471,31 +605,87 @@ impl Database {
     // return original wal file size and new wal size
     fn copy_to_shadow_wal(&self, shadow_wal: &String) -> Result<(u64, u64)> {
         let wal_file_name = &self.wal_file;
+        let live_header = WALHeader::read(wal_file_name)?;
         let wal_file_metadata = fs::metadata(wal_file_name)?;
-        let orig_wal_size = align_frame(self.page_size, wal_file_metadata.size());
+        let wal_size = wal_file_metadata.size();
+        let orig_wal_size = align_frame(self.page_size, wal_size);
+        let frame_size = WAL_FRAME_HEADER_SIZE + self.page_size;
 
-        let shadow_wal_file_metadata = fs::metadata(shadow_wal)?;
-        let orig_shadow_wal_size = align_frame(self.page_size, shadow_wal_file_metadata.size());
+        let live_end = {
+            let mut wal_file = File::open(wal_file_name)?;
+            wal_file.seek(SeekFrom::Start(WAL_HEADER_SIZE))?;
+
+            let mut offset = WAL_HEADER_SIZE;
+            loop {
+                let wal_frame = WALFrame::read(&mut wal_file, self.page_size);
+                let wal_frame = match wal_frame {
+                    Ok(wal_frame) => wal_frame,
+                    Err(e) => {
+                        if e.code() == Error::UNEXPECTED_EOF_ERROR {
+                            break;
+                        }
+                        return Err(e);
+                    }
+                };
+
+                if wal_frame.salt1 != live_header.salt1 || wal_frame.salt2 != live_header.salt2 {
+                    break;
+                }
+
+                offset += wal_frame.data.len() as u64;
+            }
+
+            align_frame(self.page_size, offset)
+        };
+
+        let mut shadow_wal_size = fs::metadata(shadow_wal)?.size();
+        if shadow_wal_size > 0 && shadow_wal_size < WAL_HEADER_SIZE {
+            let shadow_file = OpenOptions::new().write(true).open(shadow_wal)?;
+            shadow_file.set_len(0)?;
+            shadow_wal_size = 0;
+        } else if shadow_wal_size >= WAL_HEADER_SIZE {
+            let remainder = (shadow_wal_size - WAL_HEADER_SIZE) % frame_size;
+            if remainder != 0 {
+                let aligned_size = shadow_wal_size - remainder;
+                let shadow_file = OpenOptions::new().write(true).open(shadow_wal)?;
+                shadow_file.set_len(aligned_size)?;
+                shadow_wal_size = aligned_size;
+            }
+        }
+
+        if shadow_wal_size < WAL_HEADER_SIZE {
+            let mut shadow_file = OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(shadow_wal)?;
+            shadow_file.write_all(&live_header.data)?;
+            shadow_file.flush()?;
+            shadow_wal_size = WAL_HEADER_SIZE;
+        }
+
+        let shadow_header = WALHeader::read(shadow_wal)?;
+        if shadow_header != live_header {
+            return Ok((orig_wal_size, shadow_wal_size));
+        }
         debug!(
-            "copy_to_shadow_wal orig_wal_size: {orig_wal_size},  orig_shadow_wal_size: {orig_shadow_wal_size}"
+            "copy_to_shadow_wal orig_wal_size: {orig_wal_size},  orig_shadow_wal_size: {shadow_wal_size}"
         );
-
-        // read shadow wal header
-        let wal_header = WALHeader::read(shadow_wal)?;
 
         // create a temp file to copy wal frames
         let mut temp_file = tempfile()?;
 
         // seek on real db wal
         let mut wal_file = File::open(wal_file_name)?;
-        wal_file.seek(SeekFrom::Start(orig_shadow_wal_size))?;
-        // read last checksum of shadow wal file
-        let (mut ck1, mut ck2) = read_last_checksum(shadow_wal, self.page_size)?;
-        let mut offset = orig_shadow_wal_size;
-        let mut last_commit_size = orig_shadow_wal_size;
+        if live_end <= shadow_wal_size {
+            return Ok((live_end, shadow_wal_size));
+        }
+
+        wal_file.seek(SeekFrom::Start(shadow_wal_size))?;
+        let mut offset = shadow_wal_size;
+        let mut last_commit_size = shadow_wal_size;
         // Read through WAL from last position to find the page of the last
         // committed transaction.
-        loop {
+        while offset < live_end {
             let wal_frame = WALFrame::read(&mut wal_file, self.page_size);
             let wal_frame = match wal_frame {
                 Ok(wal_frame) => wal_frame,
@@ -510,23 +700,11 @@ impl Database {
                 }
             };
 
-            // compare wal frame salts with wal header salts, break if mismatch
-            if wal_frame.salt1 != wal_header.salt1 || wal_frame.salt2 != wal_header.salt2 {
+            // compare wal frame salts with live wal header salts, break if mismatch
+            if wal_frame.salt1 != live_header.salt1 || wal_frame.salt2 != live_header.salt2 {
                 debug!(
                     "db {} copy shadow wal frame salt mismatch at offset {}",
                     self.config.db, offset
-                );
-                break;
-            }
-
-            // frame header
-            (ck1, ck2) = checksum(&wal_frame.data[0..8], ck1, ck2, wal_header.is_big_endian);
-            // frame data
-            (ck1, ck2) = checksum(&wal_frame.data[24..], ck1, ck2, wal_header.is_big_endian);
-            if ck1 != wal_frame.checksum1 || ck2 != wal_frame.checksum2 {
-                debug!(
-                    "db {} copy shadow wal checksum mismatch at offset {}, check: ({},{}),({},{})",
-                    self.config.db, offset, ck1, wal_frame.checksum1, ck2, wal_frame.checksum2,
                 );
                 break;
             }
@@ -535,13 +713,11 @@ impl Database {
             temp_file.write_all(&wal_frame.data)?;
 
             offset += wal_frame.data.len() as u64;
-            if wal_frame.db_size != 0 {
-                last_commit_size = offset;
-            }
+            last_commit_size = offset;
         }
 
         // If no WAL writes found, exit.
-        if last_commit_size == orig_shadow_wal_size {
+        if last_commit_size == shadow_wal_size {
             return Ok((orig_wal_size, last_commit_size));
         }
 
@@ -580,27 +756,36 @@ impl Database {
 
     // make sure wal file has at least one frame in it
     fn ensure_wal_exists(&self) -> Result<()> {
-        if fs::exists(&self.wal_file)? {
-            let stat = fs::metadata(&self.wal_file)?;
-            if !stat.is_file() {
-                return Err(Error::SqliteWalError(format!(
-                    "wal {} is not a file",
-                    self.wal_file,
-                )));
+        for _ in 0..5 {
+            if fs::exists(&self.wal_file)? {
+                let stat = fs::metadata(&self.wal_file)?;
+                if !stat.is_file() {
+                    return Err(Error::SqliteWalError(format!(
+                        "wal {} is not a file",
+                        self.wal_file,
+                    )));
+                }
+
+                if stat.len() >= WAL_HEADER_SIZE {
+                    return Ok(());
+                }
             }
 
-            if stat.len() >= WAL_HEADER_SIZE {
-                return Ok(());
-            }
+            // Ensure WAL mode and force a write to create the WAL header.
+            let _ =
+                self.connection
+                    .pragma_update_and_check(None, "journal_mode", "WAL", |_| Ok(()));
+            self.connection.execute(
+                "INSERT INTO _replited_seq (id, seq) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET seq = seq + 1;",
+                (),
+            )?;
+            thread_sleep(Duration::from_millis(50));
         }
 
-        // create transaction that updates the internal table.
-        self.connection.execute(
-            "INSERT INTO _replited_seq (id, seq) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET seq = seq + 1;",
-            (),
-        )?;
-
-        Ok(())
+        Err(Error::SqliteWalError(format!(
+            "wal {} header not found",
+            self.wal_file,
+        )))
     }
 
     // current_shadow_index returns the current WAL index & total size.
@@ -717,11 +902,7 @@ impl Database {
         let wal_header = WALHeader::read(&self.wal_file)?;
         let shadow_wal_header = WALHeader::read(&info.shadow_wal_file)?;
         if wal_header != shadow_wal_header {
-            info.restart = true;
-        }
-
-        if info.shadow_wal_size == WAL_HEADER_SIZE && info.restart {
-            info.reason = Some("wal header only, mismatched".to_string());
+            info.reason = Some("wal header changed".to_string());
             return Ok(info);
         }
 
@@ -776,12 +957,24 @@ pub async fn run_database(config: DbConfig) -> Result<()> {
             return Err(e);
         }
     };
+    // NOTE: For stream-only configurations, `Database::try_create` may drop all
+    // senders for `db_receiver`, causing `recv()` to return `None` immediately.
+    // If we keep selecting on a closed receiver, it will starve the periodic
+    // sync loop and WAL will never be copied into the shadow WAL.
+    let mut receiver_closed = false;
     loop {
         select! {
-            cmd = db_receiver.recv() => {
-                 if let Some(cmd) = cmd && let Err(e) = database.handle_db_command(cmd).await {
-                     error!("handle_db_command of db {} error: {:?}", database.config.db, e);
+            cmd = db_receiver.recv(), if !receiver_closed => {
+                match cmd {
+                    Some(cmd) => {
+                        if let Err(e) = database.handle_db_command(cmd).await {
+                            error!("handle_db_command of db {} error: {:?}", database.config.db, e);
+                        }
                     }
+                    None => {
+                        receiver_closed = true;
+                    }
+                }
             }
             _ = sleep(DEFAULT_MONITOR_INTERVAL) => {
                 if let Err(e) = database.sync().await {
