@@ -1,0 +1,67 @@
+services:
+  primary-trailbase:
+    image: trailbase/trailbase:latest
+    container_name: primary-trailbase
+    environment:
+      - ADDRESS=0.0.0.0:4000
+    volumes:
+      - ./data/primary:/app/traildepot
+    ports:
+      - "4010:4000"
+    networks:
+      - replited_net
+    healthcheck:
+      test:
+        ["CMD-SHELL", "curl -f http://localhost:4000/api/healthcheck || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    command: ["/app/trail", "run"]
+
+  primary-replited:
+    build:
+      context: ..
+      dockerfile: Dockerfile.dev
+    container_name: primary-replited
+    depends_on:
+      primary-trailbase:
+        condition: service_healthy
+    ports:
+      - "50051:50051"
+    volumes:
+      - ./data/primary:/app/traildepot
+      - ./config/primary.toml:/etc/replited.toml
+    privileged: true
+    networks:
+      - replited_net
+    command: ["-c", "/etc/replited.toml", "replicate"]
+
+  replica-replited:
+    build:
+      context: ..
+      dockerfile: example-trailbase/replica.Dockerfile
+    container_name: replica-replited
+    restart: always
+    command:
+      - "replica-sidecar"
+      - "--exec"
+      - "/app/trail run"
+    environment:
+      - ADDRESS=0.0.0.0:4000
+    volumes:
+      - ./config/replica.toml:/etc/replited.toml
+      - ./data/replica:/app/traildepot
+    ports:
+      - "4011:4000"
+    networks:
+      - replited_net
+    healthcheck:
+      test:
+        ["CMD-SHELL", "curl -f http://localhost:4000/api/healthcheck || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+networks:
+  replited_net:
+    driver: bridge

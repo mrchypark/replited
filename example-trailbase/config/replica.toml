@@ -1,0 +1,14 @@
+[log]
+level = "Debug"
+dir = "/tmp/log"
+
+[[database]]
+db = "/app/traildepot/data/main.db"
+apply_checkpoint_interval_ms = 100
+apply_checkpoint_frame_interval = 16
+
+[[database.replicate]]
+name = "stream-primary"
+params.type = "stream"
+params.addr = "http://primary-replited:50051"
+params.remote_db_name = "/app/traildepot/data/main.db"
