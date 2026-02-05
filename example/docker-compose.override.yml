@@ -1,0 +1,8 @@
+services:
+  primary-pocketbase:
+    ports:
+      - "18090:8090"
+
+  replica-replited:
+    ports:
+      - "18091:8090"

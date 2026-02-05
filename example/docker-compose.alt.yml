@@ -1,0 +1,60 @@
+services:
+  primary-pocketbase:
+    image: ghcr.io/muchobien/pocketbase:0.35.0
+    container_name: primary-pocketbase
+    volumes:
+      - ./data/primary:/pb_data
+    ports:
+      - "18090:8090"
+    networks:
+      - replited_net
+    healthcheck:
+      test: wget --no-verbose --tries=1 --spider http://localhost:8090/api/health || exit 1
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  primary-replited:
+    build:
+      context: ..
+      dockerfile: Dockerfile.dev
+    container_name: primary-replited
+    depends_on:
+      primary-pocketbase:
+        condition: service_healthy
+    ports:
+      - "50051:50051"
+    volumes:
+      - ./data/primary:/pb_data
+      - ./config/primary.toml:/etc/replited.toml
+    privileged: true
+    networks:
+      - replited_net
+    command: ["-c", "/etc/replited.toml", "replicate"]
+
+  replica-replited:
+    build:
+      context: ..
+      dockerfile: example/replica.Dockerfile
+    container_name: replica-replited
+    restart: always
+    command:
+      - "replica-sidecar"
+      - "--exec"
+      - "/usr/local/bin/pocketbase serve --http=0.0.0.0:8090 --dir=/pb_data/replica"
+    volumes:
+      - ./config/replica.toml:/etc/replited.toml
+      - ./data:/pb_data
+    ports:
+      - "18091:8090"
+    networks:
+      - replited_net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8090/api/health || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+networks:
+  replited_net:
+    driver: bridge
