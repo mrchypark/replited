@@ -3,6 +3,8 @@ import shutil
 import glob
 import time
 import socket
+import sqlite3
+import hashlib
 from pathlib import Path
 
 # Central artifacts directory (relative to project root)
@@ -99,3 +101,48 @@ def cleanup():
     """Legacy cleanup for backward compatibility or global cleanup."""
     # We encourage using TestEnv now.
     pass
+
+def run_integrity_check(db_path: str) -> tuple:
+    """Run PRAGMA integrity_check; return (ok, detail)."""
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=1.0)
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA integrity_check;")
+        rows = cursor.fetchall()
+        conn.close()
+        if len(rows) == 1 and rows[0][0] == "ok":
+            return (True, "ok")
+        return (False, "; ".join(str(r[0]) for r in rows))
+    except Exception as e:
+        return (False, str(e))
+
+def compute_db_digest(db_path: str) -> str | None:
+    """Compute deterministic digest of user tables and ordered rows."""
+    if not Path(db_path).exists():
+        return None
+    conn = sqlite3.connect(str(db_path), timeout=1.0)
+    cursor = conn.cursor()
+    hasher = hashlib.sha256()
+    try:
+        cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name NOT LIKE 'sqlite_%' "
+            "AND name NOT LIKE '_replited_%' "
+            "ORDER BY name"
+        )
+        tables = [row[0] for row in cursor.fetchall()]
+        for table in tables:
+            hasher.update(f"table:{table}\n".encode())
+            cursor.execute(f"PRAGMA table_info('{table}')")
+            columns = [row[1] for row in cursor.fetchall()]
+            hasher.update(("cols:" + ",".join(columns) + "\n").encode())
+            if not columns:
+                continue
+            quoted = ", ".join([f'"{col}"' for col in columns])
+            order_by = ", ".join([f'"{col}"' for col in columns])
+            cursor.execute(f"SELECT {quoted} FROM \"{table}\" ORDER BY {order_by}")
+            for row in cursor.fetchall():
+                hasher.update((repr(row) + "\n").encode())
+    finally:
+        conn.close()
+    return hasher.hexdigest()
