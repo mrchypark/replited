@@ -4,12 +4,11 @@ dir = "/tmp/log"
 
 [[database]]
 db = "/pb_data/replica/data.db"
+apply_checkpoint_interval_ms = 100
 
 [[database.replicate]]
 name = "stream-primary"
 params.type = "stream"
 params.addr = "http://primary-replited:50051"
 params.remote_db_name = "/pb_data/data.db"
-apply_checkpoint_interval_ms = 100
-
 
