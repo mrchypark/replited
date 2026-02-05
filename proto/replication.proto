@@ -3,57 +3,80 @@ syntax = "proto3";
 package replication;
 
 service Replication {
-  rpc StreamWal(Handshake) returns (stream WalPacket);
-  rpc GetRestoreConfig(RestoreRequest) returns (RestoreConfig);
-  rpc StreamSnapshot(SnapshotRequest) returns (stream SnapshotResponse);
+  rpc StreamWalV2(StreamWalV2Request) returns (stream StreamWalV2Response);
+  rpc StreamSnapshotV2(StreamSnapshotV2Request) returns (stream StreamSnapshotV2Response);
+  rpc AckLsnV2(AckLsnV2Request) returns (AckLsnV2Response);
 }
 
-message RestoreRequest {
-  string db_name = 1;
-}
-
-message RestoreConfig {
-  string config_json = 1;
-}
-
-message WalPacket {
-  oneof payload {
-    bytes frame_data = 1;
-    Checkpoint event = 2;
-  }
-}
-
-message Handshake {
-  string db_name = 1;
-  string generation = 2;
+message LsnToken {
+  string generation = 1;
+  uint64 index = 2;
   uint64 offset = 3;
-  uint64 index = 4;
 }
 
-message Checkpoint {
-  uint32 index = 1;
+message StreamWalV2Request {
+  string db_identity = 1;
+  string replica_id = 2;
+  string session_id = 3;
+  LsnToken start_lsn = 4;
 }
 
-message Ack {
-  bool success = 1;
+message WalChunkV2 {
+  LsnToken start_lsn = 1;
+  LsnToken next_lsn = 2;
+  bytes wal_bytes = 3;
 }
 
-message SnapshotRequest {
-  string db_name = 1;
-}
-
-message SnapshotResponse {
+message StreamWalV2Response {
   oneof payload {
-    bytes chunk = 1;
-    SnapshotError error = 2;
+    WalChunkV2 chunk = 1;
+    StreamError error = 2;
   }
 }
 
-message SnapshotError {
+message StreamSnapshotV2Request {
+  string db_identity = 1;
+  string replica_id = 2;
+  string session_id = 3;
+  LsnToken start_lsn = 4;
+}
+
+message SnapshotMeta {
+  string db_identity = 1;
+  string generation = 2;
+  LsnToken boundary_lsn = 3;
+  uint32 page_size = 4;
+  uint64 snapshot_size_bytes = 5;
+  bytes snapshot_sha256 = 6;
+}
+
+message StreamSnapshotV2Response {
+  oneof payload {
+    SnapshotMeta meta = 1;
+    bytes chunk = 2;
+    StreamError error = 3;
+  }
+}
+
+message AckLsnV2Request {
+  string db_identity = 1;
+  string replica_id = 2;
+  string session_id = 3;
+  LsnToken last_applied_lsn = 4;
+}
+
+message AckLsnV2Response {
+  bool accepted = 1;
+  StreamError error = 2;
+}
+
+message StreamError {
   enum Code {
     UNKNOWN = 0;
-    BUSY = 1;
-    NOT_FOUND = 2;
+    LINEAGE_MISMATCH = 1;
+    WAL_NOT_RETAINED = 2;
+    SNAPSHOT_BOUNDARY_MISMATCH = 3;
+    INVALID_LSN = 4;
   }
   Code code = 1;
   string message = 2;
