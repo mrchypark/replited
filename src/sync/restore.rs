@@ -97,10 +97,12 @@ impl Restore {
             fs::create_dir_all(&dir)?;
             (self.options.output.clone(), None)
         } else {
-            let temp_file = NamedTempFile::new()?;
+            // NOTE: Create temp file in the output directory to avoid EXDEV when
+            // the system temp directory is on a different mount (common in Docker).
+            let output_dir = parent_dir(&self.options.output).unwrap();
+            fs::create_dir_all(&output_dir)?;
+            let temp_file = NamedTempFile::new_in(output_dir)?;
             let temp_file_name = temp_file.path().to_str().unwrap().to_string();
-            let dir = parent_dir(&temp_file_name).unwrap();
-            fs::create_dir_all(&dir)?;
             (temp_file_name, Some(temp_file))
         };
 

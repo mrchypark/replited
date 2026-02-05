@@ -9,12 +9,12 @@ use crate::error::Result;
 
 static WAL_EXTENDION: &str = ".wal";
 static WAL_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^([0-9]{10})\.wal$").unwrap());
-static WAL_SEGMENT_EXTENDION: &str = ".wal.lz4";
+static WAL_SEGMENT_EXTENDION: &str = ".wal.zst";
 static WAL_SEGMENT_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^([0-9]{10})(?:_([0-9]{10}))\.wal\.lz4$").unwrap());
+    LazyLock::new(|| Regex::new(r"^([0-9]{10})(?:_([0-9]{10}))\.wal\.zst$").unwrap());
 static SNAPSHOT_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^([0-9]{10})(?:_([0-9]{10}))\.snapshot\.lz4$").unwrap());
-static SNAPSHOT_EXTENDION: &str = ".snapshot.lz4";
+    LazyLock::new(|| Regex::new(r"^([0-9]{10})(?:_([0-9]{10}))\.snapshot\.zst$").unwrap());
+static SNAPSHOT_EXTENDION: &str = ".snapshot.zst";
 
 // return base name of path
 pub fn path_base(path: &str) -> Result<String> {
@@ -245,12 +245,12 @@ mod tests {
 
     #[test]
     fn test_parse_snapshot_path() -> Result<()> {
-        let path = "a/b/c/0000000019_0000000100.snapshot.lz4";
+        let path = "a/b/c/0000000019_0000000100.snapshot.zst";
         let (index, offset) = parse_snapshot_path(path)?;
         assert_eq!(index, 19);
         assert_eq!(offset, 100);
 
-        let path = "a/b/c/000000019.snapshot.lz4";
+        let path = "a/b/c/000000019.snapshot.zst";
         let index = parse_snapshot_path(path);
         assert!(index.is_err());
 
@@ -263,7 +263,7 @@ mod tests {
 
     #[test]
     fn test_parse_walsegment_path() -> Result<()> {
-        let path = "a/b/c/0000000019_0000000020.wal.lz4";
+        let path = "a/b/c/0000000019_0000000020.wal.zst";
         let (index, offset) = parse_wal_segment_path(path)?;
         assert_eq!(index, 19);
         assert_eq!(offset, 20);
@@ -278,7 +278,7 @@ mod tests {
 
     #[test]
     fn test_parent_dir() -> Result<()> {
-        let path = "/b/c/0000000019_0000000020.wal.lz4";
+        let path = "/b/c/0000000019_0000000020.wal.zst";
         let dir = parent_dir(path);
         assert_eq!(dir, Some("/b/c".to_string()));
 
