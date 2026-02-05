@@ -60,7 +60,7 @@ def start_primary() -> subprocess.Popen:
         stdout=log,
         stderr=subprocess.STDOUT
     )
-    time.sleep(2)
+    time.sleep(3)
     return proc
 
 
@@ -81,6 +81,8 @@ min_checkpoint_page_number = 100
 max_checkpoint_page_number = 1000
 truncate_page_number = 50000
 checkpoint_interval_secs = 30
+apply_checkpoint_frame_interval = 5
+apply_checkpoint_interval_ms = 50
 wal_retention_count = 5
 
 [[database.replicate]]
@@ -88,6 +90,7 @@ name = "stream-client"
 [database.replicate.params]
 type = "stream"
 addr = "http://127.0.0.1:50051"
+remote_db_name = "primary.db"
 """
     (replica_cwd / "replica.toml").write_text(config)
     (replica_cwd / "logs").mkdir(exist_ok=True)
@@ -110,7 +113,8 @@ def measure_replication_latency(num_samples: int = 100, warmup: int = 10) -> Lat
     
     try:
         # Initialize Primary database
-        conn = sqlite3.connect("primary.db")
+        conn = sqlite3.connect("primary.db", timeout=1.0)
+        conn.execute("PRAGMA busy_timeout=5000")
         cursor = conn.cursor()
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS latency_test (
