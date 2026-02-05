@@ -1,67 +1,111 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::base::Generation;
 use crate::database::WalGenerationPos;
-use crate::error::Result;
+use crate::error::{Error, Result};
 
-pub(super) fn read_generation(db_path: &str) -> Generation {
+const REPLICA_ID_FILE: &str = "replica_id";
+const LAST_APPLIED_LSN_FILE: &str = "last_applied_lsn";
+
+pub(super) fn ensure_meta_dir(db_path: &str) -> Result<PathBuf> {
+    let meta_dir = meta_dir_for_db_path(db_path)?;
+    std::fs::create_dir_all(&meta_dir)?;
+    Ok(meta_dir)
+}
+
+pub(super) fn load_or_create_replica_id(db_path: &str) -> Result<String> {
+    let meta_dir = ensure_meta_dir(db_path)?;
+    let replica_id_path = meta_dir.join(REPLICA_ID_FILE);
+
+    if let Ok(content) = std::fs::read_to_string(&replica_id_path) {
+        let trimmed = content.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
+        }
+    }
+
+    let new_id = new_replica_id();
+    write_atomic(&replica_id_path, format!("{new_id}\n").as_bytes())?;
+    Ok(new_id)
+}
+
+pub(super) fn read_last_applied_lsn(db_path: &str) -> Result<Option<WalGenerationPos>> {
+    let meta_dir = ensure_meta_dir(db_path)?;
+    let lsn_path = meta_dir.join(LAST_APPLIED_LSN_FILE);
+    let content = match std::fs::read_to_string(&lsn_path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+
+    let mut lines = content.lines().filter(|line| !line.trim().is_empty());
+    let generation = lines.next().unwrap_or_default().trim().to_string();
+    if generation.is_empty() {
+        return Ok(None);
+    }
+    let index = lines
+        .next()
+        .ok_or_else(|| Error::InvalidConfig("last_applied_lsn missing index".to_string()))?
+        .trim()
+        .parse::<u64>()?;
+    let offset = lines
+        .next()
+        .ok_or_else(|| Error::InvalidConfig("last_applied_lsn missing offset".to_string()))?
+        .trim()
+        .parse::<u64>()?;
+
+    let generation = Generation::try_create(&generation)?;
+    Ok(Some(WalGenerationPos {
+        generation,
+        index,
+        offset,
+    }))
+}
+
+pub(super) fn persist_last_applied_lsn(db_path: &str, pos: &WalGenerationPos) -> Result<()> {
+    let meta_dir = ensure_meta_dir(db_path)?;
+    let lsn_path = meta_dir.join(LAST_APPLIED_LSN_FILE);
+    let payload = format!(
+        "{}\n{}\n{}\n",
+        pos.generation.as_str(),
+        pos.index,
+        pos.offset
+    );
+    write_atomic(&lsn_path, payload.as_bytes())?;
+    Ok(())
+}
+
+fn meta_dir_for_db_path(db_path: &str) -> Result<PathBuf> {
     let file_path = Path::new(db_path);
-    let db_name = file_path.file_name().and_then(|p| p.to_str()).unwrap_or("");
+    let db_name = file_path
+        .file_name()
+        .and_then(|p| p.to_str())
+        .ok_or_else(|| Error::InvalidPath(format!("invalid db path {db_path}")))?;
     let dir_path = match file_path.parent() {
         Some(p) if p == Path::new("") => Path::new("."),
         Some(p) => p,
         None => Path::new("."),
     };
-    let meta_dir = format!(
-        "{}/.{}-replited/",
-        dir_path.to_str().unwrap_or("."),
-        db_name
-    );
-    let generation_file = Path::new(&meta_dir).join("generation");
-
-    if let Ok(content) = std::fs::read_to_string(generation_file) {
-        if let Ok(parsed) = Generation::try_create(content.trim()) {
-            return parsed;
-        }
-    }
-
-    Generation::default()
+    Ok(Path::new(dir_path).join(format!(".{db_name}-replited")))
 }
 
-pub(super) fn get_local_wal_state(db_path: &str) -> Result<(WalGenerationPos, u64)> {
-    let wal_path = format!("{db_path}-wal");
-    if !Path::new(&wal_path).exists() {
-        return Ok((
-            WalGenerationPos {
-                generation: read_generation(db_path),
-                index: 0,
-                offset: 0,
-            },
-            4096,
-        ));
+fn new_replica_id() -> String {
+    let timestamp = uuid::timestamp::Timestamp::now(uuid::NoContext);
+    uuid::Uuid::new_v7(timestamp).simple().to_string()
+}
+
+fn write_atomic(path: &Path, payload: &[u8]) -> Result<()> {
+    let tmp_path = path.with_extension("tmp");
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)?;
+        use std::io::Write;
+        file.write_all(payload)?;
+        file.sync_all()?;
     }
-
-    let file_len = std::fs::metadata(&wal_path)?.len();
-    if file_len == 0 {
-        return Ok((
-            WalGenerationPos {
-                generation: read_generation(db_path),
-                index: 0,
-                offset: 0,
-            },
-            4096,
-        ));
-    }
-
-    let wal_header = crate::sqlite::WALHeader::read(&wal_path)?;
-    let page_size = wal_header.page_size;
-
-    Ok((
-        WalGenerationPos {
-            generation: read_generation(db_path),
-            index: 0,
-            offset: file_len,
-        },
-        page_size,
-    ))
+    std::fs::rename(tmp_path, path)?;
+    Ok(())
 }
