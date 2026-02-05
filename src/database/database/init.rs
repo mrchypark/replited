@@ -157,6 +157,9 @@ impl Database {
             tx_connection: None,
             sync_notifiers,
             syncs,
+            last_retention_log: None,
+            last_retention_floor: None,
+            last_retention_tail: None,
         };
 
         info!("Acquiring read lock");
