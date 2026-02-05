@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Features
 * feat: Implement Direct Snapshot Streaming. Replicas can now restore directly from the Primary via gRPC without a shared storage backend.
-* feat: Internalize compression using `zstd`. Replaced external `lz4` binary dependency with Rust `zstd` crate.
+* feat: Internalize compression using `zstd`. Replaced external `zstd` binary dependency with Rust `zstd` crate.
 * feat: Add concurrency control for snapshot streaming with `max_concurrent_snapshots` configuration.
 
 ### Configuration
@@ -53,7 +53,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 * docs: add config.md about config fotmat.
 ### CI
 * ci: add integration test of ftp/s3/fs.
-
-
 
 

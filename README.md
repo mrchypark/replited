@@ -93,7 +93,7 @@ command options:
   1. Download the latest snapshot directly from the Primary (Direct Snapshot Streaming).
   2. Switch to WAL streaming mode to apply real-time updates.
 
-  **Note**: Direct Snapshot Streaming uses `zstd` for compression and does not require a shared storage backend.
+**Note**: Direct Snapshot Streaming uses `zstd` for compression and does not require a shared storage backend.
 
 #### ⚠️ Important: Replica is Read-Only
 

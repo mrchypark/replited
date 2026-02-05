@@ -66,6 +66,45 @@ addr = "http://PRIMARY_IP:50051"
 5. **Replica** applies snapshot to create initial database
 6. **Replica** starts streaming WAL frames for ongoing sync
 
+## v2 LSN Contract
+
+An LSN (Log Sequence Number) is the authoritative position of a replica in the WAL stream.
+It is defined as a 3-tuple: `LSN = (generation, index, offset)`.
+
+- `generation`: The replication generation name written by the primary. A generation change resets WAL history.
+- `index`: The WAL segment index within the generation.
+- `offset`: The byte offset within the WAL segment. `offset = 0` points to the WAL header.
+
+### Alignment Rule
+
+`offset` must always be aligned to a WAL frame boundary. Use SQLite's alignment helper:
+
+```
+offset == align_frame(page_size, offset)
+```
+
+If an offset is not aligned, the LSN is invalid and must not be used for streaming.
+
+### Forbidden Resume Sources
+
+v2 replication must never derive an LSN from the live `-wal` file size. Local WAL files can be
+truncated, reset, or contain partial frames and are not authoritative. The replica must only
+resume from an explicit LSN recorded by the replication system (e.g. last applied or snapshot
+boundary).
+
+## v2 Error Taxonomy
+
+Stream replication uses explicit error codes to drive replica state transitions.
+
+| Code | Meaning | Replica action |
+| --- | --- | --- |
+| `LINEAGE_MISMATCH` | Replica generation does not match the primary's lineage. | `NeedsRestore` |
+| `WAL_NOT_RETAINED` | Requested LSN is older than retained WAL segments. | `NeedsRestore` |
+| `SNAPSHOT_BOUNDARY_MISMATCH` | Requested LSN does not match the snapshot boundary used to seed the replica. | `NeedsRestore` |
+| `INVALID_LSN` | LSN is malformed or violates alignment/ordering rules. | `Retry` (recompute LSN) |
+
+If `INVALID_LSN` repeats after recomputation, the replica must fall back to `NeedsRestore`.
+
 ## Commands
 
 ### Start Primary
