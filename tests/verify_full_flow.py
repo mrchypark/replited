@@ -12,6 +12,21 @@ def verify_full_flow():
     # 1. Clean up
     from test_utils import cleanup
     cleanup()
+    for path in ["backup", "replica_cwd", "logs"]:
+        if os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
+    for path in [
+        "data.db",
+        "data.db-wal",
+        "data.db-shm",
+        "primary.log",
+        "replica.log",
+        "primary.toml",
+        "replica.toml",
+    ]:
+        if os.path.exists(path):
+            os.remove(path)
+    os.makedirs("logs", exist_ok=True)
     
     # 2. Start Primary
     print("Starting Primary...")
@@ -35,8 +50,9 @@ addr = "http://0.0.0.0:50051"
         f.write(primary_config)
 
     primary_log = open("logs/primary.log", "w")
+    replited_bin = os.path.abspath("./target/release/replited")
     primary_proc = subprocess.Popen(
-        ["../target/release/replited", "--config", "primary.toml", "replicate"],
+        [replited_bin, "--config", "primary.toml", "replicate"],
         stdout=primary_log,
         stderr=subprocess.STDOUT
     )
@@ -76,7 +92,7 @@ addr = "http://0.0.0.0:50051"
         print("Creating simulated snapshot...")
         snapshot_dir = f"backup/data.db/generations/{generation}/snapshots"
         os.makedirs(snapshot_dir, exist_ok=True)
-        snapshot_path = f"{snapshot_dir}/0000000001_0000000000.snapshot.lz4"
+        snapshot_path = f"{snapshot_dir}/0000000001_0000000000.snapshot.zst"
         
         # Checkpoint to flush WAL to DB before snapshotting
         conn = sqlite3.connect("data.db")
@@ -97,14 +113,14 @@ addr = "http://0.0.0.0:50051"
             
         conn.close()
         
-        subprocess.check_call(["lz4", "-f", "data.db", snapshot_path])
+        subprocess.check_call(["zstd", "-f", "-q", "data.db", "-o", snapshot_path])
         print(f"Created snapshot at {snapshot_path}")
         
         # Restart Primary
         print("Restarting Primary...")
         primary_log = open("logs/primary_restart.log", "w")
         primary_proc = subprocess.Popen(
-            ["../target/release/replited", "--config", "primary.toml", "replicate"],
+        [replited_bin, "--config", "primary.toml", "replicate"],
             stdout=primary_log,
             stderr=subprocess.STDOUT
         )
@@ -122,9 +138,9 @@ addr = "http://0.0.0.0:50051"
         time.sleep(1)
         
         # 7. Prepare Replica
-        os.makedirs("replica_cwd")
+        os.makedirs("replica_cwd", exist_ok=True)
         # Copy backup to replica_cwd/backup (since we use local fs)
-        shutil.copytree("backup", "replica_cwd/backup")
+        shutil.copytree("backup", "replica_cwd/backup", dirs_exist_ok=True)
         
         replica_config = """
 [log]
@@ -152,10 +168,10 @@ addr = "http://127.0.0.1:50051"
         print("Starting Replica...")
         replica_log = open("replica_cwd/replica.log", "w")
         replica_proc = subprocess.Popen(
-            ["../../target/debug/replited", "--config", "replica.toml", "replica-sidecar"],
+            [replited_bin, "--config", "replica.toml", "replica-sidecar"],
             cwd="replica_cwd",
             stdout=replica_log,
-            stderr=subprocess.STDOUT
+            stderr=subprocess.STDOUT,
         )
         
         # 9. Wait and Verify
