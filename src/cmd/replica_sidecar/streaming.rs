@@ -183,8 +183,8 @@ pub(super) async fn stream_wal_and_apply(
                     effective_start_pos.offset
                 );
             } else {
-                warn!(
-                    "ReplicaSidecar: WAL header missing for {} at offset {}; rewinding stream to 0",
+                info!(
+                    "ReplicaSidecar: WAL header missing for {} at offset {}; rewinding stream to 0 (expected on cold start or after WAL cleanup)",
                     db_path, effective_start_pos.offset
                 );
             }
@@ -238,10 +238,17 @@ pub(super) async fn stream_wal_and_apply(
                 if let Some(floor) = &ack_floor {
                     if chunk_start.generation == floor.generation && chunk_start.index > floor.index
                     {
-                        return Err(ReplicaStreamError::Stream(
-                            StreamReplicationErrorCode::SnapshotBoundaryMismatch,
-                            "stream advanced past rewind floor".to_string(),
-                        ));
+                        if can_accept_stream_advance_past_floor(db_path, floor, &chunk_start) {
+                            // The rewind floor is exactly at EOF and stream moved to the next
+                            // index. Treat floor as reached and continue.
+                            current_pos = floor.clone();
+                            suppress_ack = false;
+                        } else {
+                            return Err(ReplicaStreamError::Stream(
+                                StreamReplicationErrorCode::SnapshotBoundaryMismatch,
+                                "stream advanced past rewind floor".to_string(),
+                            ));
+                        }
                     }
                 }
 
@@ -616,17 +623,19 @@ async fn reset_local_wal(
 
     let db_path_owned = db_path.to_string();
     let managed_reader = process_manager.is_some();
-    let invalidate_warn =
+    let invalidate_warn_result =
         tokio::task::spawn_blocking(move || reset_local_wal_sync(&db_path_owned, managed_reader))
-            .await
-            .map_err(|e| ReplicaStreamError::Transport(e.to_string()))??;
-
-    if let Some(warn_message) = invalidate_warn {
-        warn!("{warn_message}");
-    }
+            .await;
 
     if let Some(pm) = process_manager {
         pm.remove_blocker().await;
+    }
+
+    let invalidate_warn =
+        invalidate_warn_result.map_err(|e| ReplicaStreamError::Transport(e.to_string()))??;
+
+    if let Some(warn_message) = invalidate_warn {
+        warn!("{warn_message}");
     }
 
     Ok(())
@@ -780,6 +789,38 @@ fn lsn_reached(current: &WalGenerationPos, floor: &WalGenerationPos) -> bool {
     current.index == floor.index && current.offset >= floor.offset
 }
 
+fn can_accept_stream_advance_past_floor(
+    db_path: &str,
+    floor: &WalGenerationPos,
+    actual_start: &WalGenerationPos,
+) -> bool {
+    if actual_start.generation != floor.generation {
+        return false;
+    }
+    if actual_start.index != floor.index + 1 || actual_start.offset != 0 {
+        return false;
+    }
+
+    floor_is_shadow_wal_eof(db_path, floor)
+}
+
+fn floor_is_shadow_wal_eof(db_path: &str, floor: &WalGenerationPos) -> bool {
+    let meta_dir = match ensure_meta_dir(db_path) {
+        Ok(dir) => dir,
+        Err(_) => return false,
+    };
+    let shadow_path = shadow_wal_file(
+        meta_dir.to_str().unwrap_or("."),
+        floor.generation.as_str(),
+        floor.index,
+    );
+    let metadata = match fs::metadata(&shadow_path) {
+        Ok(meta) => meta,
+        Err(_) => return false,
+    };
+    metadata.len() == floor.offset
+}
+
 fn seed_wal_header_from_shadow(
     db_path: &str,
     pos: &WalGenerationPos,
@@ -855,11 +896,17 @@ fn allow_shadow_wal_boundary_advance(
 
 #[cfg(test)]
 mod tests {
-    use super::{ReplicaStreamError, WalRefreshState, refresh_wal_index, validate_snapshot_meta};
+    use super::{
+        ReplicaStreamError, WalRefreshState, can_accept_stream_advance_past_floor,
+        refresh_wal_index, validate_snapshot_meta,
+    };
+    use crate::base::Generation;
     use crate::cmd::replica_sidecar::process_manager::ProcessManager;
+    use crate::database::WalGenerationPos;
     use crate::sync::StreamReplicationErrorCode;
     use crate::sync::replication::SnapshotMeta;
     use rusqlite::Connection;
+    use std::fs;
     use tempfile::TempDir;
 
     fn base_meta() -> SnapshotMeta {
@@ -902,6 +949,80 @@ mod tests {
             .expect("failed to insert seed row");
         drop(conn);
         (temp_dir, db_path.to_string_lossy().to_string())
+    }
+
+    #[test]
+    fn accepts_floor_eof_transition_to_next_index() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let db_path = temp_dir.path().join("replica.db");
+        fs::write(&db_path, []).expect("create db");
+
+        let generation = Generation::new();
+        let meta_dir = temp_dir.path().join(format!(
+            ".{}-replited",
+            db_path.file_name().unwrap().to_string_lossy()
+        ));
+        let wal_dir = meta_dir
+            .join("generations")
+            .join(generation.as_str())
+            .join("wal");
+        fs::create_dir_all(&wal_dir).expect("create wal dir");
+        let wal_file = wal_dir.join(format!("{:010}.wal", 7));
+        fs::write(&wal_file, vec![0u8; 8192]).expect("write wal");
+
+        let floor = WalGenerationPos {
+            generation: generation.clone(),
+            index: 7,
+            offset: 8192,
+        };
+        let next = WalGenerationPos {
+            generation,
+            index: 8,
+            offset: 0,
+        };
+
+        assert!(can_accept_stream_advance_past_floor(
+            db_path.to_str().unwrap(),
+            &floor,
+            &next
+        ));
+    }
+
+    #[test]
+    fn rejects_floor_transition_when_floor_not_eof() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let db_path = temp_dir.path().join("replica.db");
+        fs::write(&db_path, []).expect("create db");
+
+        let generation = Generation::new();
+        let meta_dir = temp_dir.path().join(format!(
+            ".{}-replited",
+            db_path.file_name().unwrap().to_string_lossy()
+        ));
+        let wal_dir = meta_dir
+            .join("generations")
+            .join(generation.as_str())
+            .join("wal");
+        fs::create_dir_all(&wal_dir).expect("create wal dir");
+        let wal_file = wal_dir.join(format!("{:010}.wal", 7));
+        fs::write(&wal_file, vec![0u8; 8192]).expect("write wal");
+
+        let floor = WalGenerationPos {
+            generation: generation.clone(),
+            index: 7,
+            offset: 4096,
+        };
+        let next = WalGenerationPos {
+            generation,
+            index: 8,
+            offset: 0,
+        };
+
+        assert!(!can_accept_stream_advance_past_floor(
+            db_path.to_str().unwrap(),
+            &floor,
+            &next
+        ));
     }
 
     #[tokio::test]

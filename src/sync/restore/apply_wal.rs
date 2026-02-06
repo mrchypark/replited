@@ -107,14 +107,106 @@ impl super::Restore {
             }
 
             last_index = *index;
-
-            if keep_alive {
-                let connection = Connection::open(db_path)?;
-                return Ok((last_index, last_offset, Some(connection)));
-            }
-            // connection is dropped here if not returned
         }
 
-        Ok((last_index, last_offset, None))
+        let keepalive_connection = if keep_alive {
+            Some(Connection::open(db_path)?)
+        } else {
+            None
+        };
+
+        Ok((last_index, last_offset, keepalive_connection))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+
+    use crate::base::Generation;
+    use crate::base::compress_buffer;
+    use crate::config::RestoreOptions;
+    use crate::config::StorageConfig;
+    use crate::config::StorageFsConfig;
+    use crate::config::StorageParams;
+    use crate::storage::SnapshotInfo;
+    use crate::storage::StorageClient;
+
+    #[tokio::test]
+    async fn apply_wal_frames_with_keepalive_processes_all_indexes() {
+        let temp = tempdir().expect("tempdir");
+        let db_path = temp.path().join("restore_target.db");
+        let db_path_str = db_path.to_string_lossy().to_string();
+
+        let storage_root = temp.path().join("storage");
+        let client = StorageClient::try_create(
+            "db.db".to_string(),
+            StorageConfig {
+                name: "fs".to_string(),
+                params: StorageParams::Fs(Box::new(StorageFsConfig {
+                    root: storage_root.to_string_lossy().to_string(),
+                })),
+            },
+        )
+        .expect("storage client");
+
+        let generation = Generation::new();
+        let snapshot = SnapshotInfo {
+            generation: generation.clone(),
+            index: 0,
+            offset: 0,
+            size: 0,
+            created_at: chrono::Utc::now(),
+        };
+
+        client
+            .write_wal_segment(
+                &crate::database::WalGenerationPos {
+                    generation: generation.clone(),
+                    index: 0,
+                    offset: 0,
+                },
+                compress_buffer(b"first-segment").expect("compress first"),
+            )
+            .await
+            .expect("write first segment");
+        client
+            .write_wal_segment(
+                &crate::database::WalGenerationPos {
+                    generation,
+                    index: 1,
+                    offset: 0,
+                },
+                compress_buffer(b"second-segment").expect("compress second"),
+            )
+            .await
+            .expect("write second segment");
+
+        let restore = super::super::Restore {
+            db: "db.db".to_string(),
+            config: Vec::new(),
+            options: RestoreOptions {
+                db: "db.db".to_string(),
+                output: db_path_str.clone(),
+                follow: false,
+                interval: 1,
+                timestamp: String::new(),
+            },
+        };
+
+        let (last_index, _last_offset, keepalive_conn) = restore
+            .apply_wal_frames(
+                &client,
+                &snapshot,
+                &vec![(0, vec![0]), (1, vec![0])],
+                &db_path_str,
+                0,
+                true,
+            )
+            .await
+            .expect("apply wal frames");
+
+        assert_eq!(last_index, 1);
+        assert!(keepalive_conn.is_some());
     }
 }

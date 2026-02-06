@@ -38,6 +38,15 @@ enum ReplicateState {
     WaitSnapshot,
 }
 
+fn snapshot_position_is_newer(index: u64, offset: u64, current: Option<(u64, u64)>) -> bool {
+    match current {
+        None => true,
+        Some((current_index, current_offset)) => {
+            index > current_index || (index == current_index && offset > current_offset)
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Replicate {
     db: String,
@@ -99,10 +108,10 @@ impl Replicate {
             return Err(Error::NoSnapshotError(generation));
         }
         let mut max_index = 0;
-        let mut max_snapshot_index = 0;
+        let mut max_position: Option<(u64, u64)> = None;
         for (i, snapshot) in snapshots.iter().enumerate() {
-            if snapshot.index > max_snapshot_index {
-                max_snapshot_index = snapshot.index;
+            if snapshot_position_is_newer(snapshot.index, snapshot.offset, max_position) {
+                max_position = Some((snapshot.index, snapshot.offset));
                 max_index = i;
             }
         }
@@ -330,5 +339,16 @@ impl Replicate {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::snapshot_position_is_newer;
+
+    #[test]
+    fn snapshot_position_prefers_later_offset_when_index_matches() {
+        assert!(snapshot_position_is_newer(3, 900, Some((3, 500))));
+        assert!(!snapshot_position_is_newer(3, 500, Some((3, 900))));
     }
 }

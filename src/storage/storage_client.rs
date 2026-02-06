@@ -73,6 +73,15 @@ fn metadata_last_modified_or_epoch(metadata: &Metadata, entry_name: &str) -> Dat
     }
 }
 
+fn snapshot_position_is_newer(index: u64, offset: u64, current: Option<(u64, u64)>) -> bool {
+    match current {
+        None => true,
+        Some((current_index, current_offset)) => {
+            index > current_index || (index == current_index && offset > current_offset)
+        }
+    }
+}
+
 impl StorageClient {
     pub fn try_create(db_path: String, config: StorageConfig) -> Result<Self> {
         Ok(Self {
@@ -229,30 +238,18 @@ impl StorageClient {
         debug!("max_snapshot: found {} entries", entries.len());
 
         let mut snapshot = None;
-        let mut max_index = None;
+        let mut max_position: Option<(u64, u64)> = None;
         for entry in entries {
             let metadata = entry.metadata();
             if !metadata.is_file() {
                 continue;
             }
             let (index, offset) = parse_snapshot_path(entry.name())?;
-            let mut update = false;
-            match max_index {
-                Some(mi) => {
-                    if index > mi {
-                        update = true;
-                    }
-                }
-                None => {
-                    update = true;
-                }
-            }
-
-            if !update {
+            if !snapshot_position_is_newer(index, offset, max_position) {
                 continue;
             }
 
-            max_index = Some(index);
+            max_position = Some((index, offset));
             snapshot = Some(SnapshotInfo {
                 generation: generation.clone(),
                 index,
@@ -409,5 +406,21 @@ impl StorageClient {
         }
 
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::snapshot_position_is_newer;
+
+    #[test]
+    fn snapshot_position_prefers_higher_index() {
+        assert!(snapshot_position_is_newer(11, 0, Some((10, 9999))));
+    }
+
+    #[test]
+    fn snapshot_position_breaks_tie_with_offset() {
+        assert!(snapshot_position_is_newer(10, 200, Some((10, 100))));
+        assert!(!snapshot_position_is_newer(10, 100, Some((10, 200))));
     }
 }

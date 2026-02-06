@@ -5,6 +5,10 @@ use crate::storage::RestoreWalSegments;
 use crate::storage::SnapshotInfo;
 use crate::storage::StorageClient;
 
+fn new_generation_start_index(snapshot: &SnapshotInfo) -> u64 {
+    snapshot.index
+}
+
 impl super::Restore {
     pub(super) async fn follow_loop(
         &self,
@@ -80,7 +84,7 @@ impl super::Restore {
                             &current_snapshot,
                             &latest_info.wal_segments,
                             &self.options.output,
-                            current_snapshot.offset, // Start fresh for new generation
+                            new_generation_start_index(&current_snapshot),
                             false,
                         )
                         .await?;
@@ -90,5 +94,24 @@ impl super::Restore {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::base::Generation;
+    use crate::storage::SnapshotInfo;
+
+    #[test]
+    fn new_generation_start_index_uses_snapshot_index() {
+        let snapshot = SnapshotInfo {
+            generation: Generation::new(),
+            index: 17,
+            offset: 8192,
+            size: 0,
+            created_at: chrono::Utc::now(),
+        };
+
+        assert_eq!(super::new_generation_start_index(&snapshot), 17);
     }
 }
