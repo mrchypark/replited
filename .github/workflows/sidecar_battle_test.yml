@@ -1,4 +1,4 @@
-name: Unit Test
+name: Sidecar Battle Test
 
 on:
   pull_request:
@@ -12,19 +12,16 @@ jobs:
       - name: 'Checkout codes'
         uses: actions/checkout@v4
         with:
-          # fetch depth set to 0 to make sure we have correct diff result.
           fetch-depth: 0
 
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup
 
-      - name: 'Run clippy (non-blocking)'
+      - name: 'Run sidecar battle scenarios (non-blocking)'
         continue-on-error: true
         shell: bash
         run: |
-          cargo clippy --all-targets
-
-      - name: 'Run Unit tests'
-        shell: bash
-        run: |
-          cargo test
+          cargo build --release
+          python3 tests/battle/sidecar_restore_test.py
+          python3 tests/battle/sidecar_retry_test.py
+          python3 tests/battle/sidecar_recover_test.py

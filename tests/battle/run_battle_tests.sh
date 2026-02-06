@@ -52,16 +52,40 @@ ENDURANCE_RESULT=$?
 
 echo ""
 echo "=========================================="
+echo "=== 5. Sidecar Restore Scenario ==="
+echo "=========================================="
+python3 sidecar_restore_test.py
+SIDECAR_RESTORE_RESULT=$?
+
+echo ""
+echo "=========================================="
+echo "=== 6. Sidecar Retry Scenario ==="
+echo "=========================================="
+python3 sidecar_retry_test.py
+SIDECAR_RETRY_RESULT=$?
+
+echo ""
+echo "=========================================="
+echo "=== 7. Sidecar Recover Scenario ==="
+echo "=========================================="
+python3 sidecar_recover_test.py
+SIDECAR_RECOVER_RESULT=$?
+
+echo ""
+echo "=========================================="
 echo "BATTLE TEST SUMMARY"
 echo "=========================================="
 echo "Concurrent Write: $([ $CONCURRENT_RESULT -eq 0 ] && echo 'PASS ✓' || echo 'FAIL ✗')"
 echo "Multi-Replica:    $([ $MULTI_RESULT -eq 0 ] && echo 'PASS ✓' || echo 'FAIL ✗')"
 echo "Chaos:            $([ $CHAOS_RESULT -eq 0 ] && echo 'PASS ✓' || echo 'FAIL ✗')"
 echo "Endurance:        $([ $ENDURANCE_RESULT -eq 0 ] && echo 'PASS ✓' || echo 'FAIL ✗')"
+echo "Sidecar Restore:  $([ $SIDECAR_RESTORE_RESULT -eq 0 ] && echo 'PASS ✓' || echo 'FAIL ✗')"
+echo "Sidecar Retry:    $([ $SIDECAR_RETRY_RESULT -eq 0 ] && echo 'PASS ✓' || echo 'FAIL ✗')"
+echo "Sidecar Recover:  $([ $SIDECAR_RECOVER_RESULT -eq 0 ] && echo 'PASS ✓' || echo 'FAIL ✗')"
 echo "=========================================="
 
 # Exit with failure if any test failed
-if [ $CONCURRENT_RESULT -ne 0 ] || [ $MULTI_RESULT -ne 0 ] || [ $CHAOS_RESULT -ne 0 ] || [ $ENDURANCE_RESULT -ne 0 ]; then
+if [ $CONCURRENT_RESULT -ne 0 ] || [ $MULTI_RESULT -ne 0 ] || [ $CHAOS_RESULT -ne 0 ] || [ $ENDURANCE_RESULT -ne 0 ] || [ $SIDECAR_RESTORE_RESULT -ne 0 ] || [ $SIDECAR_RETRY_RESULT -ne 0 ] || [ $SIDECAR_RECOVER_RESULT -ne 0 ]; then
     echo "OVERALL: FAIL ✗"
     exit 1
 else
