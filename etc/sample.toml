@@ -7,6 +7,7 @@ db = "/var/sqlite/test.db"
 # Replica-side WAL apply tuning (optional, defaults shown)
 # apply_checkpoint_frame_interval = 128     # frames before forcing checkpoint on replica
 # apply_checkpoint_interval_ms = 2000       # max ms between replica checkpoints
+# monitor_interval_ms = 1000                # primary WAL shadow sync poll interval (lower = lower lag)
 
 # each database has at least one replicate backend,
 # each replication config in one db MUST has different name

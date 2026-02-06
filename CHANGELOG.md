@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 <!-- Release notes generated using configuration in .github/release.yml at main -->
 
+## [v0.3.3] - 2026-02-06
+
+### Fixes
+* fix: resolve `restore --follow` WAL apply early-return that could skip later WAL indexes.
+* fix: correct generation handoff in follow mode (`offset` used as `index`) to prevent skipped replay.
+* fix: harden sidecar blocker lifecycle to ensure managed child process is always unblocked on errors.
+* fix: improve rewind-floor boundary handling in stream apply path to avoid false `SnapshotBoundaryMismatch`.
+* fix: select latest snapshot by `(index, offset)` instead of only `index`.
+
+### Configuration / Behavior
+* config: allow `max_checkpoint_page_number = 0` to disable forced checkpoints as documented.
+* config: add `monitor_interval_ms` (default `1000`) to control primary WAL shadow sync polling interval.
+
+### Performance
+* perf: remove fixed 1s idle delay in replica streaming loop; use short idle backoff only when no progress.
+* perf: lower E2E replication latency in benchmark profile via `monitor_interval_ms` and checkpoint tuning updates.
+
+### Logging
+* chore: downgrade expected cold-start WAL rewind log to `INFO`.
+* chore: suppress noisy startup `journal_mode=WAL` busy/locked warning for pinned primary connection.
+* chore: remove release build warnings from debug-only parameter naming.
+
 ## [v0.3.0] - 2025-12-05
 
 ### Features
@@ -53,5 +75,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 * docs: add config.md about config fotmat.
 ### CI
 * ci: add integration test of ftp/s3/fs.
-
 

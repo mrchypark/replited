@@ -63,6 +63,7 @@ See stream-specific docs:
 Replica-side WAL checkpoint tuning (new)
 - `apply_checkpoint_frame_interval` (default: 128): number of WAL frames to buffer before checkpointing. Lower values surface new schema/data faster at the cost of more I/O.
 - `apply_checkpoint_interval_ms` (default: 2000): max milliseconds between checkpoints even if the frame threshold is not reached.
+- `monitor_interval_ms` (default: 1000): primary-side WAL shadow sync polling interval in milliseconds. Lower values reduce replication latency at the cost of more I/O and CPU.
 - DDL (page 1) followed by a commit triggers an immediate checkpoint and SHM rebuild so schema changes are visible without restarting the sidecar.
 
 
@@ -125,6 +126,7 @@ WAL checkpoint tuning is **critical for performance** and **data visibility on r
 |---------|---------|-------------|-------------|
 | `apply_checkpoint_frame_interval` | 128 | 10-50 | Frames to buffer before checkpoint |
 | `apply_checkpoint_interval_ms` | 2000 | 100-500 | Max milliseconds between checkpoints |
+| `monitor_interval_ms` | 1000 | 50-200 | Primary WAL shadow sync poll interval |
 
 **Example Production Configuration**:
 ```toml
@@ -134,6 +136,7 @@ db = "/data/replica.db"
 # Aggressive checkpoint for low-latency replication
 apply_checkpoint_frame_interval = 10
 apply_checkpoint_interval_ms = 100
+monitor_interval_ms = 50
 
 [[database.replicate]]
 name = "stream"
@@ -148,6 +151,7 @@ remote_db_name = "/data/primary.db"
 - Higher values = better throughput, slower propagation
 - For high-write workloads: start with `frame_interval=50`, `interval_ms=500`
 - For read-heavy workloads: use defaults or higher values
+- To reduce end-to-end lag below ~1s, also lower `monitor_interval_ms` on the Primary (for example `50`).
 
 ---
 
