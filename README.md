@@ -56,6 +56,9 @@ replited --config {config file} restore --db {db in config file} --output {outpu
 ## Config
 
 See [config.md](./config.md)
+See stream-specific docs:
+- [Streaming Copy Config Guide](./docs/stream-copy-config.md)
+- [Replica Sidecar Config Guide](./docs/sidecar-config.md)
 
 Replica-side WAL checkpoint tuning (new)
 - `apply_checkpoint_frame_interval` (default: 128): number of WAL frames to buffer before checkpointing. Lower values surface new schema/data faster at the cost of more I/O.
