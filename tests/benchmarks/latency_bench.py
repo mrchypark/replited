@@ -81,9 +81,10 @@ min_checkpoint_page_number = 100
 max_checkpoint_page_number = 1000
 truncate_page_number = 50000
 checkpoint_interval_secs = 30
-apply_checkpoint_frame_interval = 5
-apply_checkpoint_interval_ms = 50
-wal_retention_count = 5
+monitor_interval_ms = 50
+apply_checkpoint_frame_interval = 20
+apply_checkpoint_interval_ms = 200
+wal_retention_count = 20
 
 [[database.replicate]]
 name = "stream-client"

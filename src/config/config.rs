@@ -15,6 +15,7 @@ const DEFAULT_MIN_CHECKPOINT_PAGE_NUMBER: u64 = 1000;
 const DEFAULT_MAX_CHECKPOINT_PAGE_NUMBER: u64 = 10000;
 const DEFAULT_TRUNCATE_PAGE_NUMBER: u64 = 500000;
 const DEFAULT_CHECKPOINT_INTERVAL_SECS: u64 = 60;
+const DEFAULT_MONITOR_INTERVAL_MS: u64 = 1000;
 const DEFAULT_WAL_RETENTION_COUNT: u64 = 10;
 const DEFAULT_APPLY_CHECKPOINT_FRAME_INTERVAL: u32 = 128;
 const DEFAULT_APPLY_CHECKPOINT_INTERVAL_MS: u64 = 2000;
@@ -136,6 +137,10 @@ pub struct DbConfig {
     #[serde(default = "default_checkpoint_interval_secs")]
     pub checkpoint_interval_secs: u64,
 
+    // Milliseconds between periodic WAL shadow sync polls on Primary.
+    #[serde(default = "default_monitor_interval_ms")]
+    pub monitor_interval_ms: u64,
+
     // Replica-side WAL apply: how many frames to buffer before forcing a checkpoint.
     // Lower values make new schema/rows visible to readers sooner at the cost of more I/O.
     #[serde(default = "default_apply_checkpoint_frame_interval")]
@@ -173,6 +178,10 @@ fn default_checkpoint_interval_secs() -> u64 {
     DEFAULT_CHECKPOINT_INTERVAL_SECS
 }
 
+fn default_monitor_interval_ms() -> u64 {
+    DEFAULT_MONITOR_INTERVAL_MS
+}
+
 fn default_apply_checkpoint_frame_interval() -> u32 {
     DEFAULT_APPLY_CHECKPOINT_FRAME_INTERVAL
 }
@@ -204,6 +213,7 @@ impl Debug for DbConfig {
             )
             .field("truncate_page_number", &self.truncate_page_number)
             .field("checkpoint_interval_secs", &self.checkpoint_interval_secs)
+            .field("monitor_interval_ms", &self.monitor_interval_ms)
             .field(
                 "apply_checkpoint_frame_interval",
                 &self.apply_checkpoint_frame_interval,
@@ -230,8 +240,15 @@ impl DbConfig {
                 "min_checkpoint_page_number cannot be zero",
             ));
         }
+        if self.monitor_interval_ms == 0 {
+            return Err(Error::InvalidConfig(
+                "monitor_interval_ms must be greater than zero",
+            ));
+        }
 
-        if self.min_checkpoint_page_number > self.max_checkpoint_page_number {
+        if self.max_checkpoint_page_number > 0
+            && self.min_checkpoint_page_number > self.max_checkpoint_page_number
+        {
             return Err(Error::InvalidConfig(
                 "min_checkpoint_page_number cannot bigger than max_checkpoint_page_number",
             ));
@@ -283,6 +300,7 @@ mod tests {
             max_checkpoint_page_number: DEFAULT_MAX_CHECKPOINT_PAGE_NUMBER,
             truncate_page_number: DEFAULT_TRUNCATE_PAGE_NUMBER,
             checkpoint_interval_secs: DEFAULT_CHECKPOINT_INTERVAL_SECS,
+            monitor_interval_ms: DEFAULT_MONITOR_INTERVAL_MS,
             apply_checkpoint_frame_interval: DEFAULT_APPLY_CHECKPOINT_FRAME_INTERVAL,
             apply_checkpoint_interval_ms: DEFAULT_APPLY_CHECKPOINT_INTERVAL_MS,
             wal_retention_count: DEFAULT_WAL_RETENTION_COUNT,
@@ -347,6 +365,15 @@ mod tests {
     }
 
     #[test]
+    fn test_db_config_validate_monitor_interval_zero() {
+        let mut config = create_valid_db_config();
+        config.monitor_interval_ms = 0;
+
+        let result = config.validate();
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_db_config_validate_apply_checkpoint_frame_interval_zero() {
         let mut config = create_valid_db_config();
         config.apply_checkpoint_frame_interval = 0;
@@ -365,6 +392,15 @@ mod tests {
         assert!(config.validate().is_ok());
     }
 
+    #[test]
+    fn test_db_config_validate_max_checkpoint_zero_disables_forced_checkpoint() {
+        let mut config = create_valid_db_config();
+        config.max_checkpoint_page_number = 0;
+        config.min_checkpoint_page_number = 5000;
+
+        assert!(config.validate().is_ok());
+    }
+
     // ========== Default value function tests ==========
 
     #[test]
@@ -373,6 +409,7 @@ mod tests {
         assert_eq!(10000, default_max_checkpoint_page_number());
         assert_eq!(500000, default_truncate_page_number());
         assert_eq!(60, default_checkpoint_interval_secs());
+        assert_eq!(1000, default_monitor_interval_ms());
         assert_eq!(128, default_apply_checkpoint_frame_interval());
         assert_eq!(2000, default_apply_checkpoint_interval_ms());
         assert_eq!(10, default_wal_retention_count());

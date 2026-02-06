@@ -41,6 +41,14 @@ pub struct ReplicationServer {
 const SNAPSHOT_CHUNK_SIZE: usize = 1024 * 1024;
 const SNAPSHOT_RETRY_COUNT: usize = 5;
 const SNAPSHOT_RETRY_DELAY_MS: u64 = 200;
+const PINNED_CONN_BUSY_TIMEOUT_MS: u64 = 100;
+
+fn is_busy_or_locked_error(err: &rusqlite::Error) -> bool {
+    let text = err.to_string().to_ascii_lowercase();
+    text.contains("database is locked")
+        || text.contains("database table is locked")
+        || text.contains("database is busy")
+}
 
 impl ReplicationServer {
     pub fn new(config: Config) -> Self {
@@ -60,13 +68,22 @@ impl ReplicationServer {
 
             // Open a persistent connection to pin the WAL file
             if let Ok(conn) = rusqlite::Connection::open(&path) {
+                let _ = conn.busy_timeout(Duration::from_millis(PINNED_CONN_BUSY_TIMEOUT_MS));
                 // Set WAL mode to ensure it's active
                 if let Err(e) = conn.pragma_update(None, "journal_mode", "WAL") {
-                    log::warn!(
-                        "Primary: Failed to set WAL mode for {}: {}",
-                        path.display(),
-                        e
-                    );
+                    if is_busy_or_locked_error(&e) {
+                        log::debug!(
+                            "Primary: journal_mode WAL busy/locked for {} while opening pin connection: {}",
+                            path.display(),
+                            e
+                        );
+                    } else {
+                        log::warn!(
+                            "Primary: Failed to set WAL mode for {}: {}",
+                            path.display(),
+                            e
+                        );
+                    }
                 }
                 _connections.push(conn);
                 log::debug!(

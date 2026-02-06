@@ -59,7 +59,6 @@ const GENERATION_LEN: usize = 32;
 const MAX_WAL_INDEX: u64 = 0x7FFFFFFF;
 
 // Default DB settings.
-const DEFAULT_MONITOR_INTERVAL: Duration = Duration::from_secs(1);
 const RETENTION_LOG_INTERVAL: Duration = Duration::from_secs(30);
 
 mod checkpoint;
@@ -105,7 +104,7 @@ pub struct Database {
 }
 
 // position info of wal for a generation
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WalGenerationPos {
     // generation name
     pub generation: Generation,
@@ -770,21 +769,21 @@ impl Database {
 
     fn debug_assert_shadow_wal_matches_live(
         &self,
-        shadow_wal: &str,
-        wal_file_name: &str,
+        _shadow_wal: &str,
+        _wal_file_name: &str,
     ) -> Result<()> {
         #[cfg(debug_assertions)]
         {
-            let shadow_wal_file = fs::metadata(shadow_wal)?;
+            let shadow_wal_file = fs::metadata(_shadow_wal)?;
             let shadow_wal_size = align_frame(self.page_size, shadow_wal_file.len());
 
             let offset = shadow_wal_size - self.page_size - WAL_FRAME_HEADER_SIZE;
 
-            let mut shadow_wal_file = OpenOptions::new().read(true).open(shadow_wal)?;
+            let mut shadow_wal_file = OpenOptions::new().read(true).open(_shadow_wal)?;
             shadow_wal_file.seek(SeekFrom::Start(offset))?;
             let shadow_wal_last_frame = WALFrame::read(&mut shadow_wal_file, self.page_size)?;
 
-            let mut wal_file = OpenOptions::new().read(true).open(wal_file_name)?;
+            let mut wal_file = OpenOptions::new().read(true).open(_wal_file_name)?;
             wal_file.seek(SeekFrom::Start(offset))?;
             let wal_last_frame = WALFrame::read(&mut wal_file, self.page_size)?;
 
@@ -1006,6 +1005,7 @@ pub async fn run_database(config: DbConfig) -> Result<()> {
             return Err(e);
         }
     };
+    let monitor_interval = Duration::from_millis(database.config.monitor_interval_ms);
     // NOTE: For stream-only configurations, `Database::try_create` may drop all
     // senders for `db_receiver`, causing `recv()` to return `None` immediately.
     // If we keep selecting on a closed receiver, it will starve the periodic
@@ -1025,7 +1025,7 @@ pub async fn run_database(config: DbConfig) -> Result<()> {
                     }
                 }
             }
-            _ = sleep(DEFAULT_MONITOR_INTERVAL) => {
+            _ = sleep(monitor_interval) => {
                 if let Err(e) = database.sync().await {
                     error!("sync db {} error: {:?}", database.config.db, e);
                 }

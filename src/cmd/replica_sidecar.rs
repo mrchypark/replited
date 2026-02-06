@@ -43,6 +43,7 @@ enum BootstrapOutcome {
 
 const MAX_AUTO_RESTORES: u32 = 5;
 const RESTORE_RESET_THRESHOLD: Duration = Duration::from_secs(60);
+const STREAM_IDLE_BACKOFF_MS: u64 = 50;
 
 struct BootstrapContext<'a> {
     stream_addr: &'a str,
@@ -325,7 +326,7 @@ async fn handle_catching_up_state(
         ctx.remote_db_name,
         ctx.replica_id,
         ctx.session_id,
-        start_pos,
+        start_pos.clone(),
         ctx.checkpoint_frame_interval,
         ctx.checkpoint_interval_ms,
         ctx.process_manager.clone(),
@@ -375,7 +376,7 @@ async fn handle_streaming_state(
         ctx.remote_db_name,
         ctx.replica_id,
         ctx.session_id,
-        start_pos,
+        start_pos.clone(),
         ctx.checkpoint_frame_interval,
         ctx.checkpoint_interval_ms,
         ctx.process_manager.clone(),
@@ -383,11 +384,14 @@ async fn handle_streaming_state(
     .await
     {
         Ok(applied_lsn) => {
+            let no_progress = applied_lsn == start_pos;
             persist_last_applied_lsn(ctx.db_path, &applied_lsn)?;
             *last_applied_lsn = Some(applied_lsn.clone());
             *resume_pos = Some(applied_lsn);
             *invalid_lsn_retries = 0;
-            sleep(Duration::from_secs(1)).await;
+            if no_progress {
+                sleep(Duration::from_millis(STREAM_IDLE_BACKOFF_MS)).await;
+            }
         }
         Err(err) => {
             handle_wal_cycle_error(err, ctx.db_path, state, invalid_lsn_retries, None).await?;
