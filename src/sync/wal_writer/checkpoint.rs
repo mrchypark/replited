@@ -1,4 +1,5 @@
 use std::io::Write;
+use std::path::PathBuf;
 
 use crate::error::Result;
 
@@ -33,7 +34,7 @@ impl super::WalWriter {
                 );
 
                 // Invalidate SHM Header
-                let shm_path = format!("{}-shm", self.db_path.to_str().unwrap());
+                let shm_path = PathBuf::from(format!("{}-shm", self.db_path.display()));
                 if let Ok(mut shm_file) = std::fs::OpenOptions::new().write(true).open(&shm_path) {
                     let zeros = [0u8; 32];
                     let _ = shm_file.write_all(&zeros);

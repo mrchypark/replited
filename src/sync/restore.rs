@@ -1,5 +1,6 @@
 use std::fs;
 
+use chrono::{DateTime, Utc};
 use log::debug;
 use log::error;
 use log::info;
@@ -73,15 +74,7 @@ impl Restore {
             return Err(Error::OverwriteDbError("cannot overwrite exist db"));
         }
 
-        let limit = if self.options.timestamp.is_empty() {
-            None
-        } else {
-            Some(
-                chrono::DateTime::parse_from_rfc3339(&self.options.timestamp)
-                    .unwrap()
-                    .with_timezone(&chrono::Utc),
-            )
-        };
+        let limit = parse_limit_timestamp(&self.options.timestamp)?;
 
         let (latest_restore_info, client) = match self.decide_restore_info(limit).await? {
             Some(latest_restore_info) => latest_restore_info,
@@ -93,16 +86,16 @@ impl Restore {
 
         // Determine target path
         let (target_path, _temp_file) = if self.options.follow {
-            let dir = parent_dir(&self.options.output).unwrap();
+            let dir = output_parent_dir(&self.options.output)?;
             fs::create_dir_all(&dir)?;
             (self.options.output.clone(), None)
         } else {
             // NOTE: Create temp file in the output directory to avoid EXDEV when
             // the system temp directory is on a different mount (common in Docker).
-            let output_dir = parent_dir(&self.options.output).unwrap();
+            let output_dir = output_parent_dir(&self.options.output)?;
             fs::create_dir_all(&output_dir)?;
             let temp_file = NamedTempFile::new_in(output_dir)?;
-            let temp_file_name = temp_file.path().to_str().unwrap().to_string();
+            let temp_file_name = temp_file.path().to_string_lossy().to_string();
             (temp_file_name, Some(temp_file))
         };
 
@@ -234,6 +227,25 @@ impl Restore {
     }
 }
 
+fn parse_limit_timestamp(timestamp: &str) -> Result<Option<DateTime<Utc>>> {
+    if timestamp.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let parsed = DateTime::parse_from_rfc3339(timestamp)
+        .map_err(|err| Error::InvalidArg(format!("invalid --timestamp {timestamp:?}: {err}")))?;
+    Ok(Some(parsed.with_timezone(&Utc)))
+}
+
+fn output_parent_dir(path: &str) -> Result<String> {
+    let dir = parent_dir(path).ok_or_else(|| Error::InvalidPath(format!("invalid path {path}")))?;
+    if dir.is_empty() {
+        Ok(".".to_string())
+    } else {
+        Ok(dir)
+    }
+}
+
 pub async fn run_restore(
     config: &DbConfig,
     options: &RestoreOptions,
@@ -242,4 +254,25 @@ pub async fn run_restore(
         Restore::try_create(config.db.clone(), config.replicate.clone(), options.clone())?;
 
     restore.run().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{output_parent_dir, parse_limit_timestamp};
+
+    #[test]
+    fn parse_limit_timestamp_accepts_empty() {
+        assert!(parse_limit_timestamp("").unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_limit_timestamp_rejects_invalid() {
+        let err = parse_limit_timestamp("not-a-timestamp").unwrap_err();
+        assert_eq!(err.code(), crate::error::Error::INVALID_ARG);
+    }
+
+    #[test]
+    fn output_parent_dir_defaults_to_current_directory() {
+        assert_eq!(output_parent_dir("data.db").unwrap(), ".");
+    }
 }

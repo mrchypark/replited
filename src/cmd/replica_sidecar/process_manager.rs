@@ -27,15 +27,12 @@ impl ProcessManager {
         }
 
         info!("ProcessManager: Starting child process: {}", self.cmd);
-        let parts: Vec<&str> = self.cmd.split_whitespace().collect();
-        if parts.is_empty() {
+        if self.cmd.trim().is_empty() {
             return;
         }
 
-        let mut command = tokio::process::Command::new(parts[0]);
-        if parts.len() > 1 {
-            command.args(&parts[1..]);
-        }
+        let mut command = tokio::process::Command::new("sh");
+        command.arg("-c").arg(&self.cmd);
 
         // Inherit stdout/stderr allowing logs to show up in replited output.
         command.stdout(Stdio::inherit());
@@ -81,20 +78,5 @@ impl ProcessManager {
             // Last blocker removed, start the process.
             self.start().await;
         }
-    }
-
-    /// Restart the child process (for schema changes, etc.)
-    /// Only restarts if there are no active blockers.
-    pub(super) async fn restart(&self) {
-        let blockers = self.blockers.load(std::sync::atomic::Ordering::SeqCst);
-        if blockers > 0 {
-            log::warn!(
-                "ProcessManager: Restart requested but blockers active ({blockers}), skipping."
-            );
-            return;
-        }
-        info!("ProcessManager: Restarting child process...");
-        self.stop().await;
-        self.start().await;
     }
 }

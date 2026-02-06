@@ -41,7 +41,7 @@ impl Database {
     pub(super) async fn snapshot(&mut self) -> Result<(Vec<u8>, WalGenerationPos)> {
         // Ensure WAL exists before trying to derive a generation position.
         // This is required for brand new databases that have not yet produced a WAL header.
-        self.ensure_wal_exists()?;
+        self.ensure_wal_exists().await?;
 
         // Snapshotting requires a generation + an initialized shadow WAL file because
         // checkpointing and position derivation are anchored to the shadow WAL inventory.

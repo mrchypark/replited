@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use sha2::{Digest, Sha256};
 use tokio::sync::{Semaphore, mpsc};
 use tokio::time::sleep;
 use tokio_stream::wrappers::ReceiverStream;
@@ -11,7 +13,7 @@ use tonic::{Request, Response, Status};
 
 use crate::base::{Generation, generation_file_path, shadow_wal_dir, shadow_wal_file};
 use crate::config::{Config, DbConfig};
-use crate::database::{DatabaseInfo, WalGenerationPos, snapshot_for_stream};
+use crate::database::{DatabaseInfo, SnapshotStreamData, WalGenerationPos, snapshot_for_stream};
 use crate::pb::replication::replication_server::Replication;
 use crate::pb::replication::stream_error::Code as StreamErrorCode;
 use crate::pb::replication::stream_snapshot_v2_response::Payload as StreamSnapshotV2Payload;
@@ -23,9 +25,11 @@ use crate::pb::replication::{
 };
 use crate::sqlite::{WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE, WALFrame, WALHeader};
 use crate::sync::replica_progress;
-use crate::sync::{
-    Lsn, ReplicaRecoveryAction, ShadowWalReader, StreamReplicationError, StreamReplicationErrorCode,
+use crate::sync::stream_protocol::{
+    lsn_token_from_pos, lsn_token_to_pos, meta_dir_for_db_path, optional_lsn_token_to_pos,
+    stream_error_from_replication_error,
 };
+use crate::sync::{Lsn, ReplicaRecoveryAction, ShadowWalReader, StreamReplicationError};
 
 pub struct ReplicationServer {
     db_paths: HashMap<String, PathBuf>,
@@ -33,6 +37,10 @@ pub struct ReplicationServer {
     snapshot_semaphores: HashMap<String, Arc<Semaphore>>,
     _connections: Arc<Mutex<Vec<rusqlite::Connection>>>, // Keep connections open to pin WAL files
 }
+
+const SNAPSHOT_CHUNK_SIZE: usize = 1024 * 1024;
+const SNAPSHOT_RETRY_COUNT: usize = 5;
+const SNAPSHOT_RETRY_DELAY_MS: u64 = 200;
 
 impl ReplicationServer {
     pub fn new(config: Config) -> Self {
@@ -154,109 +162,20 @@ impl Replication for ReplicationServer {
                 }
             };
 
-            let snapshot = match snapshot_for_stream(db_config.clone()).await {
+            let snapshot = match snapshot_for_stream_with_retry(&db_identity, &db_config).await {
                 Ok(snapshot) => snapshot,
                 Err(err) => {
-                    if err.code() == crate::error::Error::STORAGE_NOT_FOUND {
-                        let mut last_err = err;
-                        let mut snapshot = None;
-                        for _ in 0..5 {
-                            sleep(Duration::from_millis(200)).await;
-                            match snapshot_for_stream(db_config.clone()).await {
-                                Ok(value) => {
-                                    snapshot = Some(value);
-                                    break;
-                                }
-                                Err(err) => {
-                                    last_err = err;
-                                    if last_err.code() != crate::error::Error::STORAGE_NOT_FOUND {
-                                        let error =
-                                            snapshot_replication_error(&db_identity, last_err);
-                                        send_snapshot_replication_error(&tx, error).await;
-                                        return;
-                                    }
-                                }
-                            }
-                        }
-                        if let Some(snapshot) = snapshot {
-                            snapshot
-                        } else {
-                            let error = snapshot_replication_error(&db_identity, last_err);
-                            send_snapshot_replication_error(&tx, error).await;
-                            return;
-                        }
-                    } else {
-                        let error = snapshot_replication_error(&db_identity, err);
-                        send_snapshot_replication_error(&tx, error).await;
-                        return;
-                    }
-                }
-            };
-
-            if let Some(pos) = requested_pos {
-                if let Err(err) = Lsn::from(pos.clone()).validate(snapshot.page_size) {
                     send_snapshot_replication_error(&tx, err).await;
                     return;
                 }
-
-                if pos.generation != snapshot.position.generation {
-                    send_snapshot_replication_error(
-                        &tx,
-                        StreamReplicationError::LineageMismatch(format!(
-                            "generation mismatch: requested {}, current {}",
-                            pos.generation.as_str(),
-                            snapshot.position.generation.as_str()
-                        )),
-                    )
-                    .await;
-                    return;
-                }
-
-                if pos.index != snapshot.position.index || pos.offset != snapshot.position.offset {
-                    send_snapshot_replication_error(
-                        &tx,
-                        StreamReplicationError::SnapshotBoundaryMismatch(format!(
-                            "snapshot boundary mismatch: requested {}:{}:{}, current {}:{}:{}",
-                            pos.generation.as_str(),
-                            pos.index,
-                            pos.offset,
-                            snapshot.position.generation.as_str(),
-                            snapshot.position.index,
-                            snapshot.position.offset,
-                        )),
-                    )
-                    .await;
-                    return;
-                }
-            }
-
-            let snapshot_size_bytes = snapshot.compressed_data.len() as u64;
-            let snapshot_sha256 = sha256_digest(&snapshot.compressed_data).to_vec();
-            let meta = SnapshotMeta {
-                db_identity: db_identity.clone(),
-                generation: snapshot.position.generation.as_str().to_string(),
-                boundary_lsn: Some(lsn_token_from_pos(&snapshot.position)),
-                page_size: snapshot.page_size as u32,
-                snapshot_size_bytes,
-                snapshot_sha256,
             };
 
-            let response = StreamSnapshotV2Response {
-                payload: Some(StreamSnapshotV2Payload::Meta(meta)),
-            };
-            if tx.send(Ok(response)).await.is_err() {
+            if let Err(err) = validate_snapshot_request(requested_pos.as_ref(), &snapshot) {
+                send_snapshot_replication_error(&tx, err).await;
                 return;
             }
 
-            let chunk_size = 1024 * 1024usize;
-            for chunk in snapshot.compressed_data.chunks(chunk_size) {
-                let response = StreamSnapshotV2Response {
-                    payload: Some(StreamSnapshotV2Payload::Chunk(chunk.to_vec())),
-                };
-                if tx.send(Ok(response)).await.is_err() {
-                    return;
-                }
-            }
+            send_snapshot_stream(&tx, &db_identity, &snapshot).await;
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
@@ -274,6 +193,7 @@ impl Replication for ReplicationServer {
                 accepted: false,
                 error: Some(stream_error_from_replication_error(
                     StreamReplicationError::InvalidLsn("replica_id is required".to_string()),
+                    0,
                 )),
             }));
         }
@@ -289,7 +209,7 @@ impl Replication for ReplicationServer {
             Err(err) => {
                 return Ok(Response::new(AckLsnV2Response {
                     accepted: false,
-                    error: Some(stream_error_from_replication_error(err)),
+                    error: Some(stream_error_from_replication_error(err, 0)),
                 }));
             }
         };
@@ -304,6 +224,7 @@ impl Replication for ReplicationServer {
                             "invalid db path for ack: {}",
                             db_path.display()
                         )),
+                        0,
                     )),
                 }));
             }
@@ -320,6 +241,7 @@ impl Replication for ReplicationServer {
                             pos.generation.as_str(),
                             current_generation.as_str()
                         )),
+                        0,
                     )),
                 }));
             }
@@ -330,6 +252,7 @@ impl Replication for ReplicationServer {
                         StreamReplicationError::LineageMismatch(format!(
                             "ack generation unavailable for replica {replica_id}",
                         )),
+                        0,
                     )),
                 }));
             }
@@ -359,6 +282,7 @@ impl Replication for ReplicationServer {
                         err.attempted.index,
                         err.attempted.offset,
                     )),
+                    0,
                 )),
             }));
         }
@@ -398,125 +322,157 @@ async fn stream_wal_v2_from_shadow(
         }
     };
 
-    if let Some(current_generation) = read_current_generation(&meta_dir) {
-        if current_generation != start_pos.generation {
-            send_replication_error(
-                &tx,
-                StreamReplicationError::LineageMismatch(format!(
-                    "generation mismatch: requested {}, current {}",
-                    start_pos.generation.as_str(),
-                    current_generation.as_str()
-                )),
-            )
-            .await;
-            return;
-        }
+    if let Err(err) = validate_start_generation(&meta_dir, &start_pos) {
+        send_replication_error(&tx, err).await;
+        return;
     }
 
     let _lease_guard =
         replica_progress::register_lease(&db_identity, &replica_id, start_pos.clone());
 
-    if let Some(retention) = replica_progress::retention_state(&db_identity) {
-        if retention.generation == start_pos.generation && start_pos.index < retention.floor_index {
-            send_replication_error(
-                &tx,
-                StreamReplicationError::WalNotRetained(format!(
-                    "requested lsn {}:{}:{} behind retention floor {} (tail {})",
-                    start_pos.generation.as_str(),
-                    start_pos.index,
-                    start_pos.offset,
-                    retention.floor_index,
-                    retention.tail_index,
-                )),
-            )
-            .await;
-            return;
-        }
-    }
-
-    let wal_dir = shadow_wal_dir(&meta_dir, start_pos.generation.as_str());
-    let wal_path = shadow_wal_file(&meta_dir, start_pos.generation.as_str(), start_pos.index);
-    let wal_metadata = match fs::metadata(&wal_path) {
-        Ok(metadata) => metadata,
-        Err(_) => {
-            send_replication_error(
-                &tx,
-                StreamReplicationError::WalNotRetained(format!(
-                    "shadow wal not retained at {wal_path} (dir {wal_dir})",
-                )),
-            )
-            .await;
-            return;
-        }
-    };
-
-    if wal_metadata.len() < WAL_HEADER_SIZE {
-        send_replication_error(
-            &tx,
-            StreamReplicationError::WalNotRetained(format!("shadow wal too short at {wal_path}",)),
-        )
-        .await;
-        return;
-    }
-
-    let wal_header = match WALHeader::read(&wal_path) {
-        Ok(header) => header,
-        Err(err) => {
-            send_replication_error(
-                &tx,
-                StreamReplicationError::WalNotRetained(format!(
-                    "failed to read shadow wal header at {wal_path}: {err}",
-                )),
-            )
-            .await;
-            return;
-        }
-    };
-
-    let page_size = wal_header.page_size;
-    if let Err(err) = Lsn::from(start_pos.clone()).validate(page_size) {
+    if let Some(err) = retention_error(&db_identity, &start_pos) {
         send_replication_error(&tx, err).await;
         return;
     }
 
-    let info = DatabaseInfo {
-        meta_dir: meta_dir.clone(),
-        page_size,
-    };
-
-    let mut reader = match ShadowWalReader::new(start_pos.clone(), &info) {
-        Ok(reader) => reader,
+    let (info, wal_path, page_size) = match build_stream_info(&meta_dir, &start_pos) {
+        Ok(value) => value,
         Err(err) => {
-            send_replication_error(
-                &tx,
-                StreamReplicationError::WalNotRetained(format!(
-                    "shadow wal unavailable at {wal_path}: {err}",
-                )),
-            )
-            .await;
+            send_replication_error(&tx, err).await;
             return;
         }
     };
 
-    let mut chunk_start_override = None;
-    if reader.left == 0 {
-        match try_open_next_reader(&start_pos, &info) {
-            Ok(Some(next_reader)) => {
-                chunk_start_override = Some(next_reader.position());
-                reader = next_reader;
-            }
-            Ok(None) => return,
-            Err(err) => {
-                send_replication_error(
-                    &tx,
-                    StreamReplicationError::WalNotRetained(format!(
-                        "shadow wal unavailable after {wal_path}: {err}",
-                    )),
-                )
-                .await;
-                return;
-            }
+    let (reader, chunk_start_override) = match open_stream_reader(&start_pos, &info, &wal_path) {
+        Ok(value) => value,
+        Err(err) => {
+            send_replication_error(&tx, err).await;
+            return;
         }
+    };
+
+    if let Err(err) = stream_reader_chunks(
+        &tx,
+        &info,
+        &wal_path,
+        page_size,
+        reader,
+        chunk_start_override,
+    )
+    .await
+    {
+        send_replication_error(&tx, err).await;
+    }
+}
+
+fn validate_start_generation(
+    meta_dir: &str,
+    start_pos: &WalGenerationPos,
+) -> Result<(), StreamReplicationError> {
+    if let Some(current_generation) = read_current_generation(meta_dir)
+        && current_generation != start_pos.generation
+    {
+        return Err(StreamReplicationError::LineageMismatch(format!(
+            "generation mismatch: requested {}, current {}",
+            start_pos.generation.as_str(),
+            current_generation.as_str()
+        )));
+    }
+    Ok(())
+}
+
+fn retention_error(
+    db_identity: &str,
+    start_pos: &WalGenerationPos,
+) -> Option<StreamReplicationError> {
+    let retention = replica_progress::retention_state(db_identity)?;
+    if retention.generation != start_pos.generation || start_pos.index >= retention.floor_index {
+        return None;
+    }
+    Some(StreamReplicationError::WalNotRetained(format!(
+        "requested lsn {}:{}:{} behind retention floor {} (tail {})",
+        start_pos.generation.as_str(),
+        start_pos.index,
+        start_pos.offset,
+        retention.floor_index,
+        retention.tail_index,
+    )))
+}
+
+fn build_stream_info(
+    meta_dir: &str,
+    start_pos: &WalGenerationPos,
+) -> Result<(DatabaseInfo, String, u64), StreamReplicationError> {
+    let wal_dir = shadow_wal_dir(meta_dir, start_pos.generation.as_str());
+    let wal_path = shadow_wal_file(meta_dir, start_pos.generation.as_str(), start_pos.index);
+    let wal_metadata = fs::metadata(&wal_path).map_err(|_| {
+        StreamReplicationError::WalNotRetained(format!(
+            "shadow wal not retained at {wal_path} (dir {wal_dir})",
+        ))
+    })?;
+
+    if wal_metadata.len() < WAL_HEADER_SIZE {
+        return Err(StreamReplicationError::WalNotRetained(format!(
+            "shadow wal too short at {wal_path}",
+        )));
+    }
+
+    let wal_header = WALHeader::read(&wal_path).map_err(|err| {
+        StreamReplicationError::WalNotRetained(format!(
+            "failed to read shadow wal header at {wal_path}: {err}",
+        ))
+    })?;
+
+    let page_size = wal_header.page_size;
+    Lsn::from(start_pos.clone()).validate(page_size)?;
+
+    Ok((
+        DatabaseInfo {
+            meta_dir: meta_dir.to_string(),
+            page_size,
+        },
+        wal_path,
+        page_size,
+    ))
+}
+
+fn open_stream_reader(
+    start_pos: &WalGenerationPos,
+    info: &DatabaseInfo,
+    wal_path: &str,
+) -> Result<(ShadowWalReader, Option<WalGenerationPos>), StreamReplicationError> {
+    let reader = ShadowWalReader::new(start_pos.clone(), info).map_err(|err| {
+        StreamReplicationError::WalNotRetained(format!(
+            "shadow wal unavailable at {wal_path}: {err}",
+        ))
+    })?;
+
+    if reader.left == 0 {
+        return match try_open_next_reader(start_pos, info) {
+            Ok(Some(next_reader)) => {
+                let next_start = next_reader.position();
+                Ok((next_reader, Some(next_start)))
+            }
+            Ok(None) => Ok((reader, None)),
+            Err(err) => Err(StreamReplicationError::WalNotRetained(format!(
+                "shadow wal unavailable after {wal_path}: {err}",
+            ))),
+        };
+    }
+
+    Ok((reader, None))
+}
+
+async fn stream_reader_chunks(
+    tx: &mpsc::Sender<Result<StreamWalV2Response, Status>>,
+    info: &DatabaseInfo,
+    wal_path: &str,
+    page_size: u64,
+    mut reader: ShadowWalReader,
+    mut chunk_start_override: Option<WalGenerationPos>,
+) -> Result<(), StreamReplicationError> {
+    if reader.left == 0 && chunk_start_override.is_none() {
+        return Ok(());
     }
 
     let frame_size = (WAL_FRAME_HEADER_SIZE + page_size) as usize;
@@ -530,38 +486,24 @@ async fn stream_wal_v2_from_shadow(
 
         let mut chunk = Vec::with_capacity(max_chunk_bytes);
         if reader.position().offset == 0 {
-            match WALHeader::read_from(&mut reader) {
-                Ok(header) => chunk.extend_from_slice(&header.data),
-                Err(err) => {
-                    send_replication_error(
-                        &tx,
-                        StreamReplicationError::WalNotRetained(format!(
-                            "failed to read wal header at {wal_path}: {err}",
-                        )),
-                    )
-                    .await;
-                    return;
-                }
-            }
+            let header = WALHeader::read_from(&mut reader).map_err(|err| {
+                StreamReplicationError::WalNotRetained(format!(
+                    "failed to read wal header at {wal_path}: {err}",
+                ))
+            })?;
+            chunk.extend_from_slice(&header.data);
         }
 
         while reader.left > 0 {
             if !chunk.is_empty() && chunk.len() + frame_size > max_chunk_bytes {
                 break;
             }
-            match WALFrame::read(&mut reader, page_size) {
-                Ok(frame) => chunk.extend_from_slice(&frame.data),
-                Err(err) => {
-                    send_replication_error(
-                        &tx,
-                        StreamReplicationError::WalNotRetained(format!(
-                            "failed to read wal frame at {wal_path}: {err}",
-                        )),
-                    )
-                    .await;
-                    return;
-                }
-            }
+            let frame = WALFrame::read(&mut reader, page_size).map_err(|err| {
+                StreamReplicationError::WalNotRetained(format!(
+                    "failed to read wal frame at {wal_path}: {err}",
+                ))
+            })?;
+            chunk.extend_from_slice(&frame.data);
         }
 
         if chunk.is_empty() {
@@ -577,87 +519,23 @@ async fn stream_wal_v2_from_shadow(
             })),
         };
         if tx.send(Ok(response)).await.is_err() {
-            return;
+            return Ok(());
         }
 
         if reader.left == 0 {
-            match try_open_next_reader(&next_pos, &info) {
+            match try_open_next_reader(&next_pos, info) {
                 Ok(Some(next_reader)) => reader = next_reader,
                 Ok(None) => break,
                 Err(err) => {
-                    send_replication_error(
-                        &tx,
-                        StreamReplicationError::WalNotRetained(format!(
-                            "failed to open next shadow wal after {wal_path}: {err}",
-                        )),
-                    )
-                    .await;
-                    return;
+                    return Err(StreamReplicationError::WalNotRetained(format!(
+                        "failed to open next shadow wal after {wal_path}: {err}",
+                    )));
                 }
             }
         }
     }
-}
 
-fn lsn_token_to_pos(token: Option<LsnToken>) -> Result<WalGenerationPos, StreamReplicationError> {
-    let token = token
-        .ok_or_else(|| StreamReplicationError::InvalidLsn("start_lsn is required".to_string()))?;
-    let generation_value = token.generation.trim();
-    if generation_value.is_empty() {
-        return Err(StreamReplicationError::InvalidLsn(
-            "start_lsn.generation is required".to_string(),
-        ));
-    }
-    let generation = Generation::try_create(generation_value).map_err(|err| {
-        StreamReplicationError::InvalidLsn(format!(
-            "invalid generation {}: {err}",
-            token.generation
-        ))
-    })?;
-
-    Ok(WalGenerationPos {
-        generation,
-        index: token.index,
-        offset: token.offset,
-    })
-}
-
-fn optional_lsn_token_to_pos(
-    token: Option<LsnToken>,
-) -> Result<Option<WalGenerationPos>, StreamReplicationError> {
-    let token = match token {
-        Some(token) => token,
-        None => return Ok(None),
-    };
-
-    if token.generation.trim().is_empty() {
-        if token.index == 0 && token.offset == 0 {
-            return Ok(None);
-        }
-        return Err(StreamReplicationError::InvalidLsn(
-            "start_lsn.generation is required".to_string(),
-        ));
-    }
-
-    lsn_token_to_pos(Some(token)).map(Some)
-}
-
-fn lsn_token_from_pos(pos: &WalGenerationPos) -> LsnToken {
-    LsnToken {
-        generation: pos.generation.as_str().to_string(),
-        index: pos.index,
-        offset: pos.offset,
-    }
-}
-
-fn meta_dir_for_db_path(db_path: &Path) -> Option<String> {
-    let db_name = db_path.file_name()?.to_str()?;
-    let dir_path = match db_path.parent() {
-        Some(parent) if parent == Path::new("") => Path::new("."),
-        Some(parent) => parent,
-        None => Path::new("."),
-    };
-    Some(format!("{}/.{}-replited/", dir_path.to_str()?, db_name))
+    Ok(())
 }
 
 fn read_current_generation(meta_dir: &str) -> Option<Generation> {
@@ -703,23 +581,118 @@ fn try_open_next_reader(
     }
 }
 
-fn stream_error_from_replication_error(error: StreamReplicationError) -> StreamError {
-    let code = stream_error_code_from_replication_code(error.code());
-    StreamError {
-        code: code as i32,
-        message: error.to_string(),
-        retry_after_ms: 0,
+async fn snapshot_for_stream_with_retry(
+    db_identity: &str,
+    db_config: &DbConfig,
+) -> Result<SnapshotStreamData, StreamReplicationError> {
+    snapshot_with_retry(
+        db_identity,
+        SNAPSHOT_RETRY_COUNT,
+        Duration::from_millis(SNAPSHOT_RETRY_DELAY_MS),
+        || snapshot_for_stream(db_config.clone()),
+    )
+    .await
+}
+
+async fn snapshot_with_retry<F, Fut>(
+    db_identity: &str,
+    retry_count: usize,
+    retry_delay: Duration,
+    mut fetch_snapshot: F,
+) -> Result<SnapshotStreamData, StreamReplicationError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = crate::error::Result<SnapshotStreamData>>,
+{
+    match fetch_snapshot().await {
+        Ok(snapshot) => Ok(snapshot),
+        Err(err) => {
+            if err.code() != crate::error::Error::STORAGE_NOT_FOUND {
+                return Err(snapshot_replication_error(db_identity, err));
+            }
+
+            let mut last_err = err;
+            for _ in 0..retry_count {
+                sleep(retry_delay).await;
+                match fetch_snapshot().await {
+                    Ok(snapshot) => return Ok(snapshot),
+                    Err(err) => {
+                        if err.code() != crate::error::Error::STORAGE_NOT_FOUND {
+                            return Err(snapshot_replication_error(db_identity, err));
+                        }
+                        last_err = err;
+                    }
+                }
+            }
+
+            Err(snapshot_replication_error(db_identity, last_err))
+        }
     }
 }
 
-fn stream_error_code_from_replication_code(code: StreamReplicationErrorCode) -> StreamErrorCode {
-    match code {
-        StreamReplicationErrorCode::LineageMismatch => StreamErrorCode::LineageMismatch,
-        StreamReplicationErrorCode::WalNotRetained => StreamErrorCode::WalNotRetained,
-        StreamReplicationErrorCode::SnapshotBoundaryMismatch => {
-            StreamErrorCode::SnapshotBoundaryMismatch
+fn validate_snapshot_request(
+    requested_pos: Option<&WalGenerationPos>,
+    snapshot: &SnapshotStreamData,
+) -> Result<(), StreamReplicationError> {
+    let Some(pos) = requested_pos else {
+        return Ok(());
+    };
+
+    Lsn::from(pos.clone()).validate(snapshot.page_size)?;
+
+    if pos.generation != snapshot.position.generation {
+        return Err(StreamReplicationError::LineageMismatch(format!(
+            "generation mismatch: requested {}, current {}",
+            pos.generation.as_str(),
+            snapshot.position.generation.as_str()
+        )));
+    }
+
+    if pos.index != snapshot.position.index || pos.offset != snapshot.position.offset {
+        return Err(StreamReplicationError::SnapshotBoundaryMismatch(format!(
+            "snapshot boundary mismatch: requested {}:{}:{}, current {}:{}:{}",
+            pos.generation.as_str(),
+            pos.index,
+            pos.offset,
+            snapshot.position.generation.as_str(),
+            snapshot.position.index,
+            snapshot.position.offset,
+        )));
+    }
+
+    Ok(())
+}
+
+async fn send_snapshot_stream(
+    tx: &mpsc::Sender<Result<StreamSnapshotV2Response, Status>>,
+    db_identity: &str,
+    snapshot: &SnapshotStreamData,
+) {
+    let snapshot_size_bytes = snapshot.compressed_data.len() as u64;
+    let snapshot_sha256 = Sha256::digest(&snapshot.compressed_data).to_vec();
+    let meta = SnapshotMeta {
+        db_identity: db_identity.to_string(),
+        generation: snapshot.position.generation.as_str().to_string(),
+        boundary_lsn: Some(lsn_token_from_pos(&snapshot.position)),
+        page_size: snapshot.page_size as u32,
+        snapshot_size_bytes,
+        snapshot_sha256,
+    };
+
+    let response = StreamSnapshotV2Response {
+        payload: Some(StreamSnapshotV2Payload::Meta(meta)),
+    };
+    if tx.send(Ok(response)).await.is_err() {
+        return;
+    }
+
+    for chunk in snapshot.compressed_data.chunks(SNAPSHOT_CHUNK_SIZE) {
+        let response = StreamSnapshotV2Response {
+            payload: Some(StreamSnapshotV2Payload::Chunk(chunk.to_vec())),
+        };
+        if tx.send(Ok(response)).await.is_err() {
+            return;
         }
-        StreamReplicationErrorCode::InvalidLsn => StreamErrorCode::InvalidLsn,
     }
 }
 
@@ -734,7 +707,7 @@ async fn send_replication_error(
     }
     let response = StreamWalV2Response {
         payload: Some(StreamWalV2Payload::Error(
-            stream_error_from_replication_error(error),
+            stream_error_from_replication_error(error, 0),
         )),
     };
     let _ = tx.send(Ok(response)).await;
@@ -796,7 +769,7 @@ async fn send_snapshot_replication_error(
     }
     let response = StreamSnapshotV2Response {
         payload: Some(StreamSnapshotV2Payload::Error(
-            stream_error_from_replication_error(error),
+            stream_error_from_replication_error(error, 0),
         )),
     };
     let _ = tx.send(Ok(response)).await;
@@ -818,113 +791,159 @@ async fn send_snapshot_stream_error(
     let _ = tx.send(Ok(response)).await;
 }
 
-const SHA256_K: [u32; 64] = [
-    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
-];
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
-fn sha256_digest(data: &[u8]) -> [u8; 32] {
-    let mut state: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-        0x5be0cd19,
-    ];
+    use tempfile::tempdir;
 
-    let mut offset = 0usize;
-    while offset + 64 <= data.len() {
-        let mut block = [0u8; 64];
-        block.copy_from_slice(&data[offset..offset + 64]);
-        sha256_compress(&mut state, &block);
-        offset += 64;
+    use super::{
+        retention_error, snapshot_with_retry, validate_snapshot_request, validate_start_generation,
+    };
+    use crate::base::{Generation, generation_file_path};
+    use crate::database::{SnapshotStreamData, WalGenerationPos};
+    use crate::error::Error;
+    use crate::sync::StreamReplicationError;
+    use crate::sync::replica_progress;
+
+    fn snapshot_stub() -> SnapshotStreamData {
+        SnapshotStreamData {
+            compressed_data: vec![],
+            position: WalGenerationPos {
+                generation: Generation::new(),
+                index: 0,
+                offset: 0,
+            },
+            page_size: 4096,
+        }
     }
 
-    let bit_len = (data.len() as u64) * 8;
-    let mut block = [0u8; 64];
-    let remaining = &data[offset..];
-    block[..remaining.len()].copy_from_slice(remaining);
-    block[remaining.len()] = 0x80;
+    #[test]
+    fn validate_start_generation_detects_mismatch() {
+        let dir = tempdir().unwrap();
+        let meta_dir = dir.path().join(".data.db-replited");
+        fs::create_dir_all(&meta_dir).unwrap();
 
-    if remaining.len() >= 56 {
-        sha256_compress(&mut state, &block);
-        block = [0u8; 64];
+        let current_generation = Generation::new();
+        let generation_file = generation_file_path(meta_dir.to_str().unwrap());
+        fs::write(&generation_file, current_generation.as_str()).unwrap();
+
+        let requested = WalGenerationPos {
+            generation: Generation::new(),
+            index: 0,
+            offset: 0,
+        };
+
+        let err = validate_start_generation(meta_dir.to_str().unwrap(), &requested).unwrap_err();
+        assert!(matches!(err, StreamReplicationError::LineageMismatch(_)));
     }
 
-    block[56..].copy_from_slice(&bit_len.to_be_bytes());
-    sha256_compress(&mut state, &block);
+    #[test]
+    fn retention_error_when_position_is_behind_floor() {
+        let db_identity = format!("test-db-{}", Generation::new().as_str());
+        let generation = Generation::new();
+        replica_progress::update_retention(&db_identity, &generation, 5, 9);
 
-    let mut out = [0u8; 32];
-    for (i, word) in state.iter().enumerate() {
-        out[i * 4..(i + 1) * 4].copy_from_slice(&word.to_be_bytes());
-    }
-    out
-}
+        let pos = WalGenerationPos {
+            generation,
+            index: 4,
+            offset: 0,
+        };
 
-fn sha256_compress(state: &mut [u32; 8], block: &[u8; 64]) {
-    let mut w = [0u32; 64];
-    for i in 0..16 {
-        let start = i * 4;
-        w[i] = u32::from_be_bytes([
-            block[start],
-            block[start + 1],
-            block[start + 2],
-            block[start + 3],
-        ]);
-    }
-    for i in 16..64 {
-        let s0 = sha256_rotr(w[i - 15], 7) ^ sha256_rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
-        let s1 = sha256_rotr(w[i - 2], 17) ^ sha256_rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
-        w[i] = w[i - 16]
-            .wrapping_add(s0)
-            .wrapping_add(w[i - 7])
-            .wrapping_add(s1);
+        let err = retention_error(&db_identity, &pos).unwrap();
+        assert!(matches!(err, StreamReplicationError::WalNotRetained(_)));
     }
 
-    let mut a = state[0];
-    let mut b = state[1];
-    let mut c = state[2];
-    let mut d = state[3];
-    let mut e = state[4];
-    let mut f = state[5];
-    let mut g = state[6];
-    let mut h = state[7];
+    #[test]
+    fn validate_snapshot_request_accepts_matching_lsn() {
+        let generation = Generation::new();
+        let pos = WalGenerationPos {
+            generation: generation.clone(),
+            index: 2,
+            offset: 32,
+        };
+        let snapshot = SnapshotStreamData {
+            compressed_data: vec![],
+            position: pos.clone(),
+            page_size: 4096,
+        };
 
-    for i in 0..64 {
-        let s1 = sha256_rotr(e, 6) ^ sha256_rotr(e, 11) ^ sha256_rotr(e, 25);
-        let ch = (e & f) ^ ((!e) & g);
-        let temp1 = h
-            .wrapping_add(s1)
-            .wrapping_add(ch)
-            .wrapping_add(SHA256_K[i])
-            .wrapping_add(w[i]);
-        let s0 = sha256_rotr(a, 2) ^ sha256_rotr(a, 13) ^ sha256_rotr(a, 22);
-        let maj = (a & b) ^ (a & c) ^ (b & c);
-        let temp2 = s0.wrapping_add(maj);
-
-        h = g;
-        g = f;
-        f = e;
-        e = d.wrapping_add(temp1);
-        d = c;
-        c = b;
-        b = a;
-        a = temp1.wrapping_add(temp2);
+        assert!(validate_snapshot_request(Some(&pos), &snapshot).is_ok());
     }
 
-    state[0] = state[0].wrapping_add(a);
-    state[1] = state[1].wrapping_add(b);
-    state[2] = state[2].wrapping_add(c);
-    state[3] = state[3].wrapping_add(d);
-    state[4] = state[4].wrapping_add(e);
-    state[5] = state[5].wrapping_add(f);
-    state[6] = state[6].wrapping_add(g);
-    state[7] = state[7].wrapping_add(h);
-}
+    #[test]
+    fn validate_snapshot_request_rejects_boundary_mismatch() {
+        let generation = Generation::new();
+        let requested = WalGenerationPos {
+            generation: generation.clone(),
+            index: 2,
+            offset: 32,
+        };
+        let snapshot = SnapshotStreamData {
+            compressed_data: vec![],
+            position: WalGenerationPos {
+                generation,
+                index: 3,
+                offset: 32,
+            },
+            page_size: 4096,
+        };
 
-fn sha256_rotr(value: u32, bits: u32) -> u32 {
-    value.rotate_right(bits)
+        let err = validate_snapshot_request(Some(&requested), &snapshot).unwrap_err();
+        assert!(matches!(
+            err,
+            StreamReplicationError::SnapshotBoundaryMismatch(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn snapshot_with_retry_succeeds_after_retryable_errors() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_closure = attempts.clone();
+
+        let result = snapshot_with_retry("db", 2, Duration::from_millis(0), move || {
+            let attempts = attempts_for_closure.clone();
+            async move {
+                let current = attempts.fetch_add(1, Ordering::SeqCst);
+                if current < 2 {
+                    Err(Error::StorageNotFound("not found".to_string()))
+                } else {
+                    Ok(snapshot_stub())
+                }
+            }
+        })
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn snapshot_with_retry_stops_on_non_retryable_error() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_closure = attempts.clone();
+
+        let result = snapshot_with_retry("db", 5, Duration::from_millis(0), move || {
+            let attempts = attempts_for_closure.clone();
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                Err(Error::SqliteError("fatal".to_string()))
+            }
+        })
+        .await;
+
+        let err = match result {
+            Ok(_) => panic!("expected non-retryable snapshot fetch to fail"),
+            Err(err) => err,
+        };
+
+        assert!(matches!(
+            err,
+            StreamReplicationError::SnapshotBoundaryMismatch(_)
+        ));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
 }

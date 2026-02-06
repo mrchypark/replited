@@ -1,9 +1,12 @@
 use std::collections::BTreeMap;
+use std::time::SystemTime;
 
 use chrono::DateTime;
 use chrono::Utc;
 use log::debug;
 use log::error;
+use log::warn;
+use opendal::Metadata;
 use opendal::Metakey;
 use opendal::Operator;
 
@@ -58,6 +61,18 @@ pub struct RestoreInfo {
     pub wal_segments: RestoreWalSegments,
 }
 
+fn metadata_last_modified_or_epoch(metadata: &Metadata, entry_name: &str) -> DateTime<Utc> {
+    match metadata.last_modified() {
+        Some(ts) => ts,
+        None => {
+            warn!(
+                "storage metadata missing last_modified for entry {entry_name}, using UNIX_EPOCH",
+            );
+            DateTime::<Utc>::from(SystemTime::UNIX_EPOCH)
+        }
+    }
+}
+
 impl StorageClient {
     pub fn try_create(db_path: String, config: StorageConfig) -> Result<Self> {
         Ok(Self {
@@ -68,7 +83,12 @@ impl StorageClient {
     }
 
     async fn ensure_parent_exist(&self, path: &str) -> Result<()> {
-        let base = format!("{}/", parent_dir(path).unwrap());
+        let parent = parent_dir(path).unwrap_or_else(|| ".".to_string());
+        let base = if parent.is_empty() || parent == "." {
+            "./".to_string()
+        } else {
+            format!("{parent}/")
+        };
 
         let mut exist = false;
         match self.operator.is_exist(&base).await {
@@ -189,7 +209,7 @@ impl StorageClient {
                 index,
                 offset,
                 size: metadata.content_length(),
-                created_at: metadata.last_modified().unwrap(),
+                created_at: metadata_last_modified_or_epoch(metadata, entry.name()),
             })
         }
 
@@ -238,7 +258,7 @@ impl StorageClient {
                 index,
                 offset,
                 size: metadata.content_length(),
-                created_at: metadata.last_modified().unwrap(),
+                created_at: metadata_last_modified_or_epoch(metadata, entry.name()),
             });
         }
 
@@ -267,7 +287,7 @@ impl StorageClient {
                 index,
                 offset,
                 size: entry.metadata().content_length(),
-                created_at: entry.metadata().last_modified().unwrap_or_default(),
+                created_at: metadata_last_modified_or_epoch(entry.metadata(), entry.name()),
             })
         }
 
@@ -297,14 +317,7 @@ impl StorageClient {
         }
 
         // sort wal segments first by index, then offset
-        wal_segments.sort_by(|a, b| {
-            let ordering = a.index.partial_cmp(&b.index).unwrap();
-            if ordering.is_eq() {
-                a.offset.partial_cmp(&b.offset).unwrap()
-            } else {
-                ordering
-            }
-        });
+        wal_segments.sort_by(|a, b| a.index.cmp(&b.index).then(a.offset.cmp(&b.offset)));
 
         let mut restore_wal_segments: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
 
@@ -315,7 +328,9 @@ impl StorageClient {
 
             match restore_wal_segments.get_mut(&wal_segment.index) {
                 Some(offsets) => {
-                    if *offsets.last().unwrap() >= wal_segment.offset {
+                    if let Some(last_offset) = offsets.last()
+                        && *last_offset >= wal_segment.offset
+                    {
                         let msg = format!(
                             "wal segment out of order, generation: {:?}, index: {}, offset: {}",
                             snapshot.generation.as_str(),
@@ -372,7 +387,7 @@ impl StorageClient {
         }
 
         // sort the entries in reverse order
-        entry_with_generation.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        entry_with_generation.sort_by(|a, b| b.1.as_str().cmp(a.1.as_str()));
 
         for (_entry, generation) in entry_with_generation {
             let snapshot = match self.max_snapshot(generation.as_str()).await? {

@@ -2,7 +2,7 @@ use std::io::Cursor;
 use std::io::{Seek, SeekFrom, Write};
 
 use crate::error::Result;
-use crate::sqlite::{WAL_HEADER_SIZE, WALHeader};
+use crate::sqlite::{WAL_HEADER_SIZE, WALHeader, from_be_bytes_at};
 
 impl super::WalWriter {
     /// Initialize WAL with a header based on incoming Primary header.
@@ -63,8 +63,8 @@ impl super::WalWriter {
 
         // Initialize last_checksum from Header
         // CRITICAL: Checksums are ALWAYS stored in BIG-ENDIAN per SQLite spec
-        let h_c1 = u32::from_be_bytes(header_bytes[24..28].try_into().unwrap());
-        let h_c2 = u32::from_be_bytes(header_bytes[28..32].try_into().unwrap());
+        let h_c1 = from_be_bytes_at(&header_bytes, 24)?;
+        let h_c2 = from_be_bytes_at(&header_bytes, 28)?;
         self.last_checksum = (h_c1, h_c2);
 
         log::info!(

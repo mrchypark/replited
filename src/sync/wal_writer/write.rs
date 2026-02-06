@@ -2,7 +2,7 @@ use std::io::{Seek, SeekFrom, Write};
 use std::time::Instant;
 
 use crate::error::Result;
-use crate::sqlite::{WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE};
+use crate::sqlite::{WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE, from_be_bytes_at};
 
 impl super::WalWriter {
     pub fn write_frame(&mut self, data: Vec<u8>) -> Result<()> {
@@ -50,8 +50,8 @@ impl super::WalWriter {
 
                 // IMPORTANT: Reset last_checksum to Header Checksum.
                 // CRITICAL: Checksums are ALWAYS stored in BIG-ENDIAN per SQLite spec
-                let h_c1 = u32::from_be_bytes(header[24..28].try_into().unwrap());
-                let h_c2 = u32::from_be_bytes(header[28..32].try_into().unwrap());
+                let h_c1 = from_be_bytes_at(&header, 24)?;
+                let h_c2 = from_be_bytes_at(&header, 28)?;
                 self.last_checksum = (h_c1, h_c2);
                 log::debug!("WalWriter: Reset last_checksum to Header Checksum: ({h_c1}, {h_c2})");
 
@@ -71,8 +71,8 @@ impl super::WalWriter {
         let frame_data = data;
 
         // Extract checksum from Primary frame for logging
-        let c1 = u32::from_be_bytes(frame_data[16..20].try_into().unwrap_or([0; 4]));
-        let c2 = u32::from_be_bytes(frame_data[20..24].try_into().unwrap_or([0; 4]));
+        let c1 = from_be_bytes_at(&frame_data, 16)?;
+        let c2 = from_be_bytes_at(&frame_data, 20)?;
 
         log::debug!(
             "WalWriter: Writing VERBATIM Frame #{} (len={}) Primary Checksum=({:#x}, {:#x})",
@@ -102,8 +102,8 @@ impl super::WalWriter {
         self.frames_since_checkpoint += 1;
 
         // Track schema changes (page 1) and commits (db_size > 0).
-        let page_num = u32::from_be_bytes(frame_data[0..4].try_into().unwrap_or([0; 4]));
-        let db_size = u32::from_be_bytes(frame_data[4..8].try_into().unwrap_or([0; 4]));
+        let page_num = from_be_bytes_at(&frame_data, 0)?;
+        let db_size = from_be_bytes_at(&frame_data, 4)?;
         let is_commit_frame = db_size > 0;
 
         if page_num == 1 {

@@ -71,13 +71,19 @@ impl Database {
     // init replited directory
     pub(super) fn init_directory(config: &DbConfig) -> Result<String> {
         let file_path = PathBuf::from(&config.db);
-        let db_name = file_path.file_name().unwrap().to_str().unwrap();
+        let db_name = file_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                Error::InvalidPath(format!("db path {} has invalid file name", config.db))
+            })?;
         let dir_path = match file_path.parent() {
             Some(p) if p == Path::new("") => Path::new("."),
             Some(p) => p,
             None => Path::new("."),
         };
-        let meta_dir = format!("{}/.{}-replited/", dir_path.to_str().unwrap(), db_name,);
+        let meta_dir_path = dir_path.join(format!(".{db_name}-replited"));
+        let meta_dir = format!("{}/", meta_dir_path.display());
 
         let abs_meta_dir = if Path::new(&meta_dir).is_absolute() {
             PathBuf::from(&meta_dir)
@@ -124,9 +130,10 @@ impl Database {
         };
         let db = Path::new(&config.db)
             .file_name()
-            .unwrap()
-            .to_str()
-            .unwrap()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                Error::InvalidPath(format!("db path {} has invalid file name", config.db))
+            })?
             .to_string();
         for (index, replicate) in config.replicate.iter().enumerate() {
             if let crate::config::StorageParams::Stream(_) = replicate.params {

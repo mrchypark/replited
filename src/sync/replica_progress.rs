@@ -75,19 +75,17 @@ pub fn update_ack(
 ) -> Result<(), AckUpdateError> {
     let mut state = REPLICA_PROGRESS.write();
     let db_entry = state.by_db.entry(db_identity.to_string()).or_default();
-    let progress = db_entry
-        .entry(replica_id.to_string())
-        .or_insert_with(ReplicaProgress::default);
+    let progress = db_entry.entry(replica_id.to_string()).or_default();
 
-    if !progress.last_acked.is_empty() && progress.last_acked.generation == pos.generation {
-        if pos.index < progress.last_acked.index
-            || (pos.index == progress.last_acked.index && pos.offset < progress.last_acked.offset)
-        {
-            return Err(AckUpdateError {
-                previous: progress.last_acked.clone(),
-                attempted: pos,
-            });
-        }
+    if !progress.last_acked.is_empty()
+        && progress.last_acked.generation == pos.generation
+        && (pos.index < progress.last_acked.index
+            || (pos.index == progress.last_acked.index && pos.offset < progress.last_acked.offset))
+    {
+        return Err(AckUpdateError {
+            previous: progress.last_acked.clone(),
+            attempted: pos,
+        });
     }
 
     progress.last_acked = pos;
@@ -115,9 +113,7 @@ pub fn register_lease(
 fn update_lease(db_identity: &str, replica_id: &str, pos: WalGenerationPos) {
     let mut state = REPLICA_PROGRESS.write();
     let db_entry = state.by_db.entry(db_identity.to_string()).or_default();
-    let progress = db_entry
-        .entry(replica_id.to_string())
-        .or_insert_with(ReplicaProgress::default);
+    let progress = db_entry.entry(replica_id.to_string()).or_default();
 
     progress.lease_lsn = Some(pos);
     progress.lease_seen = Some(Instant::now());
@@ -148,16 +144,16 @@ pub fn active_snapshot(
     for (replica_id, progress) in db_entry.iter() {
         let acked_active = progress
             .last_ack_seen
-            .map_or(false, |seen| now.duration_since(seen) <= ttl)
+            .is_some_and(|seen| now.duration_since(seen) <= ttl)
             && !progress.last_acked.is_empty()
             && progress.last_acked.generation == *generation;
         let lease_active = progress
             .lease_seen
-            .map_or(false, |seen| now.duration_since(seen) <= ttl)
+            .is_some_and(|seen| now.duration_since(seen) <= ttl)
             && progress
                 .lease_lsn
                 .as_ref()
-                .map_or(false, |lsn| lsn.generation == *generation);
+                .is_some_and(|lsn| lsn.generation == *generation);
 
         if !(acked_active || lease_active) {
             continue;
@@ -221,4 +217,56 @@ pub fn update_retention(
 pub fn retention_state(db_identity: &str) -> Option<RetentionState> {
     let state = REPLICA_PROGRESS.read();
     state.retention.get(db_identity).cloned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_pos(generation: Generation, index: u64, offset: u64) -> WalGenerationPos {
+        WalGenerationPos {
+            generation,
+            index,
+            offset,
+        }
+    }
+
+    fn reset_state() {
+        let mut state = REPLICA_PROGRESS.write();
+        *state = ReplicaProgressState::default();
+    }
+
+    #[test]
+    fn update_ack_rejects_regression() {
+        reset_state();
+        let generation = Generation::new();
+        let db_identity = "db-ack-regression";
+        let replica_id = "replica-1";
+        let session_id = "session-1";
+
+        let first = make_pos(generation.clone(), 10, 200);
+        update_ack(db_identity, replica_id, session_id, first.clone()).unwrap();
+
+        let regressed = make_pos(generation, 10, 100);
+        let err = update_ack(db_identity, replica_id, session_id, regressed.clone()).unwrap_err();
+        assert_eq!(err.previous.index, first.index);
+        assert_eq!(err.previous.offset, first.offset);
+        assert_eq!(err.attempted.index, regressed.index);
+        assert_eq!(err.attempted.offset, regressed.offset);
+    }
+
+    #[test]
+    fn update_ack_accepts_generation_change() {
+        reset_state();
+        let db_identity = "db-generation-switch";
+        let replica_id = "replica-1";
+        let session_id = "session-1";
+
+        let first = make_pos(Generation::new(), 100, 0);
+        update_ack(db_identity, replica_id, session_id, first).unwrap();
+
+        // New generation can reset index/offset without being treated as regression.
+        let second = make_pos(Generation::new(), 0, 0);
+        assert!(update_ack(db_identity, replica_id, session_id, second).is_ok());
+    }
 }

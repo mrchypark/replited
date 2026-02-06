@@ -50,13 +50,13 @@ pub fn checksum(data: &[u8], s1: u32, s2: u32, is_big_endian: bool) -> (u32, u32
         let bytes2 = &data[i + 4..i + 8];
         let (n1, n2) = if is_big_endian {
             (
-                u32::from_be_bytes(bytes1.try_into().unwrap()),
-                u32::from_be_bytes(bytes2.try_into().unwrap()),
+                u32::from_be_bytes([bytes1[0], bytes1[1], bytes1[2], bytes1[3]]),
+                u32::from_be_bytes([bytes2[0], bytes2[1], bytes2[2], bytes2[3]]),
             )
         } else {
             (
-                u32::from_le_bytes(bytes1.try_into().unwrap()),
-                u32::from_le_bytes(bytes2.try_into().unwrap()),
+                u32::from_le_bytes([bytes1[0], bytes1[1], bytes1[2], bytes1[3]]),
+                u32::from_le_bytes([bytes2[0], bytes2[1], bytes2[2], bytes2[3]]),
             )
         };
 
@@ -111,8 +111,14 @@ pub fn align_frame(page_size: u64, offset: u64) -> u64 {
 }
 
 pub(crate) fn from_be_bytes_at(data: &[u8], offset: usize) -> Result<u32> {
-    let p = &data[offset..offset + 4];
-    Ok(u32::from_be_bytes(p.try_into()?))
+    let end = offset.saturating_add(4);
+    let p = data.get(offset..end).ok_or_else(|| {
+        Error::UnexpectedEofError(format!(
+            "cannot read 4 bytes at offset {offset}, buffer size {}",
+            data.len()
+        ))
+    })?;
+    Ok(u32::from_be_bytes([p[0], p[1], p[2], p[3]]))
 }
 
 #[cfg(test)]
@@ -322,5 +328,12 @@ mod tests {
         let data = [0x00, 0x00, 0x00, 0x00];
         let result = from_be_bytes_at(&data, 0).unwrap();
         assert_eq!(0, result);
+    }
+
+    #[test]
+    fn test_from_be_bytes_at_out_of_bounds_returns_error() {
+        let data = [0x00, 0x01, 0x02];
+        let err = from_be_bytes_at(&data, 0).unwrap_err();
+        assert_eq!(Error::UNEXPECTED_EOF_ERROR, err.code());
     }
 }

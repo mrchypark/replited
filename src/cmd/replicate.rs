@@ -1,6 +1,7 @@
 use super::command::Command;
 use crate::config::Config;
 use crate::database::run_database;
+use crate::error::Error;
 use crate::error::Result;
 use crate::log::init_log;
 
@@ -26,10 +27,8 @@ impl Command for Replicate {
         let mut stream_addr = None;
 
         for database in &self.config.database {
-            let datatase = database.clone();
-            let handle = tokio::spawn(async move {
-                let _ = run_database(datatase).await;
-            });
+            let db_config = database.clone();
+            let handle = tokio::spawn(async move { run_database(db_config).await });
 
             handles.push(handle);
 
@@ -72,20 +71,26 @@ impl Command for Replicate {
                 log::info!("Starting ReplicationServer at {addr}");
                 let handle = tokio::spawn(async move {
                     log::info!("ReplicationServer serving at {addr}");
-                    if let Err(e) = Server::builder()
+                    Server::builder()
                         .add_service(TonicReplicationServer::new(server))
                         .serve(addr)
                         .await
-                    {
-                        log::error!("ReplicationServer error: {e}");
-                    }
+                        .map_err(|e| Error::StorageError(format!("ReplicationServer error: {e}")))
                 });
                 handles.push(handle);
             }
         }
 
         for h in handles {
-            h.await.unwrap();
+            match h.await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => return Err(err),
+                Err(err) => {
+                    return Err(Error::TokioError(format!(
+                        "replicate task join error: {err}",
+                    )));
+                }
+            }
         }
         Ok(())
     }

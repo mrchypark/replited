@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crate::error::Result;
-use crate::sqlite::{WAL_FRAME_HEADER_SIZE, WALHeader, checksum};
+use crate::sqlite::{WAL_FRAME_HEADER_SIZE, WALHeader, checksum, from_be_bytes_at};
 use crate::sync::replication::WalPacket;
 use crate::sync::replication::wal_packet::Payload;
 
@@ -52,8 +52,16 @@ impl WalWriter {
         checkpoint_frame_interval: u32,
         checkpoint_time_interval: Duration,
     ) -> Result<Self> {
-        let db_path_str = wal_path.to_str().unwrap().trim_end_matches("-wal");
-        let db_path = PathBuf::from(db_path_str);
+        let db_path = wal_path
+            .to_str()
+            .and_then(|path| path.strip_suffix("-wal"))
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                crate::error::Error::InvalidPath(format!(
+                    "wal path {} is not valid UTF-8 or missing -wal suffix",
+                    wal_path.display(),
+                ))
+            })?;
 
         let file = OpenOptions::new()
             .create(true)
@@ -122,8 +130,8 @@ impl WalWriter {
 
                     // Read Checksum1 (offset 16) and Checksum2 (offset 20)
                     // CRITICAL: Checksums are ALWAYS stored in BIG-ENDIAN per SQLite spec
-                    let c1 = u32::from_be_bytes(frame_hdr[16..20].try_into().unwrap());
-                    let c2 = u32::from_be_bytes(frame_hdr[20..24].try_into().unwrap());
+                    let c1 = from_be_bytes_at(&frame_hdr, 16)?;
+                    let c2 = from_be_bytes_at(&frame_hdr, 20)?;
 
                     wal_writer.last_checksum = (c1, c2);
 

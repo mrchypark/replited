@@ -33,14 +33,8 @@ impl super::Restore {
 
             if !new_segments.is_empty() {
                 // Sort and group segments
-                new_segments.sort_by(|a, b| {
-                    let ordering = a.index.partial_cmp(&b.index).unwrap();
-                    if ordering.is_eq() {
-                        a.offset.partial_cmp(&b.offset).unwrap()
-                    } else {
-                        ordering
-                    }
-                });
+                new_segments
+                    .sort_by(|a, b| a.index.cmp(&b.index).then_with(|| a.offset.cmp(&b.offset)));
 
                 let mut restore_wal_segments: std::collections::BTreeMap<u64, Vec<u64>> =
                     std::collections::BTreeMap::new();

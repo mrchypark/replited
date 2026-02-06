@@ -10,7 +10,6 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
-use std::thread::sleep as thread_sleep;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
@@ -185,7 +184,7 @@ impl Database {
         debug!("sync database: {}", self.config.db);
 
         // make sure wal file has at least one frame in it
-        self.ensure_wal_exists()?;
+        self.ensure_wal_exists().await?;
 
         // Verify our last sync matches the current state of the WAL.
         // This ensures that we have an existing generation & that the last sync
@@ -372,18 +371,22 @@ impl Database {
         }
         for entry in fs::read_dir(&genetations_dir)? {
             let entry = entry?;
-            let file_name = entry.file_name().as_os_str().to_str().unwrap().to_string();
+            let file_name = match entry.file_name().into_string() {
+                Ok(file_name) => file_name,
+                Err(file_name) => {
+                    debug!(
+                        "db {} skipping non-utf8 generation directory name {:?}",
+                        self.config.db, file_name
+                    );
+                    continue;
+                }
+            };
             let base = path_base(&file_name)?;
             // skip the current generation
             if base == generation {
                 continue;
             }
-            let path = Path::new(&genetations_dir)
-                .join(&file_name)
-                .as_path()
-                .to_str()
-                .unwrap()
-                .to_string();
+            let path = Path::new(&genetations_dir).join(&file_name);
             fs::remove_dir_all(&path)?;
         }
         Ok(())
@@ -480,17 +483,21 @@ impl Database {
             return Ok(());
         }
         for entry in fs::read_dir(&dir)?.flatten() {
-            let file_name = entry.file_name().as_os_str().to_str().unwrap().to_string();
+            let file_name = match entry.file_name().into_string() {
+                Ok(file_name) => file_name,
+                Err(file_name) => {
+                    debug!(
+                        "db {} skipping non-utf8 wal file name {:?}",
+                        self.config.db, file_name
+                    );
+                    continue;
+                }
+            };
             let index = parse_wal_path(&file_name)?;
             if index >= retention_floor {
                 continue;
             }
-            let path = Path::new(&dir)
-                .join(&file_name)
-                .as_path()
-                .to_str()
-                .unwrap()
-                .to_string();
+            let path = Path::new(&dir).join(&file_name);
             fs::remove_file(&path)?;
         }
 
@@ -603,7 +610,7 @@ impl Database {
     }
 
     // return original wal file size and new wal size
-    fn copy_to_shadow_wal(&self, shadow_wal: &String) -> Result<(u64, u64)> {
+    fn copy_to_shadow_wal(&self, shadow_wal: &str) -> Result<(u64, u64)> {
         let wal_file_name = &self.wal_file;
         let live_header = WALHeader::read(wal_file_name)?;
         let wal_file_metadata = fs::metadata(wal_file_name)?;
@@ -611,33 +618,67 @@ impl Database {
         let orig_wal_size = align_frame(self.page_size, wal_size);
         let frame_size = WAL_FRAME_HEADER_SIZE + self.page_size;
 
-        let live_end = {
-            let mut wal_file = File::open(wal_file_name)?;
-            wal_file.seek(SeekFrom::Start(WAL_HEADER_SIZE))?;
+        let live_end = self.detect_live_wal_end(wal_file_name, &live_header)?;
+        let shadow_wal_size =
+            self.normalize_shadow_wal_state(shadow_wal, &live_header, frame_size)?;
 
-            let mut offset = WAL_HEADER_SIZE;
-            loop {
-                let wal_frame = WALFrame::read(&mut wal_file, self.page_size);
-                let wal_frame = match wal_frame {
-                    Ok(wal_frame) => wal_frame,
-                    Err(e) => {
-                        if e.code() == Error::UNEXPECTED_EOF_ERROR {
-                            break;
-                        }
-                        return Err(e);
+        let shadow_header = WALHeader::read(shadow_wal)?;
+        if shadow_header != live_header {
+            return Ok((orig_wal_size, shadow_wal_size));
+        }
+        debug!(
+            "copy_to_shadow_wal orig_wal_size: {orig_wal_size},  orig_shadow_wal_size: {shadow_wal_size}"
+        );
+
+        if live_end <= shadow_wal_size {
+            return Ok((live_end, shadow_wal_size));
+        }
+
+        let (buffer, last_commit_size) =
+            self.collect_wal_append_buffer(wal_file_name, &live_header, shadow_wal_size, live_end)?;
+        if buffer.is_empty() {
+            return Ok((orig_wal_size, last_commit_size));
+        }
+
+        self.append_buffer_to_shadow_wal(shadow_wal, &buffer)?;
+        self.debug_assert_shadow_wal_matches_live(shadow_wal, wal_file_name)?;
+
+        Ok((orig_wal_size, last_commit_size))
+    }
+
+    fn detect_live_wal_end(&self, wal_file_name: &str, live_header: &WALHeader) -> Result<u64> {
+        let mut wal_file = File::open(wal_file_name)?;
+        wal_file.seek(SeekFrom::Start(WAL_HEADER_SIZE))?;
+
+        let mut offset = WAL_HEADER_SIZE;
+        loop {
+            let wal_frame = WALFrame::read(&mut wal_file, self.page_size);
+            let wal_frame = match wal_frame {
+                Ok(wal_frame) => wal_frame,
+                Err(e) => {
+                    if e.code() == Error::UNEXPECTED_EOF_ERROR {
+                        break;
                     }
-                };
-
-                if wal_frame.salt1 != live_header.salt1 || wal_frame.salt2 != live_header.salt2 {
-                    break;
+                    return Err(e);
                 }
+            };
 
-                offset += wal_frame.data.len() as u64;
+            if wal_frame.salt1 != live_header.salt1 || wal_frame.salt2 != live_header.salt2 {
+                break;
             }
 
-            align_frame(self.page_size, offset)
-        };
+            offset += wal_frame.data.len() as u64;
+        }
 
+        Ok(align_frame(self.page_size, offset))
+    }
+
+    fn normalize_shadow_wal_state(
+        &self,
+        shadow_wal: &str,
+        live_header: &WALHeader,
+        frame_size: u64,
+    ) -> Result<u64> {
         let mut shadow_wal_size = fs::metadata(shadow_wal)?.size();
         if shadow_wal_size > 0 && shadow_wal_size < WAL_HEADER_SIZE {
             let shadow_file = OpenOptions::new().write(true).open(shadow_wal)?;
@@ -663,28 +704,24 @@ impl Database {
             shadow_wal_size = WAL_HEADER_SIZE;
         }
 
-        let shadow_header = WALHeader::read(shadow_wal)?;
-        if shadow_header != live_header {
-            return Ok((orig_wal_size, shadow_wal_size));
-        }
-        debug!(
-            "copy_to_shadow_wal orig_wal_size: {orig_wal_size},  orig_shadow_wal_size: {shadow_wal_size}"
-        );
+        Ok(shadow_wal_size)
+    }
 
+    fn collect_wal_append_buffer(
+        &self,
+        wal_file_name: &str,
+        live_header: &WALHeader,
+        shadow_wal_size: u64,
+        live_end: u64,
+    ) -> Result<(Vec<u8>, u64)> {
         // create a temp file to copy wal frames
         let mut temp_file = tempfile()?;
 
-        // seek on real db wal
         let mut wal_file = File::open(wal_file_name)?;
-        if live_end <= shadow_wal_size {
-            return Ok((live_end, shadow_wal_size));
-        }
-
         wal_file.seek(SeekFrom::Start(shadow_wal_size))?;
         let mut offset = shadow_wal_size;
         let mut last_commit_size = shadow_wal_size;
-        // Read through WAL from last position to find the page of the last
-        // committed transaction.
+
         while offset < live_end {
             let wal_frame = WALFrame::read(&mut wal_file, self.page_size);
             let wal_frame = match wal_frame {
@@ -700,7 +737,6 @@ impl Database {
                 }
             };
 
-            // compare wal frame salts with live wal header salts, break if mismatch
             if wal_frame.salt1 != live_header.salt1 || wal_frame.salt2 != live_header.salt2 {
                 debug!(
                     "db {} copy shadow wal frame salt mismatch at offset {}",
@@ -709,31 +745,34 @@ impl Database {
                 break;
             }
 
-            // Write page to temporary WAL file.
             temp_file.write_all(&wal_frame.data)?;
-
             offset += wal_frame.data.len() as u64;
             last_commit_size = offset;
         }
 
-        // If no WAL writes found, exit.
         if last_commit_size == shadow_wal_size {
-            return Ok((orig_wal_size, last_commit_size));
+            return Ok((Vec::new(), last_commit_size));
         }
 
-        // copy frames from temp file to shadow wal file
         temp_file.flush()?;
         temp_file.seek(SeekFrom::Start(0))?;
-
         let mut buffer = Vec::new();
         temp_file.read_to_end(&mut buffer)?;
+        Ok((buffer, last_commit_size))
+    }
 
-        // append wal frames to end of shadow wal file
+    fn append_buffer_to_shadow_wal(&self, shadow_wal: &str, buffer: &[u8]) -> Result<()> {
         let mut shadow_wal_file = OpenOptions::new().append(true).open(shadow_wal)?;
-        shadow_wal_file.write_all(&buffer)?;
+        shadow_wal_file.write_all(buffer)?;
         shadow_wal_file.flush()?;
+        Ok(())
+    }
 
-        // in debug mode, assert last frame match
+    fn debug_assert_shadow_wal_matches_live(
+        &self,
+        shadow_wal: &str,
+        wal_file_name: &str,
+    ) -> Result<()> {
         #[cfg(debug_assertions)]
         {
             let shadow_wal_file = fs::metadata(shadow_wal)?;
@@ -751,11 +790,12 @@ impl Database {
 
             assert_eq!(shadow_wal_last_frame, wal_last_frame);
         }
-        Ok((orig_wal_size, last_commit_size))
+
+        Ok(())
     }
 
     // make sure wal file has at least one frame in it
-    fn ensure_wal_exists(&self) -> Result<()> {
+    async fn ensure_wal_exists(&mut self) -> Result<()> {
         for _ in 0..5 {
             if fs::exists(&self.wal_file)? {
                 let stat = fs::metadata(&self.wal_file)?;
@@ -779,7 +819,7 @@ impl Database {
                 "INSERT INTO _replited_seq (id, seq) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET seq = seq + 1;",
                 (),
             )?;
-            thread_sleep(Duration::from_millis(50));
+            sleep(Duration::from_millis(50)).await;
         }
 
         Err(Error::SqliteWalError(format!(
@@ -800,7 +840,16 @@ impl Database {
         let mut index = 0;
         for entry in entries.flatten() {
             let file_type = entry.file_type()?;
-            let file_name = entry.file_name().into_string().unwrap();
+            let file_name = match entry.file_name().into_string() {
+                Ok(file_name) => file_name,
+                Err(file_name) => {
+                    debug!(
+                        "db {} skipping non-utf8 wal entry name {:?}",
+                        self.config.db, file_name
+                    );
+                    continue;
+                }
+            };
             let path = Path::new(&wal_dir).join(&file_name);
             if !fs::exists(&path)? {
                 // file was deleted after os.ReadDir returned

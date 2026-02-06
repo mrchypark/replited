@@ -76,7 +76,7 @@ fn init_fs_operator(cfg: &StorageFsConfig) -> Result<impl Builder> {
 
     let mut path = cfg.root.clone();
     if !path.starts_with('/') {
-        path = env::current_dir().unwrap().join(path).display().to_string();
+        path = env::current_dir()?.join(path).display().to_string();
     }
     builder = builder.root(&path);
 

@@ -5,6 +5,7 @@ mod restore;
 pub mod server;
 mod shadow_wal_reader;
 pub mod stream_client;
+pub(crate) mod stream_protocol;
 
 pub use crate::pb::replication;
 pub use lsn::Lsn;

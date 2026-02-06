@@ -2,19 +2,37 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
-use regex::Regex;
+use regex::{Captures, Regex};
 
 use crate::error::Error;
 use crate::error::Result;
 
 static WAL_EXTENDION: &str = ".wal";
-static WAL_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^([0-9]{10})\.wal$").unwrap());
+static WAL_REGEX: LazyLock<Regex> = LazyLock::new(|| compile_regex(r"^([0-9]{10})\.wal$"));
 static WAL_SEGMENT_EXTENDION: &str = ".wal.zst";
 static WAL_SEGMENT_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^([0-9]{10})(?:_([0-9]{10}))\.wal\.zst$").unwrap());
+    LazyLock::new(|| compile_regex(r"^([0-9]{10})_([0-9]{10})\.wal\.zst$"));
 static SNAPSHOT_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^([0-9]{10})(?:_([0-9]{10}))\.snapshot\.zst$").unwrap());
+    LazyLock::new(|| compile_regex(r"^([0-9]{10})_([0-9]{10})\.snapshot\.zst$"));
 static SNAPSHOT_EXTENDION: &str = ".snapshot.zst";
+
+fn compile_regex(pattern: &str) -> Regex {
+    Regex::new(pattern).expect("invalid static regex pattern in base::file")
+}
+
+fn parse_capture_u64(captures: &Captures<'_>, group: usize, error_message: &str) -> Result<u64> {
+    let value = captures
+        .get(group)
+        .ok_or_else(|| Error::InvalidPath(error_message.to_string()))?
+        .as_str();
+    value
+        .parse::<u64>()
+        .map_err(|_| Error::InvalidPath(error_message.to_string()))
+}
+
+fn path_to_string(path: PathBuf) -> String {
+    path.to_string_lossy().into_owned()
+}
 
 // return base name of path
 pub fn path_base(path: &str) -> Result<String> {
@@ -34,15 +52,10 @@ pub fn parent_dir(path: &str) -> Option<String> {
 // parse wal file path, return wal index
 pub fn parse_wal_path(path: &str) -> Result<u64> {
     let base = path_base(path)?;
-    let a = WAL_REGEX
+    let captures = WAL_REGEX
         .captures(&base)
         .ok_or(Error::InvalidPath(format!("invalid wal path {path}")))?;
-    let a = a
-        .get(1)
-        .ok_or(Error::InvalidPath(format!("invalid wal path {path}")))?
-        .as_str();
-
-    Ok(a.parse::<u64>()?)
+    parse_capture_u64(&captures, 1, &format!("invalid wal path {path}"))
 }
 
 pub fn format_wal_path(index: u64) -> String {
@@ -51,26 +64,14 @@ pub fn format_wal_path(index: u64) -> String {
 
 pub fn parse_wal_segment_path(path: &str) -> Result<(u64, u64)> {
     let base = path_base(path)?;
-    let a = WAL_SEGMENT_REGEX
+    let captures = WAL_SEGMENT_REGEX
         .captures(&base)
         .ok_or(Error::InvalidPath(format!(
             "invalid wal segment path {path}"
         )))?;
-    let index = a
-        .get(1)
-        .ok_or(Error::InvalidPath(format!(
-            "invalid wal segment path {path}"
-        )))?
-        .as_str();
-    let offset = a
-        .get(2)
-        .ok_or(Error::InvalidPath(format!(
-            "invalid wal segment path {path}"
-        )))?
-        .as_str();
-
-    let index = index.parse::<u64>()?;
-    let offset = offset.parse::<u64>()?;
+    let error_message = format!("invalid wal segment path {path}");
+    let index = parse_capture_u64(&captures, 1, &error_message)?;
+    let offset = parse_capture_u64(&captures, 2, &error_message)?;
 
     Ok((index, offset))
 }
@@ -78,19 +79,13 @@ pub fn parse_wal_segment_path(path: &str) -> Result<(u64, u64)> {
 // parse snapshot file path, return snapshot index and offset
 pub fn parse_snapshot_path(path: &str) -> Result<(u64, u64)> {
     let base = path_base(path)?;
-    let a = SNAPSHOT_REGEX
+    let captures = SNAPSHOT_REGEX
         .captures(&base)
         .ok_or(Error::InvalidPath(format!("invalid snapshot path {path}")))?;
-    let index = a
-        .get(1)
-        .ok_or(Error::InvalidPath(format!("invalid snapshot path {path}")))?
-        .as_str();
-    let offset = a
-        .get(2)
-        .ok_or(Error::InvalidPath(format!("invalid snapshot path {path}")))?
-        .as_str();
-
-    Ok((index.parse::<u64>()?, offset.parse::<u64>()?))
+    let error_message = format!("invalid snapshot path {path}");
+    let index = parse_capture_u64(&captures, 1, &error_message)?;
+    let offset = parse_capture_u64(&captures, 2, &error_message)?;
+    Ok((index, offset))
 }
 
 pub fn format_snapshot_path(index: u64, offset: u64) -> String {
@@ -98,70 +93,40 @@ pub fn format_snapshot_path(index: u64, offset: u64) -> String {
 }
 
 pub fn local_generations_dir(meta_dir: &str) -> String {
-    Path::new(meta_dir)
-        .join("generations")
-        .as_path()
-        .to_str()
-        .unwrap()
-        .to_string()
+    path_to_string(Path::new(meta_dir).join("generations"))
 }
 
 pub fn remote_generations_dir(db_name: &str) -> String {
-    Path::new(db_name)
-        .join("generations/")
-        .as_path()
-        .to_str()
-        .unwrap()
-        .to_string()
+    path_to_string(Path::new(db_name).join("generations/"))
 }
 
 // returns the path of a single generation.
 pub fn generation_dir(meta_dir: &str, generation: &str) -> String {
-    Path::new(meta_dir)
-        .join("generations")
-        .join(generation)
-        .as_path()
-        .to_str()
-        .unwrap()
-        .to_string()
+    path_to_string(Path::new(meta_dir).join("generations").join(generation))
 }
 
 pub fn snapshots_dir(db: &str, generation: &str) -> String {
-    Path::new(&generation_dir(db, generation))
-        .join("snapshots/")
-        .as_path()
-        .to_str()
-        .unwrap()
-        .to_string()
+    path_to_string(Path::new(&generation_dir(db, generation)).join("snapshots/"))
 }
 
 pub fn snapshot_file(db: &str, generation: &str, index: u64, offset: u64) -> String {
-    Path::new(&generation_dir(db, generation))
-        .join("snapshots")
-        .join(format_snapshot_path(index, offset))
-        .as_path()
-        .to_str()
-        .unwrap()
-        .to_string()
+    path_to_string(
+        Path::new(&generation_dir(db, generation))
+            .join("snapshots")
+            .join(format_snapshot_path(index, offset)),
+    )
 }
 
 pub fn walsegments_dir(db: &str, generation: &str) -> String {
-    Path::new(&generation_dir(db, generation))
-        .join("wal/")
-        .as_path()
-        .to_str()
-        .unwrap()
-        .to_string()
+    path_to_string(Path::new(&generation_dir(db, generation)).join("wal/"))
 }
 
 pub fn walsegment_file(db: &str, generation: &str, index: u64, offset: u64) -> String {
-    Path::new(&generation_dir(db, generation))
-        .join("wal")
-        .join(format_walsegment_path(index, offset))
-        .as_path()
-        .to_str()
-        .unwrap()
-        .to_string()
+    path_to_string(
+        Path::new(&generation_dir(db, generation))
+            .join("wal")
+            .join(format_walsegment_path(index, offset)),
+    )
 }
 
 pub fn format_walsegment_path(index: u64, offset: u64) -> String {
@@ -170,30 +135,15 @@ pub fn format_walsegment_path(index: u64, offset: u64) -> String {
 
 // returns the path of the name of the current generation.
 pub fn generation_file_path(meta_dir: &str) -> String {
-    Path::new(meta_dir)
-        .join("generation")
-        .as_path()
-        .to_str()
-        .unwrap()
-        .to_string()
+    path_to_string(Path::new(meta_dir).join("generation"))
 }
 
 pub fn shadow_wal_dir(meta_dir: &str, generation: &str) -> String {
-    Path::new(&generation_dir(meta_dir, generation))
-        .join("wal")
-        .as_path()
-        .to_str()
-        .unwrap()
-        .to_string()
+    path_to_string(Path::new(&generation_dir(meta_dir, generation)).join("wal"))
 }
 
 pub fn shadow_wal_file(meta_dir: &str, generation: &str, index: u64) -> String {
-    Path::new(&shadow_wal_dir(meta_dir, generation))
-        .join(format_wal_path(index))
-        .as_path()
-        .to_str()
-        .unwrap()
-        .to_string()
+    path_to_string(Path::new(&shadow_wal_dir(meta_dir, generation)).join(format_wal_path(index)))
 }
 
 #[cfg(test)]

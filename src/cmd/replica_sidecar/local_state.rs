@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use crate::base::Generation;
 use crate::database::WalGenerationPos;
 use crate::error::{Error, Result};
+use crate::sync::stream_protocol::meta_dir_for_db_path as protocol_meta_dir_for_db_path;
 
 const REPLICA_ID_FILE: &str = "replica_id";
 const LAST_APPLIED_LSN_FILE: &str = "last_applied_lsn";
@@ -77,16 +78,9 @@ pub(super) fn persist_last_applied_lsn(db_path: &str, pos: &WalGenerationPos) ->
 
 fn meta_dir_for_db_path(db_path: &str) -> Result<PathBuf> {
     let file_path = Path::new(db_path);
-    let db_name = file_path
-        .file_name()
-        .and_then(|p| p.to_str())
-        .ok_or_else(|| Error::InvalidPath(format!("invalid db path {db_path}")))?;
-    let dir_path = match file_path.parent() {
-        Some(p) if p == Path::new("") => Path::new("."),
-        Some(p) => p,
-        None => Path::new("."),
-    };
-    Ok(Path::new(dir_path).join(format!(".{db_name}-replited")))
+    protocol_meta_dir_for_db_path(file_path)
+        .map(PathBuf::from)
+        .ok_or_else(|| Error::InvalidPath(format!("invalid db path {db_path}")))
 }
 
 fn new_replica_id() -> String {
