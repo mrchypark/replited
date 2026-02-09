@@ -148,7 +148,7 @@ impl Error {
             display_text: error,
             detail: String::new(),
             cause: None,
-            backtrace: capture(),
+            backtrace: None,
         }
     }
 
@@ -181,5 +181,20 @@ impl Clone for Error {
             None,
             self.backtrace(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::Ordering;
+
+    use super::*;
+
+    #[test]
+    fn from_string_no_backtrace_never_captures_even_when_backtrace_enabled() {
+        let prev = crate::error::backtrace::USER_SET_ENABLE_BACKTRACE.swap(2, Ordering::Relaxed);
+        let err = Error::from_string_no_backtrace("no backtrace".to_string());
+        assert!(err.backtrace().is_none());
+        crate::error::backtrace::USER_SET_ENABLE_BACKTRACE.store(prev, Ordering::Relaxed);
     }
 }

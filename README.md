@@ -82,7 +82,14 @@ replited  --config ./etc/sample.toml restore --db /Users/codedump/local/sqlite/t
 
 command options:
 * `db`: which db will be restore from config
-* `output`: which path will restored db saved
+* `output`: base path where restored SQLite files will be written.
+
+Output files:
+- `{output}`: SQLite database file
+- `{output}-wal`: SQLite WAL file (may be required for latest rows to be visible)
+- `{output}-shm`: SQLite SHM file (re-created by SQLite on open if missing)
+
+Treat `{output}`, `{output}-wal`, `{output}-shm` as a single restore output set.
 
 ### Stream (primary + replica)
 - **Primary**: Add a stream replicate target in config (`params.type = "stream"`, `addr = "0.0.0.0:50051"`).

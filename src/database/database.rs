@@ -148,11 +148,12 @@ impl Database {
 
     fn release_read_lock(&mut self) -> Result<()> {
         // Rollback & clear read transaction.
-        if let Some(tx) = &self.tx_connection {
-            tx.execute_batch("ROLLBACK;")?;
-            self.tx_connection = None;
-        }
-
+        //
+        // Important: Always clear the connection even if rollback fails so we don't leak a read lock.
+        let Some(tx) = self.tx_connection.take() else {
+            return Ok(());
+        };
+        tx.execute_batch("ROLLBACK;")?;
         Ok(())
     }
 
@@ -233,9 +234,12 @@ impl Database {
         // notify the database has been changed
         if changed {
             let generation_pos = self.wal_generation_position()?;
-            if let Some(notifier) = &self.sync_notifiers[0] {
+            for notifier in &self.sync_notifiers {
+                let Some(notifier) = notifier else {
+                    continue;
+                };
                 notifier
-                    .send(ReplicateCommand::DbChanged(generation_pos))
+                    .send(ReplicateCommand::DbChanged(generation_pos.clone()))
                     .await?;
             }
         }
@@ -1031,5 +1035,70 @@ pub async fn run_database(config: DbConfig) -> Result<()> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tempfile::tempdir;
+
+    use crate::config::DbConfig;
+
+    use super::{Database, DbCommand};
+
+    fn test_db_config(db_path: &str, backup_root: &str) -> DbConfig {
+        let toml_str = format!(
+            r#"
+db = "{db_path}"
+min_checkpoint_page_number = 1000
+max_checkpoint_page_number = 10000
+truncate_page_number = 500000
+checkpoint_interval_secs = 60
+monitor_interval_ms = 50
+apply_checkpoint_frame_interval = 128
+apply_checkpoint_interval_ms = 2000
+wal_retention_count = 10
+max_concurrent_snapshots = 5
+
+[[replicate]]
+name = "stream"
+[replicate.params]
+type = "stream"
+addr = "http://127.0.0.1:50051"
+
+[[replicate]]
+name = "fs"
+[replicate.params]
+type = "fs"
+root = "{backup_root}"
+"#,
+        );
+
+        toml::from_str(&toml_str).expect("parse db config")
+    }
+
+    #[tokio::test]
+    async fn sync_notifies_non_stream_replicates_even_if_first_replicate_is_stream() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("primary.db");
+        let backup_root = dir.path().join("backup");
+
+        let config = test_db_config(
+            db_path.to_string_lossy().as_ref(),
+            backup_root.to_string_lossy().as_ref(),
+        );
+
+        let (mut db, mut db_rx) = Database::try_create(config).await.expect("create db");
+
+        // Trigger a sync which should notify all non-stream replicates.
+        db.sync().await.expect("sync");
+
+        let cmd = tokio::time::timeout(Duration::from_millis(500), db_rx.recv())
+            .await
+            .expect("timed out waiting for DbCommand");
+
+        assert!(matches!(cmd, Some(DbCommand::Snapshot(1))));
     }
 }

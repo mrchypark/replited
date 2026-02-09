@@ -29,7 +29,6 @@ use crate::error::Result;
 #[derive(Debug, Clone)]
 pub struct StorageClient {
     operator: Operator,
-    db_path: String,
     db_name: String,
 }
 
@@ -87,7 +86,6 @@ impl StorageClient {
         Ok(Self {
             operator: init_operator(&config.params)?,
             db_name: path_base(&db_path)?,
-            db_path,
         })
     }
 
@@ -123,7 +121,7 @@ impl StorageClient {
         compressed_data: Vec<u8>,
     ) -> Result<()> {
         let file = walsegment_file(
-            &self.db_path,
+            &self.db_name,
             pos.generation.as_str(),
             pos.index,
             pos.offset,
@@ -196,8 +194,8 @@ impl StorageClient {
                     generation,
                     e.to_string()
                 );
-                if e.kind() == opendal::ErrorKind::NotADirectory
-                    || e.kind() == opendal::ErrorKind::Unexpected
+                if e.kind() == opendal::ErrorKind::NotFound
+                    || e.kind() == opendal::ErrorKind::NotADirectory
                 {
                     return Ok(vec![]);
                 } else {
@@ -411,7 +409,26 @@ impl StorageClient {
 
 #[cfg(test)]
 mod tests {
+    use super::StorageClient;
     use super::snapshot_position_is_newer;
+    use crate::base::Generation;
+    use crate::base::walsegment_file;
+    use crate::config::StorageConfig;
+    use crate::config::StorageFsConfig;
+    use crate::config::StorageParams;
+    use crate::error::Error;
+    use opendal::Operator;
+    use opendal::raw::Access;
+    use opendal::raw::Layer;
+    use opendal::raw::LayeredAccess;
+    use opendal::raw::OpList;
+    use opendal::raw::OpRead;
+    use opendal::raw::OpWrite;
+    use opendal::raw::RpList;
+    use opendal::raw::RpRead;
+    use opendal::raw::RpWrite;
+    use opendal::services;
+    use tempfile::tempdir;
 
     #[test]
     fn snapshot_position_prefers_higher_index() {
@@ -422,5 +439,171 @@ mod tests {
     fn snapshot_position_breaks_tie_with_offset() {
         assert!(snapshot_position_is_newer(10, 200, Some((10, 100))));
         assert!(!snapshot_position_is_newer(10, 100, Some((10, 200))));
+    }
+
+    #[derive(Debug, Clone)]
+    struct FailListLayer {
+        kind: opendal::ErrorKind,
+    }
+
+    impl FailListLayer {
+        fn new(kind: opendal::ErrorKind) -> Self {
+            Self { kind }
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailListAccessor<A> {
+        inner: A,
+        kind: opendal::ErrorKind,
+    }
+
+    impl<A: Access> Layer<A> for FailListLayer {
+        type LayeredAccess = FailListAccessor<A>;
+
+        fn layer(&self, inner: A) -> Self::LayeredAccess {
+            FailListAccessor {
+                inner,
+                kind: self.kind,
+            }
+        }
+    }
+
+    impl<A: Access> LayeredAccess for FailListAccessor<A> {
+        type Inner = A;
+        type Reader = A::Reader;
+        type BlockingReader = A::BlockingReader;
+        type Writer = A::Writer;
+        type BlockingWriter = A::BlockingWriter;
+        type Lister = A::Lister;
+        type BlockingLister = A::BlockingLister;
+
+        fn inner(&self) -> &Self::Inner {
+            &self.inner
+        }
+
+        async fn read(&self, path: &str, args: OpRead) -> opendal::Result<(RpRead, Self::Reader)> {
+            self.inner.read(path, args).await
+        }
+
+        fn blocking_read(
+            &self,
+            path: &str,
+            args: OpRead,
+        ) -> opendal::Result<(RpRead, Self::BlockingReader)> {
+            self.inner.blocking_read(path, args)
+        }
+
+        async fn write(
+            &self,
+            path: &str,
+            args: OpWrite,
+        ) -> opendal::Result<(RpWrite, Self::Writer)> {
+            self.inner.write(path, args).await
+        }
+
+        fn blocking_write(
+            &self,
+            path: &str,
+            args: OpWrite,
+        ) -> opendal::Result<(RpWrite, Self::BlockingWriter)> {
+            self.inner.blocking_write(path, args)
+        }
+
+        async fn list(
+            &self,
+            _path: &str,
+            _args: OpList,
+        ) -> opendal::Result<(RpList, Self::Lister)> {
+            Err(opendal::Error::new(self.kind, "fail list"))
+        }
+
+        fn blocking_list(
+            &self,
+            _path: &str,
+            _args: OpList,
+        ) -> opendal::Result<(RpList, Self::BlockingLister)> {
+            Err(opendal::Error::new(self.kind, "fail list"))
+        }
+    }
+
+    fn storage_client_with_list_error(kind: opendal::ErrorKind) -> StorageClient {
+        let op = Operator::new(services::Memory::default())
+            .expect("op")
+            .layer(FailListLayer::new(kind))
+            .finish();
+        StorageClient {
+            operator: op,
+            db_name: "db.db".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshots_treats_not_found_as_empty() {
+        let client = storage_client_with_list_error(opendal::ErrorKind::NotFound);
+        let generation = Generation::new();
+
+        let snapshots = client
+            .snapshots(generation.as_str())
+            .await
+            .expect("snapshots");
+        assert!(snapshots.is_empty());
+    }
+
+    #[tokio::test]
+    async fn snapshots_propagates_unexpected_list_error() {
+        let client = storage_client_with_list_error(opendal::ErrorKind::Unexpected);
+        let generation = Generation::new();
+
+        let err = client
+            .snapshots(generation.as_str())
+            .await
+            .expect_err("snapshots should error");
+        assert_eq!(err.code(), Error::OPEN_DAL_ERROR);
+    }
+
+    #[tokio::test]
+    async fn write_wal_segment_uses_db_name_not_full_db_path() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("storage");
+
+        let client = StorageClient::try_create(
+            "nested/db.db".to_string(),
+            StorageConfig {
+                name: "fs".to_string(),
+                params: StorageParams::Fs(Box::new(StorageFsConfig {
+                    root: root.to_string_lossy().to_string(),
+                })),
+            },
+        )
+        .expect("storage client");
+
+        let generation = Generation::new();
+        let pos = crate::database::WalGenerationPos {
+            generation: generation.clone(),
+            index: 0,
+            offset: 0,
+        };
+
+        client
+            .write_wal_segment(
+                &pos,
+                crate::base::compress_buffer(b"segment").expect("compress"),
+            )
+            .await
+            .expect("write wal segment");
+
+        let good = root.join(walsegment_file("db.db", generation.as_str(), 0, 0));
+        let bad = root.join(walsegment_file("nested/db.db", generation.as_str(), 0, 0));
+        assert!(
+            std::fs::exists(&good).expect("exists"),
+            "wal segment should be written under db name path, expected {}",
+            good.to_string_lossy()
+        );
+        assert!(
+            !std::fs::exists(&bad).expect("exists"),
+            "wal segment should not be written under full db_path, found {}",
+            bad.to_string_lossy()
+        );
     }
 }

@@ -258,6 +258,16 @@ impl DbConfig {
                 "apply_checkpoint_frame_interval must be greater than zero",
             ));
         }
+        if self.apply_checkpoint_interval_ms == 0 {
+            return Err(Error::InvalidConfig(
+                "apply_checkpoint_interval_ms must be greater than zero",
+            ));
+        }
+        if self.max_concurrent_snapshots == 0 {
+            return Err(Error::InvalidConfig(
+                "max_concurrent_snapshots must be greater than zero",
+            ));
+        }
         Ok(())
     }
 }
@@ -270,7 +280,7 @@ pub struct StorageConfig {
 
 impl Debug for StorageConfig {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        f.debug_struct("StorageS3Config")
+        f.debug_struct("StorageConfig")
             .field("name", &self.name)
             .field("params", &self.params)
             .finish()
@@ -290,6 +300,20 @@ mod tests {
                 root: "/tmp/replited".to_string(),
             })),
         }
+    }
+
+    #[test]
+    fn test_storage_config_debug_label() {
+        let config = create_valid_storage_config();
+        let debug = format!("{config:?}");
+        assert!(
+            debug.contains("StorageConfig"),
+            "debug label should be StorageConfig, got: {debug}"
+        );
+        assert!(
+            !debug.contains("StorageS3Config"),
+            "debug label should not mention StorageS3Config, got: {debug}"
+        );
     }
 
     fn create_valid_db_config() -> DbConfig {
@@ -377,6 +401,24 @@ mod tests {
     fn test_db_config_validate_apply_checkpoint_frame_interval_zero() {
         let mut config = create_valid_db_config();
         config.apply_checkpoint_frame_interval = 0;
+
+        let result = config.validate();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_db_config_validate_apply_checkpoint_interval_zero() {
+        let mut config = create_valid_db_config();
+        config.apply_checkpoint_interval_ms = 0;
+
+        let result = config.validate();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_db_config_validate_max_concurrent_snapshots_zero() {
+        let mut config = create_valid_db_config();
+        config.max_concurrent_snapshots = 0;
 
         let result = config.validate();
         assert!(result.is_err());
@@ -471,7 +513,7 @@ mod tests {
         let config = create_valid_storage_config();
         let debug_str = format!("{config:?}");
 
-        assert!(debug_str.contains("StorageS3Config"));
+        assert!(debug_str.contains("StorageConfig"));
         assert!(debug_str.contains("test-storage"));
     }
 }

@@ -39,6 +39,17 @@ impl Generation {
 
 impl Display for Generation {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
-        write!(f, "{:?}", self.generation)
+        write!(f, "{}", self.generation)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_outputs_raw_generation_string() {
+        let g = Generation::try_create("019c3e53aea47afbbddfe5ebc2272e22").expect("generation");
+        assert_eq!(format!("{g}"), "019c3e53aea47afbbddfe5ebc2272e22");
     }
 }
