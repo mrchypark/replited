@@ -210,7 +210,11 @@ impl StorageClient {
             if !metadata.is_file() {
                 continue;
             }
-            let (index, offset) = parse_snapshot_path(entry.name())?;
+            let (index, offset) = match parse_snapshot_path(entry.name()) {
+                Ok(v) => v,
+                Err(e) if e.code() == Error::INVALID_PATH => continue,
+                Err(e) => return Err(e),
+            };
             snapshots.push(SnapshotInfo {
                 generation: generation.clone(),
                 index,
@@ -242,7 +246,11 @@ impl StorageClient {
             if !metadata.is_file() {
                 continue;
             }
-            let (index, offset) = parse_snapshot_path(entry.name())?;
+            let (index, offset) = match parse_snapshot_path(entry.name()) {
+                Ok(v) => v,
+                Err(e) if e.code() == Error::INVALID_PATH => continue,
+                Err(e) => return Err(e),
+            };
             if !snapshot_position_is_newer(index, offset, max_position) {
                 continue;
             }
@@ -276,7 +284,11 @@ impl StorageClient {
             if !metadata.is_file() {
                 continue;
             }
-            let (index, offset) = parse_wal_segment_path(entry.name())?;
+            let (index, offset) = match parse_wal_segment_path(entry.name()) {
+                Ok(v) => v,
+                Err(e) if e.code() == Error::INVALID_PATH => continue,
+                Err(e) => return Err(e),
+            };
             wal_segments.push(WalSegmentInfo {
                 generation: generation.clone(),
                 index,
@@ -412,10 +424,13 @@ mod tests {
     use super::StorageClient;
     use super::snapshot_position_is_newer;
     use crate::base::Generation;
+    use crate::base::compress_buffer;
+    use crate::base::snapshot_file;
     use crate::base::walsegment_file;
     use crate::config::StorageConfig;
     use crate::config::StorageFsConfig;
     use crate::config::StorageParams;
+    use crate::database::WalGenerationPos;
     use crate::error::Error;
     use opendal::Operator;
     use opendal::raw::Access;
@@ -605,5 +620,89 @@ mod tests {
             "wal segment should not be written under full db_path, found {}",
             bad.to_string_lossy()
         );
+    }
+
+    #[tokio::test]
+    async fn wal_segments_ignores_tmp_files() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("storage");
+
+        let client = StorageClient::try_create(
+            "db.db".to_string(),
+            StorageConfig {
+                name: "fs".to_string(),
+                params: StorageParams::Fs(Box::new(StorageFsConfig {
+                    root: root.to_string_lossy().to_string(),
+                })),
+            },
+        )
+        .expect("storage client");
+
+        let generation = Generation::new();
+        let pos = WalGenerationPos {
+            generation: generation.clone(),
+            index: 15,
+            offset: 634512,
+        };
+
+        client
+            .write_wal_segment(&pos, compress_buffer(b"segment").expect("compress"))
+            .await
+            .expect("write wal segment");
+
+        // Simulate transient/incomplete upload: `<segment>.tmp`.
+        let segment_rel = walsegment_file("db.db", generation.as_str(), pos.index, pos.offset);
+        std::fs::write(root.join(format!("{segment_rel}.tmp")), b"incomplete").expect("write tmp");
+
+        // Before fix: this used to error with InvalidPath when listing WAL segments.
+        let segments = client
+            .wal_segments(generation.as_str())
+            .await
+            .expect("wal_segments");
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].index, 15);
+        assert_eq!(segments[0].offset, 634512);
+    }
+
+    #[tokio::test]
+    async fn snapshots_ignores_tmp_files() {
+        let temp = tempdir().expect("tempdir");
+        let root = temp.path().join("storage");
+
+        let client = StorageClient::try_create(
+            "db.db".to_string(),
+            StorageConfig {
+                name: "fs".to_string(),
+                params: StorageParams::Fs(Box::new(StorageFsConfig {
+                    root: root.to_string_lossy().to_string(),
+                })),
+            },
+        )
+        .expect("storage client");
+
+        let generation = Generation::new();
+        let pos = WalGenerationPos {
+            generation: generation.clone(),
+            index: 7,
+            offset: 1234,
+        };
+
+        client
+            .write_snapshot(&pos, compress_buffer(b"snapshot").expect("compress"))
+            .await
+            .expect("write snapshot");
+
+        // Simulate transient/incomplete upload: `<snapshot>.tmp`.
+        let snap_rel = snapshot_file("db.db", generation.as_str(), pos.index, pos.offset);
+        std::fs::write(root.join(format!("{snap_rel}.tmp")), b"incomplete").expect("write tmp");
+
+        // Before fix: this used to error with InvalidPath when listing snapshots.
+        let snaps = client
+            .snapshots(generation.as_str())
+            .await
+            .expect("snapshots");
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(snaps[0].index, 7);
+        assert_eq!(snaps[0].offset, 1234);
     }
 }

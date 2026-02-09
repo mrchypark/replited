@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 <!-- Release notes generated using configuration in .github/release.yml at main -->
 
+## [v0.3.4] - 2026-02-09
+
+### Fixes
+* fix: make `restore` output a `DB + WAL + SHM` set in non-follow mode (move `-wal/-shm` with the DB, and ensure SHM exists when WAL exists).
+* fix: replica sidecar WAL apply now treats "offset beyond EOF" as rewindable and resets local WAL to avoid streaming stalls.
+* fix: ignore transient `*.tmp` snapshot/WAL segment files when listing storage objects to avoid replication errors during concurrent uploads.
+
+### Tests
+* test: stabilize battle tests by cleaning up per-run artifacts and waiting for convergence before final validation.
+
+### Chores
+* chore: ignore local `.worktrees/` directory.
+
 ## [v0.3.3] - 2026-02-06
 
 ### Fixes
@@ -75,4 +88,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 * docs: add config.md about config fotmat.
 ### CI
 * ci: add integration test of ftp/s3/fs.
-
