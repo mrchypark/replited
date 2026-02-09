@@ -60,3 +60,6 @@ tests/output/
 # Example data
 example/data/
 example/verify_output.txt
+
+# Git worktrees (local only)
+.worktrees/
