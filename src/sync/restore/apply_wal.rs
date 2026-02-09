@@ -22,6 +22,7 @@ impl super::Restore {
         wal_segments: &RestoreWalSegments,
         db_path: &str,
         mut last_index: u64,
+        mut last_offset: u64,
         keep_alive: bool,
     ) -> Result<(u64, u64, Option<Connection>)> {
         debug!(
@@ -29,7 +30,6 @@ impl super::Restore {
             self.db, wal_segments
         );
         let wal_file_name = format!("{db_path}-wal");
-        let mut last_offset = 0;
 
         for (index, offsets) in wal_segments {
             let mut wal_decompressed_data = Vec::new();
@@ -95,6 +95,9 @@ impl super::Restore {
                 .open(&wal_file_name)?;
 
             if let Some(start) = start_offset {
+                // Truncate any partial frame data after the resume point before appending.
+                // This prevents leaving stale bytes at the end of the file.
+                wal_file.set_len(start)?;
                 wal_file.seek(SeekFrom::Start(start))?;
             } else if !wal_decompressed_data.is_empty() {
                 // If we didn't find any segments to apply but we have data, append.
@@ -121,6 +124,8 @@ impl super::Restore {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use tempfile::tempdir;
 
     use crate::base::Generation;
@@ -201,6 +206,7 @@ mod tests {
                 &vec![(0, vec![0]), (1, vec![0])],
                 &db_path_str,
                 0,
+                0,
                 true,
             )
             .await
@@ -208,5 +214,88 @@ mod tests {
 
         assert_eq!(last_index, 1);
         assert!(keepalive_conn.is_some());
+    }
+
+    #[tokio::test]
+    async fn apply_wal_frames_skips_offsets_before_last_offset() {
+        let temp = tempdir().expect("tempdir");
+        let db_path = temp.path().join("restore_target.db");
+        let db_path_str = db_path.to_string_lossy().to_string();
+
+        // Precreate a local WAL file representing already-applied bytes.
+        fs::write(format!("{db_path_str}-wal"), b"HELLO").expect("seed wal");
+
+        let storage_root = temp.path().join("storage");
+        let client = StorageClient::try_create(
+            "db.db".to_string(),
+            StorageConfig {
+                name: "fs".to_string(),
+                params: StorageParams::Fs(Box::new(StorageFsConfig {
+                    root: storage_root.to_string_lossy().to_string(),
+                })),
+            },
+        )
+        .expect("storage client");
+
+        let generation = Generation::new();
+        let snapshot = SnapshotInfo {
+            generation: generation.clone(),
+            index: 0,
+            offset: 0,
+            size: 0,
+            created_at: chrono::Utc::now(),
+        };
+
+        client
+            .write_wal_segment(
+                &crate::database::WalGenerationPos {
+                    generation: generation.clone(),
+                    index: 0,
+                    offset: 0,
+                },
+                compress_buffer(b"hello").expect("compress seg0"),
+            )
+            .await
+            .expect("write segment 0");
+        client
+            .write_wal_segment(
+                &crate::database::WalGenerationPos {
+                    generation,
+                    index: 0,
+                    offset: 5,
+                },
+                compress_buffer(b"world").expect("compress seg5"),
+            )
+            .await
+            .expect("write segment 5");
+
+        let restore = super::super::Restore {
+            db: "db.db".to_string(),
+            config: Vec::new(),
+            options: RestoreOptions {
+                db: "db.db".to_string(),
+                output: db_path_str.clone(),
+                follow: false,
+                interval: 1,
+                timestamp: String::new(),
+            },
+        };
+
+        let (_last_index, _last_offset, keepalive_conn) = restore
+            .apply_wal_frames(
+                &client,
+                &snapshot,
+                &vec![(0, vec![0, 5])],
+                &db_path_str,
+                0,
+                5,
+                false,
+            )
+            .await
+            .expect("apply wal frames");
+        assert!(keepalive_conn.is_none());
+
+        let bytes = fs::read(format!("{db_path_str}-wal")).expect("read wal");
+        assert_eq!(bytes, b"HELLOworld");
     }
 }

@@ -70,8 +70,16 @@ impl Restore {
 
     pub async fn run(&self) -> Result<Option<crate::database::WalGenerationPos>> {
         // Ensure output path does not already exist.
-        if fs::exists(&self.options.output)? && !self.options.follow {
-            return Err(Error::OverwriteDbError("cannot overwrite exist db"));
+        if !self.options.follow {
+            for path in [
+                self.options.output.clone(),
+                format!("{}-wal", self.options.output),
+                format!("{}-shm", self.options.output),
+            ] {
+                if fs::exists(&path)? {
+                    return Err(Error::OverwriteDbError("cannot overwrite exist db"));
+                }
+            }
         }
 
         let limit = parse_limit_timestamp(&self.options.timestamp)?;
@@ -100,6 +108,7 @@ impl Restore {
         };
 
         let mut last_index = 0;
+        let mut last_offset = 0;
         let mut resume = false;
 
         if self.options.follow && fs::exists(&target_path)? {
@@ -141,6 +150,7 @@ impl Restore {
                     let _ = fs::remove_file(&shm_path);
                     // last_index and last_offset remain 0
                 } else {
+                    last_offset = current_offset;
                     // Find last_index based on offset
                     last_index = latest_restore_info
                         .wal_segments
@@ -170,12 +180,13 @@ impl Restore {
                 &latest_restore_info.wal_segments,
                 &target_path,
                 last_index,
+                last_offset,
                 self.options.follow,
             )
             .await?;
 
         last_index = new_last_index;
-        let last_offset = new_last_offset;
+        last_offset = new_last_offset;
 
         // If follow mode, ensure we have a keepalive connection (either returned or new)
         let _keepalive_connection = if self.options.follow {
@@ -192,10 +203,33 @@ impl Restore {
         };
 
         if !self.options.follow {
-            // rename the temp file to output file
+            // Move DB + WAL + SHM together so the output DB can see unapplied WAL frames.
+            let temp_wal_path = format!("{target_path}-wal");
+            let temp_shm_path = format!("{target_path}-shm");
+            let out_wal_path = format!("{}-wal", self.options.output);
+            let out_shm_path = format!("{}-shm", self.options.output);
+
+            // WAL/SHM may not exist (e.g. no WAL segments). Move what exists.
+            if fs::exists(&temp_wal_path)? {
+                fs::rename(&temp_wal_path, &out_wal_path)?;
+            }
+            if fs::exists(&temp_shm_path)? {
+                fs::rename(&temp_shm_path, &out_shm_path)?;
+            }
+
+            // Rename the temp DB last to treat it as the "commit" step.
             fs::rename(&target_path, &self.options.output)?;
-            // We don't need to move WAL/SHM because PASSIVE checkpoint moves data to DB,
-            // and we don't care about WAL history for non-follow mode.
+
+            // Some tooling expects the classic SQLite "DB + WAL + SHM" file set.
+            // Create an empty SHM file if a WAL exists but no SHM was created during restore.
+            // SQLite will initialize/resize it on first open.
+            if fs::exists(&out_wal_path)? && !fs::exists(&out_shm_path)? {
+                let _ = std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(false)
+                    .open(&out_shm_path)?;
+            }
         }
 
         info!(

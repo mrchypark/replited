@@ -58,6 +58,7 @@ impl super::Restore {
                         &restore_wal_segments,
                         &self.options.output,
                         last_index,
+                        last_offset,
                         false,
                     )
                     .await?;
@@ -85,6 +86,7 @@ impl super::Restore {
                             &latest_info.wal_segments,
                             &self.options.output,
                             new_generation_start_index(&current_snapshot),
+                            0,
                             false,
                         )
                         .await?;

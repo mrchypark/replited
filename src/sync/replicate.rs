@@ -94,11 +94,18 @@ impl Replicate {
         let mut s = s;
         loop {
             select! {
-                cmd = rx.recv() => if let Some(cmd) = cmd {
-                    s.command(cmd).await?
+                cmd = rx.recv() => match cmd {
+                    Some(cmd) => {
+                        s.command(cmd).await?;
+                    }
+                    None => {
+                        // Sender dropped: shut down the replicator task gracefully.
+                        break;
+                    }
                 }
             }
         }
+        Ok(())
     }
 
     // returns the last snapshot in a generation.
@@ -344,11 +351,68 @@ impl Replicate {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::snapshot_position_is_newer;
 
     #[test]
     fn snapshot_position_prefers_later_offset_when_index_matches() {
         assert!(snapshot_position_is_newer(3, 900, Some((3, 500))));
         assert!(!snapshot_position_is_newer(3, 500, Some((3, 900))));
+    }
+
+    #[test]
+    fn replicate_main_exits_when_channel_closed() {
+        use tempfile::tempdir;
+        use tokio::runtime::Builder;
+        use tokio::sync::mpsc;
+
+        use crate::config::{StorageConfig, StorageFsConfig, StorageParams};
+        use crate::database::DatabaseInfo;
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+
+        let handle = std::thread::spawn(move || {
+            let runtime = Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build runtime");
+
+            runtime.block_on(async move {
+                let temp = tempdir().expect("tempdir");
+                let storage_root = temp.path().join("storage");
+                let storage_cfg = StorageConfig {
+                    name: "fs".to_string(),
+                    params: StorageParams::Fs(Box::new(StorageFsConfig {
+                        root: storage_root.to_string_lossy().to_string(),
+                    })),
+                };
+
+                let (db_notifier, _db_rx) = mpsc::channel(1);
+                let info = DatabaseInfo {
+                    meta_dir: temp.path().to_string_lossy().to_string(),
+                    page_size: 4096,
+                };
+
+                let replicate =
+                    super::Replicate::new(storage_cfg, "data.db".to_string(), 0, db_notifier, info)
+                        .await
+                        .expect("create replicate");
+
+                let (tx, rx) = mpsc::channel(1);
+                drop(tx); // immediately close channel
+
+                let _ = super::Replicate::main(replicate, rx).await;
+
+                let _ = done_tx.send(());
+            });
+        });
+
+        // In the broken implementation, this will time out and the test will fail.
+        done_rx
+            .recv_timeout(Duration::from_millis(200))
+            .expect("Replicate::main did not exit after channel closed");
+
+        handle.join().expect("join thread");
     }
 }
