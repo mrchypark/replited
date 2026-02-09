@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 <!-- Release notes generated using configuration in .github/release.yml at main -->
 
+## [v0.3.5] - 2026-02-09
+
+### Docs
+* docs: align stream replication guide with direct snapshot streaming (`stream_snapshot_v2` + `zstd`) and WAL streaming (`stream_wal_v2`).
+* docs: correct config reference for canonical `params.type` values (lowercase) and FTP `params.username`.
+* docs: update sample config and clarify `remote_db_name` usage for stream replicas.
+* docs: correct `max_concurrent_snapshots` default to `5` in docs.
+
 ## [v0.3.4] - 2026-02-09
 
 ### Fixes
@@ -51,7 +59,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Configuration
 * config: Stream replication no longer requires a storage backend (fs, s3, etc.) for initial snapshot restore.
-* config: Added `max_concurrent_snapshots` to `[[database]]` config (default: 10).
+* config: Added `max_concurrent_snapshots` to `[[database]]` config (default: 5).
 
 ### Fixes
 * fix: Resolve stack overflow issue in Primary server by moving large buffer allocations to heap.

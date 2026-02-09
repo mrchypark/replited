@@ -44,7 +44,8 @@ See config sample in [sample.toml](./etc/sample.toml)
 | monitor_interval_ms | milliseconds between primary WAL shadow sync polls (default 1000) |
 | apply_checkpoint_frame_interval | **replica-side**: WAL frames to buffer before checkpoint (default 128) |
 | apply_checkpoint_interval_ms | **replica-side**: max milliseconds between checkpoints (default 2000) |
-| max_concurrent_snapshots | max concurrent snapshot streams allowed (default 10) |
+| wal_retention_count | number of shadow WAL segments retained locally on primary for gap fill (default 10) |
+| max_concurrent_snapshots | max concurrent snapshot streams allowed (default 5) |
 
 ### Replicate Config
 | item  |  value    |
@@ -55,7 +56,7 @@ See config sample in [sample.toml](./etc/sample.toml)
 #### Azure blob Params
 | item  |  value    |
 | :---- | ---- |
-| params.type | "Azb" |
+| params.type | `"azb"` (alias: `"Azb"`) |
 | params.root | root of Azblob service backend. |
 | params.container | container name of Azblob service backend. |
 | params.endpoint | endpoint of Azblob service backend. |
@@ -65,22 +66,22 @@ See config sample in [sample.toml](./etc/sample.toml)
 #### File System Params
 | item  |  value    |
 | :---- | ---- |
-| params.type | "Fs" |
+| params.type | `"fs"` (alias: `"Fs"`) |
 | params.root | root directory of file system backend |
 
 #### Ftp Params
 | item  |  value    |
 | :---- | ---- |
-| params.type | "Ftp" |
+| params.type | `"ftp"` (alias: `"Ftp"`) |
 | params.endpoint | Endpoint of this ftp, use "ftps://127.0.0.1" by default. |
 | params.root | root directory of file system backend, use "/" by default. |
-| params.user | user of ftp backend. |
+| params.username | username of ftp backend. |
 | params.password | password of ftp backend. |
 
 #### Gcs Params
 | item  |  value    |
 | :---- | ---- |
-| params.type | "Gcs" |
+| params.type | `"gcs"` (alias: `"Gcs"`) |
 | params.endpoint | Endpoint of this backend, must be full uri, use "https://storage.googleapis.com" by default. |
 | params.root | Root URI of gcs operations. |
 | params.bucket | Bucket name of this backend. |
@@ -90,7 +91,7 @@ See config sample in [sample.toml](./etc/sample.toml)
 #### S3 Params
 | item  |  value    |
 | :---- | ---- |
-| params.type | "S3" |
+| params.type | `"s3"` (alias: `"S3"`) |
 | params.endpoint | Endpoint of this backend, must be full uri, use "https://s3.amazonaws.com" by default. |
 | params.region | Region represent the signing region of this endpoint.If `region` is empty, use env value `AWS_REGION` if it is set, or else use `us-east-1` by default. |
 | params.bucket | Bucket name of this backend. |
@@ -101,9 +102,9 @@ See config sample in [sample.toml](./etc/sample.toml)
 #### Stream Params
 | item  |  value    |
 | :---- | ---- |
-| params.type | "Stream" |
+| params.type | `"stream"` |
 | params.addr | gRPC server address (e.g., "0.0.0.0:50051" for server, "http://127.0.0.1:50051" for client) |
-| params.remote_db_name | **(Required for replica)** Primary database name/path to look up in primary's config |
+| params.remote_db_name | **(Recommended for replica)** Primary database name/path to look up in primary's config (defaults to local `db` if omitted) |
 
 **Note**: Stream replication does not require a storage backend (fs, s3, etc.) for initial snapshot restore. The replica can stream the snapshot directly from the primary.
 

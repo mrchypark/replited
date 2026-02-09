@@ -10,31 +10,25 @@ Stream replication enables real-time WAL (Write-Ahead Log) synchronization betwe
 │  replited   │     WAL Frames      │  replited   │
 └─────────────┘                     └─────────────┘
        │                                   │
-       ▼                                   ▼
-┌─────────────┐                     ┌─────────────┐
-│  Storage    │ ───── Snapshot ───► │  Restored   │
-│  Backend    │    (Initial Only)   │     DB      │
-└─────────────┘                     └─────────────┘
+       └──────── Snapshot (zstd) ─────────►│
+                                           ▼
+                                    ┌─────────────┐
+                                    │  Restored   │
+                                    │     DB      │
+                                    └─────────────┘
 ```
 
 ## ⚠️ Requirements
 
 > [!IMPORTANT]
-> Stream replication requires a **storage backend** (fs, s3, etc.) for initial snapshot restore.
-> Streaming alone only synchronizes WAL frames - it cannot create the initial database.
+> Stream replication does **not** require a separate storage backend (fs, s3, etc.) for bootstrapping.
+> The replica can stream the initial snapshot directly from the Primary (compressed with `zstd`) and then switch to WAL streaming.
 
 ### Primary Configuration
 
 ```toml
 [[database]]
 db = "primary.db"
-
-# Required: Storage backend for snapshots
-[[database.replicate]]
-name = "backup"
-[database.replicate.params]
-type = "fs"
-root = "./backup"
 
 # Stream server
 [[database.replicate]]
@@ -48,23 +42,28 @@ addr = "http://0.0.0.0:50051"
 
 ```toml
 [[database]]
-db = "primary.db"  # Must match Primary's db name
+db = "replica.db"  # Local path can differ from Primary
 
 [[database.replicate]]
 name = "stream-client"
 [database.replicate.params]
 type = "stream"
 addr = "http://PRIMARY_IP:50051"
+remote_db_name = "primary.db" # Primary DB identity (usually Primary `db` value)
 ```
+
+Notes:
+
+- Primary DB identity is the `db` string from the Primary config. If the replica `db` path differs, set `remote_db_name` explicitly.
+- For a full config reference, see `docs/stream-copy-config.md` and `docs/sidecar-config.md`.
 
 ## Initial Restore Flow
 
 1. **Replica** starts with `--force-restore` flag
-2. **Replica** connects to Primary and calls `get_restore_config()`
-3. **Primary** returns its `DbConfig` including storage settings
-4. **Replica** uses `StorageClient` to download snapshot from storage backend
-5. **Replica** applies snapshot to create initial database
-6. **Replica** starts streaming WAL frames for ongoing sync
+2. **Replica** connects to Primary and calls `stream_snapshot_v2`
+3. **Primary** generates/serves a compressed snapshot stream (`zstd`) plus a snapshot boundary LSN
+4. **Replica** restores the snapshot locally and records the snapshot boundary LSN
+5. **Replica** switches to `stream_wal_v2` to apply real-time WAL updates
 
 ## v2 LSN Contract
 
@@ -124,13 +123,13 @@ replited --config replica.toml replica-sidecar
 ## Troubleshooting
 
 ### "Database not found" on Primary
-Replica is requesting a different database name. Ensure `db` field matches between Primary and Replica configs.
+Replica is requesting a different DB identity. Ensure `remote_db_name` matches the Primary `db` value exactly.
 
 ### "NoSnapshotError"
-No snapshot available in storage backend. Ensure:
-1. Primary has a storage backend configured (fs, s3, etc.)
-2. Initial data has been written and checkpointed
-3. Snapshot file exists in the storage path
+Primary could not provide a usable snapshot yet. Ensure:
+1. Primary is running `replited ... replicate` with a `type = "stream"` target configured
+2. The database has had initial data written and a checkpoint has occurred
+3. Retry after a short delay (snapshot generation is retried internally)
 
 ### "Invalid stream address"
 Address should be in format `http://IP:PORT`. The scheme is required for gRPC client but stripped for server binding.

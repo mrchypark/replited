@@ -15,7 +15,7 @@ db = "/var/sqlite/test.db"
 # sample of azure blob replicate config
 [[database.replicate]]
 name = "name of azure blob"
-params.type = "Azb"
+params.type = "azb"
 params.endpoint = "xxx"
 params.container = "xxx"
 params.root = ""
@@ -25,14 +25,14 @@ params.account_key = "xxx"
 # sample of file system replicate config
 [[database.replicate]]
 name = "name of fs"
-params.type = "Fs"
+params.type = "fs"
 params.root = "/var/replited"
 
 # sample of ftp replicate config
 [[database.replicate]]
 name = "name of ftp"
-params.type = "Ftp"
-params.endpoint = "https://storage.googleapis.com"
+params.type = "ftp"
+params.endpoint = "ftps://127.0.0.1"
 params.root = "/var/replited"
 params.username = "username"
 params.password = "password"
@@ -40,7 +40,7 @@ params.password = "password"
 # sample of gcs replicate config
 [[database.replicate]]
 name = "name of gcs"
-params.type = "Gcs"
+params.type = "gcs"
 params.endpoint = "https://storage.googleapis.com"
 params.bucket = "sqlite"
 params.root = ""
@@ -49,7 +49,7 @@ params.credential = "xxx"
 # sample of s3 replicate config
 [[database.replicate]]
 name = "name of s3"
-params.type = "S3"
+params.type = "s3"
 params.endpoint = "http://127.0.0.1:9900"
 params.bucket = "sqlite"
 params.region = ""

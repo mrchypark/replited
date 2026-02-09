@@ -1,4 +1,4 @@
-# replited(Replicate SQLITE Daemon)
+# replited (Replicate SQLite Daemon)
 
 [![GitHub stars](https://img.shields.io/github/stars/mrchypark/replited?label=Stars&logo=github)](https://github.com/mrchypark/replited)
 [![GitHub forks](https://img.shields.io/github/forks/mrchypark/replited?label=Forks&logo=github)](https://github.com/mrchypark/replited)
@@ -69,7 +69,7 @@ Replica-side WAL checkpoint tuning (new)
 
 ## Sub commands
 ### Replicate
-`repicate` sub command will run a background process to replicate db to replicates in config periodically, example:
+`replicate` subcommand will run a background process to replicate db to replication targets in the config periodically, example:
 ```
 replited  --config ./etc/sample.toml  replicate
 ```
