@@ -28,6 +28,12 @@ venv/
 # Local orchestration notes
 .sisyphus/
 
+# Local runtime artifacts (dev/e2e)
+logs/
+primary.toml
+replica.toml
+replica_cwd/
+
 .test/
 test.db
 .test_continuous/
