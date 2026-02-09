@@ -218,26 +218,40 @@ def run_chaos_test(
             time.sleep(0.05)  # 50ms between writes
         
         # Final verification
+        # Chaos events can temporarily stall replication (e.g. connection retries, WAL index refresh).
+        # Don't treat short-lived lag as data loss; wait for convergence within a bounded window.
         print("\n[VERIFY] Waiting for final sync...")
         conn.close()
-        time.sleep(5)  # Give replica time to catch up
-        
+
+        replica_db_path = str(replica_cwd / "primary.db")
+        final_timeout = 60  # seconds
+        start_verify = time.time()
+        last_log = start_verify
         primary_count = get_row_count("primary.db")
-        replica_count = get_row_count(str(replica_cwd / "primary.db"))
-        
+        replica_count = get_row_count(replica_db_path)
+        while time.time() - start_verify < final_timeout:
+            primary_count = get_row_count("primary.db")
+            replica_count = get_row_count(replica_db_path)
+
+            if time.time() - last_log >= 5:
+                print(f"Primary rows: {primary_count}")
+                print(f"Replica rows: {replica_count}")
+                last_log = time.time()
+
+            if primary_count > 0 and replica_count >= 0 and replica_count == primary_count:
+                result.final_sync_verified = True
+                break
+
+            time.sleep(1)
+
         print(f"Primary rows: {primary_count}")
         print(f"Replica rows: {replica_count}")
-        
-        if primary_count > 0 and replica_count > 0:
-            if replica_count >= primary_count - 10:  # Allow small lag
-                result.final_sync_verified = True
-            else:
-                result.data_loss_detected = True
-                result.errors.append(
-                    f"Data sync gap: primary={primary_count}, replica={replica_count}"
-                )
-        else:
-            result.errors.append(f"Invalid counts: primary={primary_count}, replica={replica_count}")
+
+        if not result.final_sync_verified:
+            result.data_loss_detected = True
+            result.errors.append(
+                f"Data sync gap after {final_timeout}s: primary={primary_count}, replica={replica_count}"
+            )
         
     finally:
         try:

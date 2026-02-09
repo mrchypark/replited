@@ -654,9 +654,24 @@ async fn apply_wal_bytes(
     let wal_path = format!("{db_path}-wal");
     let offset = start_pos.offset;
     let wal_bytes = wal_bytes.to_vec();
-    tokio::task::spawn_blocking(move || apply_wal_bytes_sync(&wal_path, offset, &wal_bytes))
-        .await
-        .map_err(|e| ReplicaStreamError::Transport(e.to_string()))?
+    let result =
+        tokio::task::spawn_blocking(move || apply_wal_bytes_sync(&wal_path, offset, &wal_bytes))
+            .await
+            .map_err(|e| ReplicaStreamError::Transport(e.to_string()))?;
+
+    match result {
+        Ok(()) => Ok(()),
+        Err(ReplicaStreamError::Stream(StreamReplicationErrorCode::InvalidLsn, message)) => {
+            // Local WAL state got truncated/reset underneath us (common when rebuilding SHM/WAL
+            // state). Reset the local WAL so the next retry can safely rewind and re-stream.
+            reset_local_wal(db_path, process_manager).await?;
+            Err(ReplicaStreamError::Stream(
+                StreamReplicationErrorCode::InvalidLsn,
+                message,
+            ))
+        }
+        Err(other) => Err(other),
+    }
 }
 
 fn reset_local_wal_sync(
@@ -698,9 +713,10 @@ fn apply_wal_bytes_sync(
         Ok(meta) => meta.len(),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             if offset > 0 {
-                return Err(ReplicaStreamError::Io(format!(
-                    "WAL offset {offset} beyond EOF for {wal_path}",
-                )));
+                return Err(ReplicaStreamError::Stream(
+                    StreamReplicationErrorCode::InvalidLsn,
+                    format!("WAL offset {offset} beyond EOF for {wal_path}"),
+                ));
             }
             0
         }
@@ -708,9 +724,10 @@ fn apply_wal_bytes_sync(
     };
 
     if offset > 0 && current_len < offset {
-        return Err(ReplicaStreamError::Io(format!(
-            "WAL offset {offset} beyond EOF {current_len} for {wal_path}",
-        )));
+        return Err(ReplicaStreamError::Stream(
+            StreamReplicationErrorCode::InvalidLsn,
+            format!("WAL offset {offset} beyond EOF {current_len} for {wal_path}"),
+        ));
     }
 
     let mut wal_file = fs::OpenOptions::new()
@@ -897,7 +914,7 @@ fn allow_shadow_wal_boundary_advance(
 #[cfg(test)]
 mod tests {
     use super::{
-        ReplicaStreamError, WalRefreshState, can_accept_stream_advance_past_floor,
+        ReplicaStreamError, WalRefreshState, apply_wal_bytes, can_accept_stream_advance_past_floor,
         refresh_wal_index, validate_snapshot_meta,
     };
     use crate::base::Generation;
@@ -1023,6 +1040,37 @@ mod tests {
             &floor,
             &next
         ));
+    }
+
+    #[tokio::test]
+    async fn apply_wal_bytes_resets_local_wal_and_returns_invalid_lsn_when_offset_beyond_eof() {
+        let (_temp_dir, db_path) = create_test_wal_db();
+        let wal_path = format!("{db_path}-wal");
+
+        // Seed a local WAL smaller than the requested offset to simulate truncation/reset.
+        fs::write(&wal_path, b"short").expect("seed wal");
+
+        let start = WalGenerationPos {
+            generation: Generation::new(),
+            index: 0,
+            offset: 100,
+        };
+
+        let err = apply_wal_bytes(&db_path, &start, b"data", None)
+            .await
+            .expect_err("apply should fail");
+        match err {
+            ReplicaStreamError::Stream(code, message) => {
+                assert_eq!(code, StreamReplicationErrorCode::InvalidLsn);
+                assert!(message.contains("beyond EOF"));
+            }
+            other => panic!("expected stream error, got {other:?}"),
+        }
+
+        assert!(
+            !fs::exists(&wal_path).expect("stat wal"),
+            "expected local WAL to be reset after invalid lsn"
+        );
     }
 
     #[tokio::test]

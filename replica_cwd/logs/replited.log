@@ -1,0 +1,43 @@
+2026-02-09T17:02:27.915370+09:00  INFO replited::cmd::replica_sidecar: replica_sidecar.rs:123 ReplicaSidecar::run_single_db start for data.db
+2026-02-09T17:02:27.932529+09:00 DEBUG replited::cmd::replica_sidecar: replica_sidecar.rs:163 ReplicaSidecar::run_single_db loop state: Bootstrapping
+2026-02-09T17:02:27.961484+09:00 DEBUG replited::cmd::replica_sidecar: replica_sidecar.rs:163 ReplicaSidecar::run_single_db loop state: CatchingUp
+2026-02-09T17:02:27.961779+09:00  INFO replited::cmd::replica_sidecar::streaming: streaming.rs:186 ReplicaSidecar: WAL header missing for data.db at offset 4152; rewinding stream to 0 (expected on cold start or after WAL cleanup)
+2026-02-09T17:02:27.974281+09:00  INFO replited::cmd::replica_sidecar::streaming: streaming.rs:469 ReplicaSidecar: WAL checkpoint PASSIVE for data.db: (0, 1, 1)
+2026-02-09T17:02:27.977179+09:00 DEBUG replited::cmd::replica_sidecar: replica_sidecar.rs:163 ReplicaSidecar::run_single_db loop state: Streaming
+2026-02-09T17:02:27.982389+09:00  INFO replited::cmd::replica_sidecar::streaming: streaming.rs:178 ReplicaSidecar: seeded WAL header for data.db from shadow wal at 019c416c5a277350a65aa8523f854040:1:4152
+2026-02-09T17:02:27.995340+09:00  INFO replited::cmd::replica_sidecar::streaming: streaming.rs:469 ReplicaSidecar: WAL checkpoint PASSIVE for data.db: (0, 1, 1)
+2026-02-09T17:02:28.050832+09:00 DEBUG replited::cmd::replica_sidecar: replica_sidecar.rs:163 ReplicaSidecar::run_single_db loop state: Streaming
+2026-02-09T17:02:28.056391+09:00  INFO replited::cmd::replica_sidecar::streaming: streaming.rs:178 ReplicaSidecar: seeded WAL header for data.db from shadow wal at 019c416c5a277350a65aa8523f854040:1:4152
+2026-02-09T17:02:28.070496+09:00  INFO replited::cmd::replica_sidecar::streaming: streaming.rs:469 ReplicaSidecar: WAL checkpoint PASSIVE for data.db: (0, 1, 1)
+2026-02-09T17:02:28.125426+09:00 DEBUG replited::cmd::replica_sidecar: replica_sidecar.rs:163 ReplicaSidecar::run_single_db loop state: Streaming
+2026-02-09T17:02:28.131381+09:00  INFO replited::cmd::replica_sidecar::streaming: streaming.rs:178 ReplicaSidecar: seeded WAL header for data.db from shadow wal at 019c416c5a277350a65aa8523f854040:1:4152
+2026-02-09T17:02:28.145441+09:00  INFO replited::cmd::replica_sidecar::streaming: streaming.rs:469 ReplicaSidecar: WAL checkpoint PASSIVE for data.db: (0, 1, 1)
+2026-02-09T17:02:28.201962+09:00 DEBUG replited::cmd::replica_sidecar: replica_sidecar.rs:163 ReplicaSidecar::run_single_db loop state: Streaming
+2026-02-09T17:02:28.207416+09:00  INFO replited::cmd::replica_sidecar::streaming: streaming.rs:178 ReplicaSidecar: seeded WAL header for data.db from shadow wal at 019c416c5a277350a65aa8523f854040:1:4152
+2026-02-09T17:02:28.223566+09:00  INFO replited::cmd::replica_sidecar::streaming: streaming.rs:469 ReplicaSidecar: WAL checkpoint PASSIVE for data.db: (0, 1, 1)
+2026-02-09T17:02:28.279961+09:00 DEBUG replited::cmd::replica_sidecar: replica_sidecar.rs:163 ReplicaSidecar::run_single_db loop state: Streaming
+2026-02-09T17:02:28.285437+09:00  INFO replited::cmd::replica_sidecar::streaming: streaming.rs:178 ReplicaSidecar: seeded WAL header for data.db from shadow wal at 019c416c5a277350a65aa8523f854040:1:4152
+2026-02-09T17:02:28.300424+09:00  INFO replited::cmd::replica_sidecar::streaming: streaming.rs:469 ReplicaSidecar: WAL checkpoint PASSIVE for data.db: (0, 1, 1)
+2026-02-09T17:02:28.356556+09:00 DEBUG replited::cmd::replica_sidecar: replica_sidecar.rs:163 ReplicaSidecar::run_single_db loop state: Streaming
+2026-02-09T17:02:28.361457+09:00  INFO replited::cmd::replica_sidecar::streaming: streaming.rs:178 ReplicaSidecar: seeded WAL header for data.db from shadow wal at 019c416c5a277350a65aa8523f854040:1:4152
+2026-02-09T17:02:28.377022+09:00  INFO replited::cmd::replica_sidecar::streaming: streaming.rs:469 ReplicaSidecar: WAL checkpoint PASSIVE for data.db: (0, 1, 1)
+2026-02-09T17:02:28.433089+09:00 DEBUG replited::cmd::replica_sidecar: replica_sidecar.rs:163 ReplicaSidecar::run_single_db loop state: Streaming
+2026-02-09T17:02:28.438638+09:00  INFO replited::cmd::replica_sidecar::streaming: streaming.rs:178 ReplicaSidecar: seeded WAL header for data.db from shadow wal at 019c416c5a277350a65aa8523f854040:1:4152
+2026-02-09T17:02:28.453746+09:00  INFO replited::cmd::replica_sidecar::streaming: streaming.rs:469 ReplicaSidecar: WAL checkpoint PASSIVE for data.db: (0, 1, 1)
+2026-02-09T17:02:28.509303+09:00 DEBUG replited::cmd::replica_sidecar: replica_sidecar.rs:163 ReplicaSidecar::run_single_db loop state: Streaming
+2026-02-09T17:02:28.515415+09:00  INFO replited::cmd::replica_sidecar::streaming: streaming.rs:178 ReplicaSidecar: seeded WAL header for data.db from shadow wal at 019c416c5a277350a65aa8523f854040:1:4152
+2026-02-09T17:02:28.527653+09:00  INFO replited::cmd::replica_sidecar::streaming: streaming.rs:469 ReplicaSidecar: WAL checkpoint PASSIVE for data.db: (0, 1, 1)
+2026-02-09T17:02:28.582469+09:00 DEBUG replited::cmd::replica_sidecar: replica_sidecar.rs:163 ReplicaSidecar::run_single_db loop state: Streaming
+2026-02-09T17:02:28.589500+09:00  INFO replited::cmd::replica_sidecar::streaming: streaming.rs:178 ReplicaSidecar: seeded WAL header for data.db from shadow wal at 019c416c5a277350a65aa8523f854040:1:4152
+2026-02-09T17:02:28.606355+09:00  INFO replited::cmd::replica_sidecar::streaming: streaming.rs:469 ReplicaSidecar: WAL checkpoint PASSIVE for data.db: (0, 1, 1)
+2026-02-09T17:02:28.663212+09:00 DEBUG replited::cmd::replica_sidecar: replica_sidecar.rs:163 ReplicaSidecar::run_single_db loop state: Streaming
+2026-02-09T17:02:28.669911+09:00  INFO replited::cmd::replica_sidecar::streaming: streaming.rs:178 ReplicaSidecar: seeded WAL header for data.db from shadow wal at 019c416c5a277350a65aa8523f854040:1:4152
+2026-02-09T17:02:28.684374+09:00  INFO replited::cmd::replica_sidecar::streaming: streaming.rs:469 ReplicaSidecar: WAL checkpoint PASSIVE for data.db: (0, 1, 1)
+2026-02-09T17:02:28.740029+09:00 DEBUG replited::cmd::replica_sidecar: replica_sidecar.rs:163 ReplicaSidecar::run_single_db loop state: Streaming
+2026-02-09T17:02:28.747053+09:00  INFO replited::cmd::replica_sidecar::streaming: streaming.rs:178 ReplicaSidecar: seeded WAL header for data.db from shadow wal at 019c416c5a277350a65aa8523f854040:1:4152
+2026-02-09T17:02:28.763807+09:00  INFO replited::cmd::replica_sidecar::streaming: streaming.rs:469 ReplicaSidecar: WAL checkpoint PASSIVE for data.db: (0, 1, 1)
+2026-02-09T17:02:28.819906+09:00 DEBUG replited::cmd::replica_sidecar: replica_sidecar.rs:163 ReplicaSidecar::run_single_db loop state: Streaming
+2026-02-09T17:02:28.825114+09:00  INFO replited::cmd::replica_sidecar::streaming: streaming.rs:178 ReplicaSidecar: seeded WAL header for data.db from shadow wal at 019c416c5a277350a65aa8523f854040:1:4152
+2026-02-09T17:02:28.841866+09:00  INFO replited::cmd::replica_sidecar::streaming: streaming.rs:469 ReplicaSidecar: WAL checkpoint PASSIVE for data.db: (0, 1, 1)
+2026-02-09T17:02:28.897790+09:00 DEBUG replited::cmd::replica_sidecar: replica_sidecar.rs:163 ReplicaSidecar::run_single_db loop state: Streaming
+2026-02-09T17:02:28.903127+09:00  INFO replited::cmd::replica_sidecar::streaming: streaming.rs:178 ReplicaSidecar: seeded WAL header for data.db from shadow wal at 019c416c5a277350a65aa8523f854040:1:4152

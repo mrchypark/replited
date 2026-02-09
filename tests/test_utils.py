@@ -98,9 +98,51 @@ addr = "127.0.0.1:50051"
         print(f"Generated {self.primary_toml}")
 
 def cleanup():
-    """Legacy cleanup for backward compatibility or global cleanup."""
-    # We encourage using TestEnv now.
-    pass
+    """Remove common on-disk artifacts created by legacy e2e/battle scripts.
+
+    Newer tests should use `TestEnv` which scopes artifacts under `tests/output/`.
+    Older scripts still run in their current working directory and need explicit cleanup
+    to avoid leaking state between scenarios.
+    """
+
+    cwd = Path(".")
+
+    # Common top-level files created by battle scripts.
+    for name in [
+        "primary.db",
+        "primary.db-wal",
+        "primary.db-shm",
+        "data.db",
+        "data.db-wal",
+        "data.db-shm",
+        "primary.toml",
+        "replica.toml",
+        "primary.log",
+        "replica.log",
+    ]:
+        try:
+            (cwd / name).unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            print(f"cleanup: failed to remove {name}: {e}")
+
+    # Common directories created by battle scripts.
+    for name in ["logs", "backup", "replica_cwd"]:
+        path = cwd / name
+        if path.is_dir():
+            try:
+                shutil.rmtree(path, ignore_errors=True)
+            except OSError as e:
+                print(f"cleanup: failed to remove {path}: {e}")
+
+    # Per-replica working directories used by some battle scripts.
+    for entry in cwd.iterdir():
+        if entry.is_dir() and entry.name.startswith("replica_"):
+            try:
+                shutil.rmtree(entry, ignore_errors=True)
+            except OSError as e:
+                print(f"cleanup: failed to remove {entry}: {e}")
 
 def run_integrity_check(db_path: str) -> tuple:
     """Run PRAGMA integrity_check; return (ok, detail)."""
