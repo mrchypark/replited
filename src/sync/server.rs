@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 use std::fs;
+use std::fs::File;
 use std::future::Future;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use sha2::{Digest, Sha256};
 use tokio::sync::{Semaphore, mpsc};
 use tokio::time::sleep;
 use tokio_stream::wrappers::ReceiverStream;
@@ -685,15 +686,13 @@ async fn send_snapshot_stream(
     db_identity: &str,
     snapshot: &SnapshotStreamData,
 ) {
-    let snapshot_size_bytes = snapshot.compressed_data.len() as u64;
-    let snapshot_sha256 = Sha256::digest(&snapshot.compressed_data).to_vec();
     let meta = SnapshotMeta {
         db_identity: db_identity.to_string(),
         generation: snapshot.position.generation.as_str().to_string(),
         boundary_lsn: Some(lsn_token_from_pos(&snapshot.position)),
         page_size: snapshot.page_size as u32,
-        snapshot_size_bytes,
-        snapshot_sha256,
+        snapshot_size_bytes: snapshot.compressed_size_bytes,
+        snapshot_sha256: snapshot.compressed_sha256.clone(),
     };
 
     let response = StreamSnapshotV2Response {
@@ -703,9 +702,40 @@ async fn send_snapshot_stream(
         return;
     }
 
-    for chunk in snapshot.compressed_data.chunks(SNAPSHOT_CHUNK_SIZE) {
+    let compressed_path: &Path = snapshot.compressed_path.as_ref();
+    let mut file = match File::open(compressed_path) {
+        Ok(file) => file,
+        Err(err) => {
+            send_snapshot_stream_error(
+                tx,
+                StreamErrorCode::Unknown,
+                format!("failed to open snapshot stream source: {err}"),
+                0,
+            )
+            .await;
+            return;
+        }
+    };
+    let mut buffer = vec![0u8; SNAPSHOT_CHUNK_SIZE];
+    loop {
+        let read = match file.read(&mut buffer) {
+            Ok(read) => read,
+            Err(err) => {
+                send_snapshot_stream_error(
+                    tx,
+                    StreamErrorCode::Unknown,
+                    format!("failed to read snapshot stream source: {err}"),
+                    0,
+                )
+                .await;
+                return;
+            }
+        };
+        if read == 0 {
+            break;
+        }
         let response = StreamSnapshotV2Response {
-            payload: Some(StreamSnapshotV2Payload::Chunk(chunk.to_vec())),
+            payload: Some(StreamSnapshotV2Payload::Chunk(buffer[..read].to_vec())),
         };
         if tx.send(Ok(response)).await.is_err() {
             return;
@@ -811,30 +841,130 @@ async fn send_snapshot_stream_error(
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::Write;
+    use std::path::Path;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
+    use sha2::{Digest, Sha256};
+    use tempfile::NamedTempFile;
     use tempfile::tempdir;
+    use tokio::sync::mpsc;
 
     use super::{
-        retention_error, snapshot_with_retry, validate_snapshot_request, validate_start_generation,
+        SNAPSHOT_CHUNK_SIZE, retention_error, send_snapshot_stream, snapshot_with_retry,
+        validate_snapshot_request, validate_start_generation,
     };
     use crate::base::{Generation, generation_file_path};
     use crate::database::{SnapshotStreamData, WalGenerationPos};
     use crate::error::Error;
+    use crate::pb::replication::stream_error::Code as StreamErrorCode;
+    use crate::pb::replication::stream_snapshot_v2_response::Payload as StreamSnapshotV2Payload;
     use crate::sync::StreamReplicationError;
     use crate::sync::replica_progress;
 
     fn snapshot_stub() -> SnapshotStreamData {
+        let file = NamedTempFile::new().unwrap();
         SnapshotStreamData {
-            compressed_data: vec![],
+            compressed_path: file.into_temp_path(),
+            compressed_size_bytes: 0,
+            compressed_sha256: vec![],
             position: WalGenerationPos {
                 generation: Generation::new(),
                 index: 0,
                 offset: 0,
             },
             page_size: 4096,
+        }
+    }
+
+    #[tokio::test]
+    async fn send_snapshot_stream_sends_meta_then_file_chunks() {
+        let contents = vec![b'x'; SNAPSHOT_CHUNK_SIZE + 17];
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(&contents).unwrap();
+        file.flush().unwrap();
+
+        let generation = Generation::new();
+        let snapshot = SnapshotStreamData {
+            compressed_path: file.into_temp_path(),
+            compressed_size_bytes: contents.len() as u64,
+            compressed_sha256: Sha256::digest(&contents).to_vec(),
+            position: WalGenerationPos {
+                generation: generation.clone(),
+                index: 3,
+                offset: 128,
+            },
+            page_size: 4096,
+        };
+        let (tx, mut rx) = mpsc::channel(8);
+
+        send_snapshot_stream(&tx, "db-1", &snapshot).await;
+        drop(tx);
+
+        let meta = rx.recv().await.unwrap().unwrap();
+        match meta.payload.unwrap() {
+            StreamSnapshotV2Payload::Meta(meta) => {
+                assert_eq!(meta.db_identity, "db-1");
+                assert_eq!(meta.generation, generation.as_str());
+                assert_eq!(meta.snapshot_size_bytes, contents.len() as u64);
+                assert_eq!(meta.snapshot_sha256, Sha256::digest(&contents).to_vec());
+            }
+            payload => panic!("expected meta payload, got {payload:?}"),
+        }
+
+        let mut reconstructed = Vec::new();
+        while let Some(message) = rx.recv().await {
+            let response = message.unwrap();
+            match response.payload.unwrap() {
+                StreamSnapshotV2Payload::Chunk(chunk) => reconstructed.extend_from_slice(&chunk),
+                payload => panic!("expected chunk payload, got {payload:?}"),
+            }
+        }
+
+        assert_eq!(reconstructed, contents);
+    }
+
+    #[tokio::test]
+    async fn send_snapshot_stream_reports_missing_file() {
+        let file = NamedTempFile::new().unwrap();
+        let temp_path = file.into_temp_path();
+        let missing_path: &Path = temp_path.as_ref();
+        fs::remove_file(missing_path).unwrap();
+
+        let snapshot = SnapshotStreamData {
+            compressed_path: temp_path,
+            compressed_size_bytes: 10,
+            compressed_sha256: vec![1, 2, 3],
+            position: WalGenerationPos {
+                generation: Generation::new(),
+                index: 0,
+                offset: 0,
+            },
+            page_size: 4096,
+        };
+        let (tx, mut rx) = mpsc::channel(8);
+
+        send_snapshot_stream(&tx, "db-1", &snapshot).await;
+        drop(tx);
+
+        let meta = rx.recv().await.unwrap().unwrap();
+        assert!(matches!(
+            meta.payload,
+            Some(StreamSnapshotV2Payload::Meta(_))
+        ));
+
+        let err = rx.recv().await.unwrap().unwrap();
+        match err.payload.unwrap() {
+            StreamSnapshotV2Payload::Error(err) => {
+                assert_eq!(err.code, StreamErrorCode::Unknown as i32);
+                assert!(
+                    err.message
+                        .contains("failed to open snapshot stream source")
+                );
+            }
+            payload => panic!("expected error payload, got {payload:?}"),
         }
     }
 
@@ -882,8 +1012,11 @@ mod tests {
             index: 2,
             offset: 32,
         };
+        let file = NamedTempFile::new().unwrap();
         let snapshot = SnapshotStreamData {
-            compressed_data: vec![],
+            compressed_path: file.into_temp_path(),
+            compressed_size_bytes: 0,
+            compressed_sha256: vec![],
             position: pos.clone(),
             page_size: 4096,
         };
@@ -899,8 +1032,11 @@ mod tests {
             index: 2,
             offset: 32,
         };
+        let file = NamedTempFile::new().unwrap();
         let snapshot = SnapshotStreamData {
-            compressed_data: vec![],
+            compressed_path: file.into_temp_path(),
+            compressed_size_bytes: 0,
+            compressed_sha256: vec![],
             position: WalGenerationPos {
                 generation,
                 index: 3,

@@ -70,6 +70,7 @@ impl Display for StorageParams {
 
 /// Config for storage backend stream.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StorageStreamConfig {
     pub addr: String,
     pub remote_db_name: Option<String>,
@@ -86,6 +87,7 @@ impl Default for StorageStreamConfig {
 
 /// Config for storage backend azblob.
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StorageAzblobConfig {
     pub endpoint: String,
     pub container: String,
@@ -109,6 +111,7 @@ impl Debug for StorageAzblobConfig {
 /// Config for FTP and FTPS data source
 pub const STORAGE_FTP_DEFAULT_ENDPOINT: &str = "ftps://127.0.0.1";
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StorageFtpConfig {
     pub endpoint: String,
     pub root: String,
@@ -140,6 +143,7 @@ impl Debug for StorageFtpConfig {
 
 /// Config for storage backend fs.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StorageFsConfig {
     pub root: String,
 }
@@ -156,6 +160,7 @@ impl Default for StorageFsConfig {
 pub static STORAGE_GCS_DEFAULT_ENDPOINT: &str = "https://storage.googleapis.com";
 
 #[derive(Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct StorageGcsConfig {
     pub endpoint: String,
     pub bucket: String,
@@ -189,6 +194,7 @@ impl Debug for StorageGcsConfig {
 pub static STORAGE_S3_DEFAULT_ENDPOINT: &str = "https://s3.amazonaws.com";
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StorageS3Config {
     pub endpoint: String,
     pub region: String,

@@ -34,7 +34,6 @@ dir = "logs"
 [[database]]
 db = "primary.db"
 max_concurrent_snapshots = 4
-wal_retention_secs = 86400
 wal_retention_count = 5 
 min_checkpoint_page_number = 100
 max_checkpoint_page_number = 1000

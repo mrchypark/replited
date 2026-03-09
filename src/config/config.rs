@@ -21,7 +21,8 @@ const DEFAULT_APPLY_CHECKPOINT_FRAME_INTERVAL: u32 = 128;
 const DEFAULT_APPLY_CHECKPOINT_INTERVAL_MS: u64 = 2000;
 const DEFAULT_MAX_CONCURRENT_SNAPSHOTS: usize = 5;
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub log: LogConfig,
 
@@ -67,6 +68,7 @@ impl Config {
 
 /// Config for logging.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LogConfig {
     pub level: LogLevel,
     pub dir: String,
@@ -98,6 +100,7 @@ impl Display for LogConfig {
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DbConfig {
     // db file full path
     pub db: String,
@@ -273,6 +276,7 @@ impl DbConfig {
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StorageConfig {
     pub name: String,
     pub params: StorageParams,
@@ -493,6 +497,35 @@ mod tests {
 
         let result = config.validate();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_config_load_rejects_unknown_fields() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config_path = dir.path().join("invalid.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[log]
+level = "Info"
+dir = "/tmp"
+
+[[database]]
+db = "/tmp/test.db"
+wal_retention_secs = 60
+
+[[database.replicate]]
+name = "stream"
+[database.replicate.params]
+type = "stream"
+addr = "http://127.0.0.1:50051"
+"#,
+        )
+        .expect("write config");
+
+        let err = Config::load(config_path.to_str().expect("path"))
+            .expect_err("unknown field should fail parsing");
+        assert_eq!(err.code(), Error::PARSE_CONFIG_FAIL);
     }
 
     // ========== DbConfig Debug tests ==========

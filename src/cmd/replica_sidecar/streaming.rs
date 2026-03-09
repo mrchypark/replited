@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use log::{info, warn};
@@ -25,13 +25,19 @@ use crate::sync::stream_protocol::{
 use super::local_state::{ensure_meta_dir, persist_last_applied_lsn};
 use super::{ProcessManager, ReplicaStreamError};
 
-pub(super) async fn stream_snapshot_and_restore(
+#[derive(Debug, Clone)]
+pub(super) struct StreamedSnapshot {
+    pub compressed_path: PathBuf,
+    pub boundary_lsn: WalGenerationPos,
+}
+
+pub(super) async fn stream_snapshot_to_disk(
     client: &StreamClient,
     db_path: &str,
     db_identity: &str,
     replica_id: &str,
     session_id: &str,
-) -> Result<WalGenerationPos, ReplicaStreamError> {
+) -> Result<StreamedSnapshot, ReplicaStreamError> {
     let meta_dir = ensure_meta_dir(db_path).map_err(|e| ReplicaStreamError::Io(e.to_string()))?;
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -61,75 +67,95 @@ pub(super) async fn stream_snapshot_and_restore(
     let mut hasher = Sha256::new();
     let mut total_bytes = 0u64;
 
-    loop {
-        let response = stream
-            .message()
-            .await
-            .map_err(|e| ReplicaStreamError::Transport(e.to_string()))?;
-        let response = match response {
-            Some(response) => response,
-            None => break,
-        };
+    let result = async {
+        loop {
+            let response = stream
+                .message()
+                .await
+                .map_err(|e| ReplicaStreamError::Transport(e.to_string()))?;
+            let response = match response {
+                Some(response) => response,
+                None => break,
+            };
 
-        match response.payload {
-            Some(StreamSnapshotV2Payload::Meta(snapshot_meta)) => {
-                if meta.is_some() {
+            match response.payload {
+                Some(StreamSnapshotV2Payload::Meta(snapshot_meta)) => {
+                    if meta.is_some() {
+                        return Err(ReplicaStreamError::InvalidResponse(
+                            "snapshot meta received twice".to_string(),
+                        ));
+                    }
+                    meta = Some(snapshot_meta);
+                }
+                Some(StreamSnapshotV2Payload::Chunk(chunk)) => {
+                    if meta.is_none() {
+                        return Err(ReplicaStreamError::InvalidResponse(
+                            "snapshot chunk before meta".to_string(),
+                        ));
+                    }
+                    compressed_file
+                        .write_all(&chunk)
+                        .map_err(|e| ReplicaStreamError::Io(e.to_string()))?;
+                    hasher.update(&chunk);
+                    total_bytes += chunk.len() as u64;
+                }
+                Some(StreamSnapshotV2Payload::Error(err)) => {
+                    return Err(map_stream_error(err));
+                }
+                None => {
                     return Err(ReplicaStreamError::InvalidResponse(
-                        "snapshot meta received twice".to_string(),
+                        "snapshot response missing payload".to_string(),
                     ));
                 }
-                meta = Some(snapshot_meta);
-            }
-            Some(StreamSnapshotV2Payload::Chunk(chunk)) => {
-                if meta.is_none() {
-                    return Err(ReplicaStreamError::InvalidResponse(
-                        "snapshot chunk before meta".to_string(),
-                    ));
-                }
-                compressed_file
-                    .write_all(&chunk)
-                    .map_err(|e| ReplicaStreamError::Io(e.to_string()))?;
-                hasher.update(&chunk);
-                total_bytes += chunk.len() as u64;
-            }
-            Some(StreamSnapshotV2Payload::Error(err)) => {
-                return Err(map_stream_error(err));
-            }
-            None => {
-                return Err(ReplicaStreamError::InvalidResponse(
-                    "snapshot response missing payload".to_string(),
-                ));
             }
         }
+        compressed_file
+            .sync_all()
+            .map_err(|e| ReplicaStreamError::Io(e.to_string()))?;
+
+        let meta = meta.ok_or_else(|| {
+            ReplicaStreamError::InvalidResponse("snapshot meta missing".to_string())
+        })?;
+
+        let digest = hasher.finalize();
+        validate_snapshot_meta(&meta, total_bytes, digest.as_slice())?;
+
+        let boundary_token = meta.boundary_lsn.ok_or_else(|| {
+            ReplicaStreamError::InvalidResponse("snapshot boundary missing".to_string())
+        })?;
+        let boundary_lsn = lsn_token_to_pos(Some(boundary_token))
+            .map_err(|e| ReplicaStreamError::InvalidResponse(e.to_string()))?;
+
+        Ok(StreamedSnapshot {
+            compressed_path: compressed_path.clone(),
+            boundary_lsn,
+        })
+    }
+    .await;
+
+    if result.is_err() {
+        let _ = fs::remove_file(&compressed_path);
     }
 
-    compressed_file
-        .sync_all()
-        .map_err(|e| ReplicaStreamError::Io(e.to_string()))?;
+    result
+}
 
-    let meta = meta
-        .ok_or_else(|| ReplicaStreamError::InvalidResponse("snapshot meta missing".to_string()))?;
-
-    let digest = hasher.finalize();
-    validate_snapshot_meta(&meta, total_bytes, digest.as_slice())?;
-
-    let boundary_token = meta.boundary_lsn.ok_or_else(|| {
-        ReplicaStreamError::InvalidResponse("snapshot boundary missing".to_string())
-    })?;
-    let boundary_lsn = lsn_token_to_pos(Some(boundary_token))
-        .map_err(|e| ReplicaStreamError::InvalidResponse(e.to_string()))?;
-
+pub(super) async fn restore_streamed_snapshot(
+    db_path: &str,
+    snapshot: &StreamedSnapshot,
+) -> Result<WalGenerationPos, ReplicaStreamError> {
     let db_path_owned = db_path.to_string();
-    let compressed_path_owned = compressed_path.clone();
-    tokio::task::spawn_blocking(move || {
+    let compressed_path_owned = snapshot.compressed_path.clone();
+    let result = tokio::task::spawn_blocking(move || {
         restore_snapshot_from_compressed(&db_path_owned, &compressed_path_owned)
     })
     .await
     .map_err(|e| ReplicaStreamError::Transport(e.to_string()))?
-    .map_err(|e| ReplicaStreamError::Io(e.to_string()))?;
+    .map_err(|e| ReplicaStreamError::Io(e.to_string()));
 
-    let _ = fs::remove_file(&compressed_path);
-    Ok(boundary_lsn)
+    let _ = fs::remove_file(&snapshot.compressed_path);
+    result?;
+    Ok(snapshot.boundary_lsn.clone())
 }
 
 fn validate_snapshot_meta(

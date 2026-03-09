@@ -6,6 +6,7 @@ mod string;
 
 pub use compress::compress_buffer;
 pub use compress::compress_file;
+pub use compress::compress_path_to_path_and_hash;
 pub use compress::decompressed_data;
 pub use file::generation_dir;
 pub use file::generation_file_path;
