@@ -4,6 +4,12 @@ description: 'Prepare Rust Build Environment'
 runs:
   using: "composite"
   steps:
+    - name: Install protobuf compiler
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y protobuf-compiler
+
     - name: Setup rust related environment variables
       shell: bash
       run: |
