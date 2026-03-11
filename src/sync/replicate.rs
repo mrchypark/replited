@@ -28,6 +28,7 @@ use crate::sqlite::align_frame;
 use crate::storage::SnapshotInfo;
 use crate::storage::StorageClient;
 use crate::storage::WalSegmentInfo;
+use crate::storage::{DEFAULT_CACHE_SIZE_LIMIT_BYTES, LocalObjectCache};
 
 #[derive(Clone, Debug)]
 pub enum ReplicateCommand {
@@ -86,18 +87,35 @@ impl Replicate {
         index: usize,
         db_notifier: Sender<DbCommand>,
         info: DatabaseInfo,
+        cache_root: String,
     ) -> Result<Self> {
+        let cache = LocalObjectCache::try_create(cache_root, DEFAULT_CACHE_SIZE_LIMIT_BYTES)?;
         Ok(Self {
             db: db.clone(),
             index,
             position: Arc::new(RwLock::new(WalGenerationPos::default())),
             db_notifier,
-            client: StorageClient::try_create(db, config.clone())?,
+            client: StorageClient::try_create_with_cache(db, config.clone(), Some(cache))?,
             config,
             state: ReplicateState::WaitDbChanged,
             wait_snapshot_started_at: None,
             info,
         })
+    }
+
+    #[cfg(test)]
+    pub async fn new_for_test(
+        config: StorageConfig,
+        db: String,
+        index: usize,
+        db_notifier: Sender<DbCommand>,
+        info: DatabaseInfo,
+    ) -> Result<Self> {
+        let cache_root = std::path::Path::new(&info.meta_dir)
+            .join("cache")
+            .to_string_lossy()
+            .to_string();
+        Self::new(config, db, index, db_notifier, info, cache_root).await
     }
 
     pub fn start(s: Replicate, rx: Receiver<ReplicateCommand>) -> Result<JoinHandle<()>> {
@@ -529,7 +547,9 @@ impl Replicate {
         loop {
             let current_generation = self.position().generation.clone();
             if !current_generation.is_empty()
-                && self.maybe_request_manifest_rollover(&current_generation).await?
+                && self
+                    .maybe_request_manifest_rollover(&current_generation)
+                    .await?
             {
                 return Ok(());
             }
@@ -548,8 +568,8 @@ impl Replicate {
 mod tests {
     use std::time::Duration;
 
-    use super::snapshot_position_is_newer;
     use super::ReplicateCommand;
+    use super::snapshot_position_is_newer;
 
     #[test]
     fn snapshot_position_prefers_later_offset_when_index_matches() {
@@ -608,7 +628,13 @@ mod tests {
                 };
 
                 let replicate =
-                    super::Replicate::new(storage_cfg, "data.db".to_string(), 0, db_notifier, info)
+                    super::Replicate::new_for_test(
+                        storage_cfg,
+                        "data.db".to_string(),
+                        0,
+                        db_notifier,
+                        info,
+                    )
                         .await
                         .expect("create replicate");
 
@@ -653,15 +679,10 @@ mod tests {
             meta_dir: temp.path().to_string_lossy().to_string(),
             page_size: 4096,
         };
-        let replicate = super::Replicate::new(
-            storage_cfg,
-            "data.db".to_string(),
-            0,
-            db_notifier,
-            info,
-        )
-        .await
-        .expect("create replicate");
+        let replicate =
+            super::Replicate::new_for_test(storage_cfg, "data.db".to_string(), 0, db_notifier, info)
+                .await
+                .expect("create replicate");
 
         let snapshot_pos = WalGenerationPos {
             generation: generation.clone(),
@@ -698,20 +719,28 @@ mod tests {
             .await
             .expect("publish wal pack");
 
-        let (_generation_id, _manifest_id, _lineage_id, _base_snapshot_id, _base_snapshot_sha256, _base_snapshot, wal_packs) =
-            replicate
-                .client
-                .read_manifest_restore_inputs()
-                .await
-                .expect("read manifest restore inputs")
-                .expect("manifest restore inputs");
+        let (
+            _generation_id,
+            _manifest_id,
+            _lineage_id,
+            _base_snapshot_id,
+            _base_snapshot_sha256,
+            _base_snapshot,
+            wal_packs,
+        ) = replicate
+            .client
+            .read_manifest_restore_inputs()
+            .await
+            .expect("read manifest restore inputs")
+            .expect("manifest restore inputs");
         assert_eq!(wal_packs.len(), 1);
         assert_eq!(wal_packs[0].0, snapshot_pos.offset);
         assert_eq!(wal_packs[0].1, snapshot_pos.offset + pack_data.len() as u64);
     }
 
     #[tokio::test]
-    async fn calculate_generation_position_uses_zero_offset_for_manifest_snapshot_when_no_wal_exists() {
+    async fn calculate_generation_position_uses_zero_offset_for_manifest_snapshot_when_no_wal_exists()
+     {
         use tempfile::tempdir;
         use tokio::sync::mpsc;
 
@@ -734,15 +763,10 @@ mod tests {
             meta_dir: temp.path().to_string_lossy().to_string(),
             page_size: 4096,
         };
-        let replicate = super::Replicate::new(
-            storage_cfg,
-            "data.db".to_string(),
-            0,
-            db_notifier,
-            info,
-        )
-        .await
-        .expect("create replicate");
+        let replicate =
+            super::Replicate::new_for_test(storage_cfg, "data.db".to_string(), 0, db_notifier, info)
+                .await
+                .expect("create replicate");
 
         let snapshot_pos = WalGenerationPos {
             generation: generation.clone(),
@@ -777,8 +801,6 @@ mod tests {
         use crate::base::compress_buffer;
         use crate::config::{StorageConfig, StorageFsConfig, StorageParams};
         use crate::database::{DatabaseInfo, WalGenerationPos};
-        use crate::error::Error;
-
         let temp = tempdir().expect("tempdir");
         let storage_root = temp.path().join("storage");
         let storage_cfg = StorageConfig {
@@ -793,15 +815,10 @@ mod tests {
             meta_dir: temp.path().to_string_lossy().to_string(),
             page_size: 4096,
         };
-        let replicate = super::Replicate::new(
-            storage_cfg,
-            "data.db".to_string(),
-            0,
-            db_notifier,
-            info,
-        )
-        .await
-        .expect("create replicate");
+        let replicate =
+            super::Replicate::new_for_test(storage_cfg, "data.db".to_string(), 0, db_notifier, info)
+                .await
+                .expect("create replicate");
 
         let snapshot_pos = WalGenerationPos {
             generation: generation.clone(),
@@ -848,15 +865,10 @@ mod tests {
             meta_dir: temp.path().to_string_lossy().to_string(),
             page_size: 4096,
         };
-        let replicate = super::Replicate::new(
-            storage_cfg,
-            "data.db".to_string(),
-            0,
-            db_notifier,
-            info,
-        )
-        .await
-        .expect("create replicate");
+        let replicate =
+            super::Replicate::new_for_test(storage_cfg, "data.db".to_string(), 0, db_notifier, info)
+                .await
+                .expect("create replicate");
 
         replicate
             .client
@@ -890,13 +902,20 @@ mod tests {
             .await
             .expect("oversize wal pack should split");
 
-        let (_generation_id, _manifest_id, _lineage_id, _base_snapshot_id, _base_snapshot_sha256, _base_snapshot, wal_packs) =
-            replicate
-                .client
-                .read_manifest_restore_inputs()
-                .await
-                .expect("read manifest restore inputs")
-                .expect("manifest metadata");
+        let (
+            _generation_id,
+            _manifest_id,
+            _lineage_id,
+            _base_snapshot_id,
+            _base_snapshot_sha256,
+            _base_snapshot,
+            wal_packs,
+        ) = replicate
+            .client
+            .read_manifest_restore_inputs()
+            .await
+            .expect("read manifest restore inputs")
+            .expect("manifest metadata");
         assert_eq!(wal_packs.len(), 2);
         assert_eq!(wal_packs[0].0, 0);
         assert_eq!(
@@ -984,15 +1003,10 @@ mod tests {
             meta_dir: temp.path().to_string_lossy().to_string(),
             page_size: 4096,
         };
-        let mut replicate = super::Replicate::new(
-            storage_cfg,
-            "data.db".to_string(),
-            0,
-            db_notifier,
-            info,
-        )
-        .await
-        .expect("create replicate");
+        let mut replicate =
+            super::Replicate::new_for_test(storage_cfg, "data.db".to_string(), 0, db_notifier, info)
+                .await
+                .expect("create replicate");
         replicate.state = super::ReplicateState::WaitSnapshot;
         replicate.wait_snapshot_started_at = Some(
             std::time::Instant::now()
@@ -1036,15 +1050,10 @@ mod tests {
             meta_dir: temp.path().to_string_lossy().to_string(),
             page_size: 4096,
         };
-        let replicate = super::Replicate::new(
-            storage_cfg,
-            "data.db".to_string(),
-            0,
-            db_notifier,
-            info,
-        )
-        .await
-        .expect("create replicate");
+        let replicate =
+            super::Replicate::new_for_test(storage_cfg, "data.db".to_string(), 0, db_notifier, info)
+                .await
+                .expect("create replicate");
 
         replicate
             .client
@@ -1077,16 +1086,27 @@ mod tests {
             .await
             .expect("publish wal pack");
 
-        let (_generation_id, _manifest_id, _lineage_id, _base_snapshot_id, _base_snapshot_sha256, _base_snapshot, wal_packs) =
-            replicate
-                .client
-                .read_manifest_restore_inputs()
-                .await
-                .expect("read manifest restore inputs")
-                .expect("manifest metadata");
+        let (
+            _generation_id,
+            _manifest_id,
+            _lineage_id,
+            _base_snapshot_id,
+            _base_snapshot_sha256,
+            _base_snapshot,
+            wal_packs,
+        ) = replicate
+            .client
+            .read_manifest_restore_inputs()
+            .await
+            .expect("read manifest restore inputs")
+            .expect("manifest metadata");
         assert_eq!(wal_packs.len(), 1);
         assert!(wal_packs[0].2.contains("/ranges/"));
-        assert!(wal_packs[0].2.contains("0000000001_0000004096_0000000001_0000008192"));
+        assert!(
+            wal_packs[0]
+                .2
+                .contains("0000000001_0000004096_0000000001_0000008192")
+        );
     }
 
     #[tokio::test]
@@ -1107,7 +1127,7 @@ mod tests {
                 .to_string(),
             page_size: 4096,
         };
-        let mut replicate = super::Replicate::new(
+        let mut replicate = super::Replicate::new_for_test(
             StorageConfig {
                 name: "ftp".to_string(),
                 params: StorageParams::Ftp(Box::new(StorageFtpConfig::default())),
@@ -1155,7 +1175,7 @@ mod tests {
                 .to_string(),
             page_size: 4096,
         };
-        let mut replicate = super::Replicate::new(
+        let mut replicate = super::Replicate::new_for_test(
             StorageConfig {
                 name: "ftp".to_string(),
                 params: StorageParams::Ftp(Box::new(StorageFtpConfig::default())),
@@ -1198,8 +1218,6 @@ mod tests {
         use crate::base::compress_buffer;
         use crate::config::{StorageConfig, StorageFsConfig, StorageParams};
         use crate::database::{DatabaseInfo, WalGenerationPos};
-        use crate::error::Error;
-
         let temp = tempdir().expect("tempdir");
         let storage_root = temp.path().join("storage");
         let storage_cfg = StorageConfig {
@@ -1213,7 +1231,7 @@ mod tests {
             meta_dir: temp.path().to_string_lossy().to_string(),
             page_size: 4096,
         };
-        let replicate = super::Replicate::new(
+        let replicate = super::Replicate::new_for_test(
             storage_cfg.clone(),
             "data.db".to_string(),
             0,
@@ -1224,8 +1242,9 @@ mod tests {
         .expect("create replicate");
 
         let generation = Generation::new();
-        let setup_client = crate::storage::StorageClient::try_create("data.db".to_string(), storage_cfg)
-            .expect("storage client");
+        let setup_client =
+            crate::storage::StorageClient::try_create("data.db".to_string(), storage_cfg)
+                .expect("storage client");
         setup_client
             .write_snapshot(
                 &WalGenerationPos {
@@ -1273,7 +1292,7 @@ mod tests {
                 .to_string(),
             page_size: 4096,
         };
-        let replicate = super::Replicate::new(
+        let replicate = super::Replicate::new_for_test(
             StorageConfig {
                 name: "ftp".to_string(),
                 params: StorageParams::Ftp(Box::new(StorageFtpConfig::default())),
@@ -1331,15 +1350,16 @@ mod tests {
             meta_dir: temp.path().to_string_lossy().to_string(),
             page_size: 4096,
         };
-        let mut replicate = super::Replicate::new(
-            storage_cfg,
-            "data.db".to_string(),
-            0,
-            db_notifier,
-            info,
-        )
-        .await
-        .expect("create replicate");
+        let mut replicate =
+            super::Replicate::new_for_test(
+                storage_cfg,
+                "data.db".to_string(),
+                0,
+                db_notifier,
+                info,
+            )
+                .await
+                .expect("create replicate");
 
         let err = replicate
             .command(ReplicateCommand::Snapshot((
@@ -1390,15 +1410,16 @@ mod tests {
             meta_dir: temp.path().to_string_lossy().to_string(),
             page_size: 4096,
         };
-        let mut replicate = super::Replicate::new(
-            storage_cfg,
-            "data.db".to_string(),
-            0,
-            db_notifier,
-            info,
-        )
-        .await
-        .expect("create replicate");
+        let mut replicate =
+            super::Replicate::new_for_test(
+                storage_cfg,
+                "data.db".to_string(),
+                0,
+                db_notifier,
+                info,
+            )
+                .await
+                .expect("create replicate");
 
         replicate
             .client
@@ -1475,15 +1496,16 @@ mod tests {
             meta_dir: temp.path().to_string_lossy().to_string(),
             page_size: 4096,
         };
-        let mut replicate = super::Replicate::new(
-            storage_cfg,
-            "data.db".to_string(),
-            0,
-            db_notifier,
-            info,
-        )
-        .await
-        .expect("create replicate");
+        let mut replicate =
+            super::Replicate::new_for_test(
+                storage_cfg,
+                "data.db".to_string(),
+                0,
+                db_notifier,
+                info,
+            )
+                .await
+                .expect("create replicate");
 
         replicate
             .client
@@ -1545,13 +1567,20 @@ mod tests {
             .await
             .expect("publish rollover snapshot");
 
-        let (generation_id, _manifest_id, _lineage_id, _base_snapshot_id, _base_snapshot_sha256, _base_snapshot, _wal_packs) =
-            replicate
-                .client
-                .read_manifest_restore_inputs()
-                .await
-                .expect("read manifest restore inputs")
-                .expect("manifest metadata");
+        let (
+            generation_id,
+            _manifest_id,
+            _lineage_id,
+            _base_snapshot_id,
+            _base_snapshot_sha256,
+            _base_snapshot,
+            _wal_packs,
+        ) = replicate
+            .client
+            .read_manifest_restore_inputs()
+            .await
+            .expect("read manifest restore inputs")
+            .expect("manifest metadata");
         assert_eq!(generation_id, newer_generation.as_str());
     }
 }

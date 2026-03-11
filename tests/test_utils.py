@@ -39,6 +39,7 @@ class TestEnv:
         self.replica_db = self.replica_cwd / "primary.db"
         self.logs_dir = self.root / "logs"
         self.backup_dir = self.root / "backup"
+        self.cache_dir = self.root / "cache"
         self.config_dir = self.root / "config"
         
         # Paths for config files
@@ -61,6 +62,7 @@ class TestEnv:
         self.root.mkdir(parents=True, exist_ok=True)
         self.logs_dir.mkdir(exist_ok=True)
         self.backup_dir.mkdir(exist_ok=True)
+        self.cache_dir.mkdir(exist_ok=True)
         self.config_dir.mkdir(exist_ok=True)
         self.replica_cwd.mkdir(exist_ok=True)
         # Also create logs dir for replica
@@ -128,7 +130,7 @@ def cleanup():
             print(f"cleanup: failed to remove {name}: {e}")
 
     # Common directories created by battle scripts.
-    for name in ["logs", "backup", "replica_cwd"]:
+    for name in ["logs", "backup", "cache", "replica_cwd"]:
         path = cwd / name
         if path.is_dir():
             try:

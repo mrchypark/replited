@@ -60,12 +60,21 @@ pub fn init_azblob_operator(cfg: &StorageAzblobConfig) -> Result<impl Builder> {
 
 /// init_gcs_operator will init a opendal gcs operator.
 fn init_gcs_operator(cfg: &StorageGcsConfig) -> Result<impl Builder> {
-    let builder = services::Gcs::default()
+    let mut builder = services::Gcs::default()
         .endpoint(&cfg.endpoint)
         .bucket(&cfg.bucket)
         .root(&cfg.root)
-        .credential(&cfg.credential)
         .http_client(new_storage_http_client()?);
+
+    if !cfg.credential.is_empty() {
+        builder = builder.credential(&cfg.credential);
+    }
+    if cfg.allow_anonymous {
+        builder = builder.allow_anonymous();
+    }
+    if cfg.disable_vm_metadata {
+        builder = builder.disable_vm_metadata();
+    }
 
     Ok(builder)
 }

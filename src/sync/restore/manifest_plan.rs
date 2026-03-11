@@ -35,12 +35,14 @@ pub(crate) struct ManifestRestoreWalObject {
     pub(crate) offset: u64,
     pub(crate) end_offset: u64,
     pub(crate) object_key: String,
+    pub(crate) sha256: String,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct ManifestRestorePlan {
     pub(crate) snapshot: SnapshotInfo,
     pub(crate) snapshot_key: String,
+    pub(crate) snapshot_sha256: String,
     pub(crate) wal_objects: Vec<ManifestRestoreWalObject>,
 }
 
@@ -67,6 +69,7 @@ pub(crate) fn plan_manifest_restore(input: &ManifestPlannerInput) -> Result<Mani
         return Ok(ManifestRestorePlan {
             snapshot,
             snapshot_key: input.base_snapshot.clone(),
+            snapshot_sha256: input.base_snapshot_sha256.clone(),
             wal_objects: vec![],
         });
     }
@@ -159,6 +162,7 @@ pub(crate) fn plan_manifest_restore(input: &ManifestPlannerInput) -> Result<Mani
             offset,
             end_offset: pack.end_lsn,
             object_key: pack.object_key,
+            sha256: pack.sha256,
         });
         expected_index = index;
         expected_offset = pack.end_lsn;
@@ -183,13 +187,14 @@ pub(crate) fn plan_manifest_restore(input: &ManifestPlannerInput) -> Result<Mani
     Ok(ManifestRestorePlan {
         snapshot,
         snapshot_key: input.base_snapshot.clone(),
+        snapshot_sha256: input.base_snapshot_sha256.clone(),
         wal_objects,
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{plan_manifest_restore, ManifestPlannerInput, ManifestPlannerWalPack};
+    use super::{ManifestPlannerInput, ManifestPlannerWalPack, plan_manifest_restore};
     use crate::error::Error;
 
     fn sample_input() -> ManifestPlannerInput {
@@ -301,7 +306,7 @@ mod tests {
             },
         ];
 
-        let plan = plan_manifest_restore(&input).expect("manifest plan");
+        let _plan = plan_manifest_restore(&input).expect("manifest plan");
     }
 
     #[test]

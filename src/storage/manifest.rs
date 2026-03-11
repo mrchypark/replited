@@ -55,7 +55,10 @@ mod tests {
 
         assert_eq!(decoded.current_generation, pointer.current_generation);
         assert_eq!(decoded.current_manifest_key, pointer.current_manifest_key);
-        assert_eq!(decoded.current_manifest_sha256, pointer.current_manifest_sha256);
+        assert_eq!(
+            decoded.current_manifest_sha256,
+            pointer.current_manifest_sha256
+        );
     }
 
     #[test]

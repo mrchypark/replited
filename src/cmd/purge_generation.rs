@@ -57,11 +57,13 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::base::compress_buffer;
     use crate::base::Generation;
-    use crate::config::{DbConfig, LogConfig, LogLevel, StorageConfig, StorageFsConfig, StorageParams};
+    use crate::base::compress_buffer;
     use crate::config::StorageFtpConfig;
     use crate::config::StorageStreamConfig;
+    use crate::config::{
+        DbConfig, LogConfig, LogLevel, StorageConfig, StorageFsConfig, StorageParams,
+    };
     use crate::database::WalGenerationPos;
 
     fn sample_config(db: &str, roots: &[String]) -> Config {
@@ -77,11 +79,10 @@ mod tests {
                     .enumerate()
                     .map(|(idx, root)| StorageConfig {
                         name: format!("fs-{idx}"),
-                        params: StorageParams::Fs(Box::new(StorageFsConfig {
-                            root: root.clone(),
-                        })),
+                        params: StorageParams::Fs(Box::new(StorageFsConfig { root: root.clone() })),
                     })
                     .collect(),
+                cache_root: None,
                 min_checkpoint_page_number: 1000,
                 max_checkpoint_page_number: 10000,
                 truncate_page_number: 500000,
@@ -133,7 +134,8 @@ mod tests {
         let new_generation = Generation::new();
 
         for root in [&root_a, &root_b] {
-            let client = publish_generation(root.to_string_lossy().as_ref(), db, &old_generation).await;
+            let client =
+                publish_generation(root.to_string_lossy().as_ref(), db, &old_generation).await;
             client
                 .publish_manifest_snapshot(
                     &WalGenerationPos {
@@ -182,7 +184,8 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         let new_generation = Generation::new();
 
-        let client_a = publish_generation(root_a.to_string_lossy().as_ref(), db, &old_generation).await;
+        let client_a =
+            publish_generation(root_a.to_string_lossy().as_ref(), db, &old_generation).await;
         client_a
             .publish_manifest_snapshot(
                 &WalGenerationPos {
@@ -194,7 +197,8 @@ mod tests {
             )
             .await
             .expect("publish new snapshot");
-        let client_b = publish_generation(root_b.to_string_lossy().as_ref(), db, &new_generation).await;
+        let client_b =
+            publish_generation(root_b.to_string_lossy().as_ref(), db, &new_generation).await;
         drop(client_b);
 
         let mut cmd = PurgeGeneration {
@@ -211,7 +215,10 @@ mod tests {
             },
         };
 
-        let err = cmd.run().await.expect_err("second supported target should fail");
+        let err = cmd
+            .run()
+            .await
+            .expect_err("second supported target should fail");
         assert_eq!(err.code(), Error::STORAGE_ERROR);
     }
 
@@ -257,6 +264,7 @@ mod tests {
                             params: StorageParams::Ftp(Box::new(StorageFtpConfig::default())),
                         },
                     ],
+                    cache_root: None,
                     min_checkpoint_page_number: 1000,
                     max_checkpoint_page_number: 10000,
                     truncate_page_number: 500000,
@@ -323,6 +331,7 @@ mod tests {
                             params: StorageParams::Stream(Box::new(StorageStreamConfig::default())),
                         },
                     ],
+                    cache_root: None,
                     min_checkpoint_page_number: 1000,
                     max_checkpoint_page_number: 10000,
                     truncate_page_number: 500000,

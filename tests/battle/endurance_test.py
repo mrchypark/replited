@@ -46,7 +46,7 @@ def cleanup():
               "replica.db", "replica.db-wal", "replica.db-shm"]:
         if os.path.exists(f):
             os.remove(f)
-    for d in [".primary.db-replited", ".replica.db-replited", "logs", "backup", "replica_cwd"]:
+    for d in [".primary.db-replited", ".replica.db-replited", "logs", "backup", "cache", "replica_cwd"]:
         if os.path.exists(d):
             shutil.rmtree(d)
     os.makedirs("logs", exist_ok=True)
@@ -138,6 +138,7 @@ dir = "logs"
 
 [[database]]
 db = "replica.db"
+cache_root = "cache"
 min_checkpoint_page_number = 100
 max_checkpoint_page_number = 1000
 truncate_page_number = 50000

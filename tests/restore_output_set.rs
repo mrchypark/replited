@@ -214,6 +214,7 @@ async fn restore_outputs_db_wal_shm_set_and_reads_latest_rows() {
     let config = DbConfig {
         db: "db.db".to_string(),
         replicate: vec![storage_config],
+        cache_root: None,
         min_checkpoint_page_number: 1000,
         max_checkpoint_page_number: 10000,
         truncate_page_number: 500000,
@@ -230,6 +231,7 @@ async fn restore_outputs_db_wal_shm_set_and_reads_latest_rows() {
         follow: false,
         interval: 1,
         timestamp: String::new(),
+        truth_source: String::new(),
     };
 
     let deadline = Instant::now() + Duration::from_secs(5);

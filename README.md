@@ -20,29 +20,29 @@
 ## Introduction
 
 Inspired by [Litestream](https://litestream.io/) and built in [Rust](https://www.rust-lang.org/), replited provides:
-- manifest-backed archival replication to `fs`
+- manifest-backed archival replication with cache-first restore for `fs`, reference `s3`, and parity backends `gcs` / `azblob`
 - stream replication between a Primary and read-only replicas
 
 ## Why replited
 * Using sqlite's [WAL](https://sqlite.org/wal.html) mechanism, instead of backing up full data every time, do incremental backup of data to reduce the amount of synchronised data;
 * Support for two distinct replication lanes:
-  * archival replication to local file system storage (`fs`)
+  * manifest-first archival replication with local fs cache/spool plus `fs` or reference `s3` object storage
   * low-latency stream replication over gRPC
 
 ## Support Backend
 
 | Lane | Supported backend |
 | --- | --- |
-| Archival replication | `fs` ![CI](https://github.com/mrchypark/replited/actions/workflows/fs_integration_test.yml/badge.svg) |
+| Archival replication | `fs` ![CI](https://github.com/mrchypark/replited/actions/workflows/fs_integration_test.yml/badge.svg), reference `s3` ![CI](https://github.com/mrchypark/replited/actions/workflows/s3_integration_test.yml/badge.svg), parity `gcs`, parity `azb` |
 | Stream replication | `stream` |
 
-Archival restore/publish is manifest-only in this breaking cut. Legacy archival compatibility backends such as `ftp`, `s3`, `gcs`, and `azblob` are not supported in the runtime path.
+Archival publish/restore is manifest-first in this breaking cut. Restore resolves snapshot objects and WAL packs through the local fs cache first, then falls back to the configured archival backend on cache miss. `fs` is the fast canonical archival path, `s3` is the reference object backend validated in CI and locally against MinIO, and `gcs` / `azb` follow the same runtime model with emulator workflows.
 
 
 
 ## Quick Start
 
-Start a daemon to replicate sqlite to archival `fs` storage:
+Start a daemon to replicate sqlite to archival storage:
 
 ```shell
 replited --config {config file} replicate 
@@ -59,9 +59,14 @@ replited --config {config file} restore --db {db in config file} --output {outpu
 See [config.md](./config.md)
 
 Archival support in the current breaking cut:
-- `type = "fs"` for manifest-backed archival publish/restore
+- `type = "fs"` for the fast canonical manifest-backed archival path
+- `type = "s3"` for the reference object-store archival path validated in CI
+- `type = "gcs"` for GCS-style object archival; emulator configs must set `allow_anonymous = true` and `disable_vm_metadata = true`
+- `type = "azb"` for Azure Blob archival
 - `type = "stream"` for Primary/Replica streaming
-- other archival backends are intentionally unsupported in runtime
+- `cache_root` controls the local fs cache/spool used by manifest-first, cache-first restore; if omitted it defaults under the database metadata directory
+- the archival cache root must differ from an `fs` archival target root
+- `ftp` remains outside the supported runtime scope
 See stream-specific docs:
 - [Streaming Copy Config Guide](./docs/stream-copy-config.md)
 - [Replica Sidecar Config Guide](./docs/sidecar-config.md)

@@ -21,8 +21,9 @@ pub fn command(arg: Arg) -> Result<Box<dyn Command>> {
             exec.clone(),
         )?)),
         ArgCommand::Restore(options) => Ok(Restore::try_create(&arg.config, options.clone())?),
-        ArgCommand::PurgeGeneration(options) => {
-            Ok(super::PurgeGeneration::try_create(&arg.config, options.clone())?)
-        }
+        ArgCommand::PurgeGeneration(options) => Ok(super::PurgeGeneration::try_create(
+            &arg.config,
+            options.clone(),
+        )?),
     }
 }

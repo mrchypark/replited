@@ -11,34 +11,38 @@ use log::warn;
 use rusqlite::Connection;
 use tempfile::NamedTempFile;
 
+use crate::base::decompressed_data;
 use crate::base::parent_dir;
 use crate::config::DbConfig;
 use crate::config::RestoreOptions;
 use crate::config::StorageConfig;
-use crate::base::decompressed_data;
 use crate::error::Error;
 use crate::error::Result;
+use crate::sqlite::{WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE, WALHeader};
 use crate::storage::RestoreRequestCostSnapshot;
 use crate::storage::RestoreRequestCostStats;
-use crate::sqlite::{WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE, WALHeader};
+use crate::storage::DEFAULT_CACHE_SIZE_LIMIT_BYTES;
+use crate::storage::LocalObjectCache;
 use crate::storage::StorageClient;
 
 mod follow;
 mod manifest_plan;
 use manifest_plan::{
-    plan_manifest_restore, ManifestPlannerInput, ManifestPlannerWalPack, ManifestRestoreWalObject,
+    ManifestPlannerInput, ManifestPlannerWalPack, ManifestRestoreWalObject, plan_manifest_restore,
 };
 
 struct Restore {
     db: String,
     config: Vec<StorageConfig>,
     options: RestoreOptions,
+    cache: Option<LocalObjectCache>,
 }
 
 #[derive(Debug, Clone)]
 struct DiscoveredRestorePlan {
     snapshot: crate::storage::SnapshotInfo,
     snapshot_key: String,
+    snapshot_sha256: String,
     wal_objects: Vec<ManifestRestoreWalObject>,
 }
 
@@ -83,11 +87,14 @@ fn format_restore_request_cost_summary(
     request_costs: RestoreRequestCostSnapshot,
 ) -> String {
     format!(
-        "restore_request_cost path={path} latest_pointer_gets={} generation_manifest_gets={} object_gets={} list_calls={}",
+        "restore_request_cost path={path} latest_pointer_gets={} generation_manifest_gets={} object_gets={} list_calls={} cache_hits={} cache_misses={} cache_write_failures={}",
         request_costs.latest_pointer_gets,
         request_costs.generation_manifest_gets,
         request_costs.object_gets,
         request_costs.list_calls,
+        request_costs.cache_hits,
+        request_costs.cache_misses,
+        request_costs.cache_write_failures,
     )
 }
 
@@ -153,6 +160,7 @@ impl ManifestRestoreSource for StorageManifestRestoreSource {
         Ok(Some(DiscoveredRestorePlan {
             snapshot: plan.snapshot,
             snapshot_key: plan.snapshot_key,
+            snapshot_sha256: plan.snapshot_sha256,
             wal_objects: plan.wal_objects,
         }))
     }
@@ -163,15 +171,27 @@ impl Restore {
         db: String,
         config: Vec<StorageConfig>,
         options: RestoreOptions,
+        cache_root: Option<String>,
     ) -> Result<Self> {
+        let cache = match cache_root {
+            Some(root) => Some(LocalObjectCache::try_create(
+                root,
+                DEFAULT_CACHE_SIZE_LIMIT_BYTES,
+            )?),
+            None => None,
+        };
         Ok(Self {
             db,
             config,
             options,
+            cache,
         })
     }
 
-    async fn decide_restore_plan(&self, limit: Option<DateTime<Utc>>) -> Result<SelectedRestorePlan> {
+    async fn decide_restore_plan(
+        &self,
+        limit: Option<DateTime<Utc>>,
+    ) -> Result<SelectedRestorePlan> {
         self.decide_restore_plan_with_request_costs(limit, RestoreRequestCostStats::default())
             .await
     }
@@ -198,8 +218,14 @@ impl Restore {
         }
 
         let mut latest_manifest_plan: Option<SelectedRestorePlan> = None;
+        let configured_truth_source = self.options.truth_source.trim();
+        let mut matched_truth_source = configured_truth_source.is_empty();
 
         for config in &self.config {
+            if !configured_truth_source.is_empty() && config.name != configured_truth_source {
+                continue;
+            }
+            matched_truth_source = true;
             let plan = match manifest_source
                 .discover_manifest_restore_plan(&self.db, config, request_costs.clone())
                 .await?
@@ -209,11 +235,11 @@ impl Restore {
             };
 
             match &latest_manifest_plan {
-                Some(current)
-                    if plan.snapshot.generation < current.plan.snapshot.generation => {}
+                Some(current) if plan.snapshot.generation < current.plan.snapshot.generation => {}
                 Some(current)
                     if plan.snapshot.generation == current.plan.snapshot.generation
-                        && restore_plan_progress(&plan) <= restore_plan_progress(&current.plan) => {}
+                        && restore_plan_progress(&plan) <= restore_plan_progress(&current.plan) => {
+                }
                 _ => {
                     latest_manifest_plan = Some(SelectedRestorePlan {
                         storage_config: config.clone(),
@@ -221,6 +247,13 @@ impl Restore {
                     })
                 }
             }
+        }
+
+        if !matched_truth_source {
+            return Err(Error::InvalidArg(format!(
+                "truth source {configured_truth_source:?} not found for db {}",
+                self.db
+            )));
         }
 
         latest_manifest_plan.ok_or_else(|| Error::NoSnapshotError(self.db.clone()))
@@ -247,9 +280,10 @@ impl Restore {
             .decide_restore_plan_with_request_costs(limit, request_costs.clone())
             .await?;
         let latest_restore_plan = selected_restore_plan.plan;
-        let client = StorageClient::try_create_with_restore_request_costs(
+        let client = StorageClient::try_create_with_cache_and_restore_request_costs(
             self.db.clone(),
             selected_restore_plan.storage_config,
+            self.cache.clone(),
             request_costs.clone(),
         )?;
 
@@ -329,8 +363,25 @@ impl Restore {
         }
 
         if !resume {
-            self.restore_snapshot_from_key(&client, &latest_restore_plan.snapshot_key, &target_path)
-                .await?;
+            if let Some(cache) = &self.cache {
+                let pinned = std::iter::once(latest_restore_plan.snapshot_key.clone())
+                    .chain(
+                        latest_restore_plan
+                            .wal_objects
+                            .iter()
+                            .map(|wal| wal.object_key.clone()),
+                    )
+                    .collect::<Vec<_>>();
+                cache.set_pinned_keys(pinned);
+            }
+
+            self.restore_snapshot_from_key(
+                &client,
+                &latest_restore_plan.snapshot_key,
+                &latest_restore_plan.snapshot_sha256,
+                &target_path,
+            )
+            .await?;
         }
 
         // apply wal frames
@@ -404,15 +455,21 @@ impl Restore {
         if self.options.follow {
             drop(_keepalive_connection);
             self.follow_loop(
-                client,
                 latest_restore_plan.snapshot,
                 last_index,
                 last_offset,
             )
             .await?;
+            if let Some(cache) = &self.cache {
+                cache.clear_pinned_keys();
+            }
 
             // follow mode does not return a position (it keeps running)
             return Ok(None);
+        }
+
+        if let Some(cache) = &self.cache {
+            cache.clear_pinned_keys();
         }
 
         let pos = crate::database::WalGenerationPos {
@@ -428,9 +485,12 @@ impl Restore {
         &self,
         client: &StorageClient,
         snapshot_key: &str,
+        snapshot_sha256: &str,
         path: &str,
     ) -> Result<()> {
-        let compressed_data = client.read_object_by_key(snapshot_key).await?;
+        let compressed_data = client
+            .read_object_by_key_checked(snapshot_key, Some(snapshot_sha256))
+            .await?;
         let decompressed_data = decompressed_data(compressed_data)?;
         debug!(
             "restore_snapshot_from_key: decompressed data size: {}",
@@ -487,7 +547,9 @@ impl Restore {
                 continue;
             }
 
-            let compressed_data = client.read_object_by_key(&wal_object.object_key).await?;
+            let compressed_data = client
+                .read_object_by_key_checked(&wal_object.object_key, Some(&wal_object.sha256))
+                .await?;
             let data = decompressed_data(compressed_data)?;
             let should_truncate = wal_object.index > last_index;
 
@@ -549,8 +611,12 @@ pub async fn run_restore(
     config: &DbConfig,
     options: &RestoreOptions,
 ) -> Result<Option<crate::database::WalGenerationPos>> {
-    let restore =
-        Restore::try_create(config.db.clone(), config.replicate.clone(), options.clone())?;
+    let restore = Restore::try_create(
+        config.db.clone(),
+        config.replicate.clone(),
+        options.clone(),
+        Some(config.cache_root_path()?),
+    )?;
 
     restore.run().await
 }
@@ -562,12 +628,12 @@ mod tests {
     use async_trait::async_trait;
     use chrono::Utc;
 
-    use super::{
-        output_parent_dir, parse_limit_timestamp, format_restore_request_cost_summary,
-        restore_plan_progress, resume_position_from_local_wal, DiscoveredRestorePlan, Restore,
-        ManifestRestoreSource, SelectedRestorePlan,
-    };
     use super::manifest_plan::ManifestRestoreWalObject;
+    use super::{
+        DiscoveredRestorePlan, ManifestRestoreSource, Restore, SelectedRestorePlan,
+        format_restore_request_cost_summary, output_parent_dir, parse_limit_timestamp,
+        restore_plan_progress, resume_position_from_local_wal,
+    };
     use crate::base::Generation;
     use crate::config::RestoreOptions;
     use crate::config::StorageConfig;
@@ -644,12 +710,15 @@ mod tests {
     ) -> DiscoveredRestorePlan {
         let wal_objects = wal_objects
             .into_iter()
-            .map(|(index, offset, end_offset, object_key)| ManifestRestoreWalObject {
-                index,
-                offset,
-                end_offset,
-                object_key,
-            })
+            .map(
+                |(index, offset, end_offset, object_key)| ManifestRestoreWalObject {
+                    index,
+                    offset,
+                    end_offset,
+                    object_key,
+                    sha256: format!("sha-{index}-{offset}"),
+                },
+            )
             .collect::<Vec<_>>();
         DiscoveredRestorePlan {
             snapshot: SnapshotInfo {
@@ -660,17 +729,22 @@ mod tests {
                 created_at: Utc::now(),
             },
             snapshot_key: "db.db/generations/019c3e53aea47afbbddfe5ebc2272e22/snapshots/0000000001_0000000000.snapshot.zst".to_string(),
+            snapshot_sha256: "snapshot-sha".to_string(),
             wal_objects,
         }
     }
 
-    fn sample_storage_config(root: &str) -> StorageConfig {
+    fn named_storage_config(name: &str, root: &str) -> StorageConfig {
         StorageConfig {
-            name: "fs".to_string(),
+            name: name.to_string(),
             params: StorageParams::Fs(Box::new(StorageFsConfig {
                 root: root.to_string(),
             })),
         }
+    }
+
+    fn sample_storage_config(root: &str) -> StorageConfig {
+        named_storage_config("fs", root)
     }
 
     fn sample_restore() -> Restore {
@@ -690,7 +764,9 @@ mod tests {
                 follow: false,
                 interval: 1,
                 timestamp: timestamp.to_string(),
+                truth_source: String::new(),
             },
+            None,
         )
         .expect("restore")
     }
@@ -854,7 +930,7 @@ mod tests {
             storage_config: sample_storage_config("/tmp/replited-a"),
             plan: DiscoveredRestorePlan {
                 snapshot: SnapshotInfo {
-                generation: Generation::try_create(
+                    generation: Generation::try_create(
                         "019c3e53aea47afbbddfe5ebc2272e22",
                     )
                     .expect("generation"),
@@ -864,18 +940,24 @@ mod tests {
                     created_at: Utc::now(),
                 },
                 snapshot_key: "db.db/generations/019c3e53aea47afbbddfe5ebc2272e22/snapshots/0000000007_0000000000.snapshot.zst".to_string(),
+                snapshot_sha256: "snapshot-sha".to_string(),
                 wal_objects: vec![ManifestRestoreWalObject {
                     index: 7,
                     offset: 0,
                     end_offset: 4096,
                     object_key: "db.db/generations/019c3e53aea47afbbddfe5ebc2272e22/wal/0000000007_0000000000.wal.zst".to_string(),
+                    sha256: "wal-sha".to_string(),
                 }],
             },
         };
 
         assert!(selected.plan.snapshot_key.ends_with(".snapshot.zst"));
         assert_eq!(selected.plan.wal_objects.len(), 1);
-        assert!(selected.plan.wal_objects[0].object_key.ends_with(".wal.zst"));
+        assert!(
+            selected.plan.wal_objects[0]
+                .object_key
+                .ends_with(".wal.zst")
+        );
     }
 
     #[test]
@@ -903,12 +985,15 @@ mod tests {
                 generation_manifest_gets: 2,
                 object_gets: 3,
                 list_calls: 0,
+                cache_hits: 0,
+                cache_misses: 0,
+                cache_write_failures: 0,
             },
         );
 
         assert_eq!(
             summary,
-            "restore_request_cost path=manifest latest_pointer_gets=1 generation_manifest_gets=2 object_gets=3 list_calls=0"
+            "restore_request_cost path=manifest latest_pointer_gets=1 generation_manifest_gets=2 object_gets=3 list_calls=0 cache_hits=0 cache_misses=0 cache_write_failures=0"
         );
     }
 
@@ -933,19 +1018,119 @@ mod tests {
                         generation,
                         index: 1,
                         snapshot_offset: 0,
-                        wal_objects: vec![(1, 0, 1024, "b-1".to_string()), (1, 1024, 2048, "b-2".to_string())],
+                        wal_objects: vec![
+                            (1, 0, 1024, "b-1".to_string()),
+                            (1, 1024, 2048, "b-2".to_string()),
+                        ],
                     })),
                 ),
             ]),
         };
 
         let latest = restore
-            .decide_restore_plan_with_sources(None, &manifest_source, RestoreRequestCostStats::default())
+            .decide_restore_plan_with_sources(
+                None,
+                &manifest_source,
+                RestoreRequestCostStats::default(),
+            )
             .await
             .expect("latest restore plan");
 
         assert_eq!(storage_root(&latest.storage_config), "/tmp/replited-b");
         assert_eq!(restore_plan_progress(&latest.plan), (1, 2048));
+    }
+
+    #[tokio::test]
+    async fn restore_source_respects_explicit_truth_source_name() {
+        let restore = Restore::try_create(
+            "data.db".to_string(),
+            vec![
+                named_storage_config("fs-a", "/tmp/replited-a"),
+                named_storage_config("fs-b", "/tmp/replited-b"),
+            ],
+            RestoreOptions {
+                db: "data.db".to_string(),
+                output: "/tmp/out.db".to_string(),
+                follow: false,
+                interval: 1,
+                timestamp: String::new(),
+                truth_source: "fs-a".to_string(),
+            },
+            None,
+        )
+        .expect("restore");
+        let newer = Generation::try_create("019c3e53aea57afbbddfe5ebc2272e22").expect("newer");
+        let manifest_source = FakeManifestSource {
+            answers: HashMap::from([
+                (
+                    "data.db:/tmp/replited-a".to_string(),
+                    Ok(Some(RestoreInfoSpec {
+                        generation: "019c3e53aea47afbbddfe5ebc2272e22".to_string(),
+                        index: 1,
+                        snapshot_offset: 0,
+                        wal_objects: vec![],
+                    })),
+                ),
+                (
+                    "data.db:/tmp/replited-b".to_string(),
+                    Ok(Some(RestoreInfoSpec {
+                        generation: newer.as_str().to_string(),
+                        index: 1,
+                        snapshot_offset: 0,
+                        wal_objects: vec![],
+                    })),
+                ),
+            ]),
+        };
+
+        let latest = restore
+            .decide_restore_plan_with_sources(
+                None,
+                &manifest_source,
+                RestoreRequestCostStats::default(),
+            )
+            .await
+            .expect("selected restore plan");
+
+        assert_eq!(latest.storage_config.name, "fs-a");
+        assert_eq!(
+            latest.plan.snapshot.generation.as_str(),
+            "019c3e53aea47afbbddfe5ebc2272e22"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_source_rejects_unknown_truth_source() {
+        let restore = Restore::try_create(
+            "data.db".to_string(),
+            vec![
+                named_storage_config("fs-a", "/tmp/replited-a"),
+                named_storage_config("fs-b", "/tmp/replited-b"),
+            ],
+            RestoreOptions {
+                db: "data.db".to_string(),
+                output: "/tmp/out.db".to_string(),
+                follow: false,
+                interval: 1,
+                timestamp: String::new(),
+                truth_source: "missing".to_string(),
+            },
+            None,
+        )
+        .expect("restore");
+
+        let err = restore
+            .decide_restore_plan_with_sources(
+                None,
+                &FakeManifestSource {
+                    answers: HashMap::new(),
+                },
+                RestoreRequestCostStats::default(),
+            )
+            .await
+            .expect_err("missing truth source should fail");
+
+        assert_eq!(err.code(), Error::INVALID_ARG);
     }
 
     #[test]
@@ -956,22 +1141,28 @@ mod tests {
                 offset: 0,
                 end_offset: 1024,
                 object_key: "one-a".to_string(),
+                sha256: "sha-one-a".to_string(),
             },
             ManifestRestoreWalObject {
                 index: 1,
                 offset: 1024,
                 end_offset: 2048,
                 object_key: "one-b".to_string(),
+                sha256: "sha-one-b".to_string(),
             },
             ManifestRestoreWalObject {
                 index: 2,
                 offset: 0,
                 end_offset: 1024,
                 object_key: "two-a".to_string(),
+                sha256: "sha-two-a".to_string(),
             },
         ];
 
-        assert_eq!(resume_position_from_local_wal(&wal_objects, 2048), Some((1, 2048)));
+        assert_eq!(
+            resume_position_from_local_wal(&wal_objects, 2048),
+            Some((1, 2048))
+        );
     }
 
     #[test]
@@ -982,15 +1173,20 @@ mod tests {
                 offset: 0,
                 end_offset: 1024,
                 object_key: "one-a".to_string(),
+                sha256: "sha-one-a".to_string(),
             },
             ManifestRestoreWalObject {
                 index: 2,
                 offset: 0,
                 end_offset: 1024,
                 object_key: "two-a".to_string(),
+                sha256: "sha-two-a".to_string(),
             },
         ];
 
-        assert_eq!(resume_position_from_local_wal(&wal_objects, 1024), Some((1, 1024)));
+        assert_eq!(
+            resume_position_from_local_wal(&wal_objects, 1024),
+            Some((1, 1024))
+        );
     }
 }

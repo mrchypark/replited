@@ -40,8 +40,13 @@ impl super::Restore {
         client: &StorageClient,
         latest_plan: &super::DiscoveredRestorePlan,
     ) -> Result<(u64, u64)> {
-        self.restore_snapshot_from_key(client, &latest_plan.snapshot_key, &self.options.output)
-            .await?;
+        self.restore_snapshot_from_key(
+            client,
+            &latest_plan.snapshot_key,
+            &latest_plan.snapshot_sha256,
+            &self.options.output,
+        )
+        .await?;
 
         let (new_last_index, new_last_offset, _) = self
             .apply_wal_objects(
@@ -59,7 +64,6 @@ impl super::Restore {
 
     pub(super) async fn follow_loop(
         &self,
-        mut current_client: StorageClient,
         mut current_snapshot: SnapshotInfo,
         mut last_index: u64,
         mut last_offset: u64,
@@ -70,6 +74,12 @@ impl super::Restore {
 
             let latest_selected = self.decide_restore_plan(None).await?;
             let latest_plan = latest_selected.plan;
+            if let Some(cache) = &self.cache {
+                let pinned = std::iter::once(latest_plan.snapshot_key.clone())
+                    .chain(latest_plan.wal_objects.iter().map(|wal| wal.object_key.clone()))
+                    .collect::<Vec<_>>();
+                cache.set_pinned_keys(pinned);
+            }
 
             match determine_follow_manifest_action(
                 &current_snapshot,
@@ -78,8 +88,11 @@ impl super::Restore {
             ) {
                 FollowManifestAction::None => {}
                 FollowManifestAction::ApplySameGeneration => {
-                    current_client =
-                        StorageClient::try_create(self.db.clone(), latest_selected.storage_config)?;
+                    let current_client = StorageClient::try_create_with_cache(
+                        self.db.clone(),
+                        latest_selected.storage_config,
+                        self.cache.clone(),
+                    )?;
                     let (new_last_index, new_last_offset, _) = self
                         .apply_wal_objects(
                             &current_client,
@@ -101,8 +114,11 @@ impl super::Restore {
                         latest_plan.snapshot.generation
                     );
 
-                    current_client =
-                        StorageClient::try_create(self.db.clone(), latest_selected.storage_config)?;
+                    let current_client = StorageClient::try_create_with_cache(
+                        self.db.clone(),
+                        latest_selected.storage_config,
+                        self.cache.clone(),
+                    )?;
 
                     let (new_last_index, new_last_offset) = self
                         .apply_follow_generation_switch(&current_client, &latest_plan)
@@ -121,6 +137,7 @@ impl super::Restore {
 mod tests {
     use chrono::Utc;
     use rusqlite::Connection;
+    use sha2::Digest;
     use tempfile::tempdir;
 
     use crate::base::Generation;
@@ -157,14 +174,20 @@ mod tests {
             },
             snapshot_key: "db.db/generations/g/snapshots/0000000001_0000000000.snapshot.zst"
                 .to_string(),
+            snapshot_sha256: "snapshot-sha".to_string(),
             wal_objects: wal_progress
                 .iter()
-                .map(|(index, offset, end_offset)| super::super::ManifestRestoreWalObject {
-                    index: *index,
-                    offset: *offset,
-                    end_offset: *end_offset,
-                    object_key: format!("db.db/generations/g/wal/{index:010}_{offset:010}.wal.zst"),
-                })
+                .map(
+                    |(index, offset, end_offset)| super::super::ManifestRestoreWalObject {
+                        index: *index,
+                        offset: *offset,
+                        end_offset: *end_offset,
+                        object_key: format!(
+                            "db.db/generations/g/wal/{index:010}_{offset:010}.wal.zst"
+                        ),
+                        sha256: format!("sha-{index}-{offset}"),
+                    },
+                )
                 .collect(),
         }
     }
@@ -271,6 +294,11 @@ mod tests {
             "db.db/generations/{}/snapshots/0000000001_0000000000.snapshot.zst",
             generation.as_str()
         );
+        let compressed_snapshot = compress_buffer(
+            &std::fs::read(&source_snapshot_path).expect("read source snapshot"),
+        )
+        .expect("compress snapshot");
+        let snapshot_sha256 = format!("{:x}", sha2::Sha256::digest(&compressed_snapshot));
         client
             .publish_manifest_snapshot(
                 &crate::database::WalGenerationPos {
@@ -278,8 +306,7 @@ mod tests {
                     index: 1,
                     offset: 0,
                 },
-                compress_buffer(&std::fs::read(&source_snapshot_path).expect("read source snapshot"))
-                    .expect("compress snapshot"),
+                compressed_snapshot,
             )
             .await
             .expect("publish manifest snapshot");
@@ -293,13 +320,16 @@ mod tests {
                 follow: true,
                 interval: 1,
                 timestamp: "".to_string(),
+                truth_source: String::new(),
             },
+            None,
         )
         .expect("restore");
 
         let plan = super::super::DiscoveredRestorePlan {
             snapshot,
             snapshot_key,
+            snapshot_sha256,
             wal_objects: vec![],
         };
 
@@ -310,7 +340,9 @@ mod tests {
 
         let conn = Connection::open(&output_path).expect("open restored db");
         let value: String = conn
-            .query_row("SELECT value FROM items ORDER BY id LIMIT 1", [], |row| row.get(0))
+            .query_row("SELECT value FROM items ORDER BY id LIMIT 1", [], |row| {
+                row.get(0)
+            })
             .expect("read row");
 
         assert_eq!(value, "new");

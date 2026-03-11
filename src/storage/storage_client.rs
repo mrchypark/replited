@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 use tokio::time::sleep;
 
 use super::init_operator;
+use super::LocalObjectCache;
 use super::manifest::GenerationManifest;
 use super::manifest::LatestPointer;
 use super::manifest::ManifestWalPack;
@@ -38,6 +39,7 @@ pub struct StorageClient {
     db_name: String,
     latest_pointer_update_policy: LatestPointerUpdatePolicy,
     restore_request_costs: RestoreRequestCostStats,
+    cache: Option<LocalObjectCache>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -51,6 +53,9 @@ struct RestoreRequestCostStatsInner {
     generation_manifest_gets: AtomicU64,
     object_gets: AtomicU64,
     list_calls: AtomicU64,
+    cache_hits: AtomicU64,
+    cache_misses: AtomicU64,
+    cache_write_failures: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -59,6 +64,9 @@ pub(crate) struct RestoreRequestCostSnapshot {
     pub(crate) generation_manifest_gets: u64,
     pub(crate) object_gets: u64,
     pub(crate) list_calls: u64,
+    pub(crate) cache_hits: u64,
+    pub(crate) cache_misses: u64,
+    pub(crate) cache_write_failures: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,6 +78,7 @@ pub struct LatestPointerGuard {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LatestPointerUpdatePolicy {
     FsCompareUnderLock { root: PathBuf },
+    SingleWriterUnconditional { backend: String },
     Unsupported { backend: String },
 }
 
@@ -145,15 +154,29 @@ impl RestoreRequestCostStats {
         self.inner.list_calls.fetch_add(1, Ordering::Relaxed);
     }
 
+    fn record_cache_hit(&self) {
+        self.inner.cache_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_cache_miss(&self) {
+        self.inner.cache_misses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_cache_write_failure(&self) {
+        self.inner
+            .cache_write_failures
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn snapshot(&self) -> RestoreRequestCostSnapshot {
         RestoreRequestCostSnapshot {
             latest_pointer_gets: self.inner.latest_pointer_gets.load(Ordering::Relaxed),
-            generation_manifest_gets: self
-                .inner
-                .generation_manifest_gets
-                .load(Ordering::Relaxed),
+            generation_manifest_gets: self.inner.generation_manifest_gets.load(Ordering::Relaxed),
             object_gets: self.inner.object_gets.load(Ordering::Relaxed),
             list_calls: self.inner.list_calls.load(Ordering::Relaxed),
+            cache_hits: self.inner.cache_hits.load(Ordering::Relaxed),
+            cache_misses: self.inner.cache_misses.load(Ordering::Relaxed),
+            cache_write_failures: self.inner.cache_write_failures.load(Ordering::Relaxed),
         }
     }
 }
@@ -175,6 +198,7 @@ impl StorageClient {
         matches!(
             self.latest_pointer_update_policy,
             LatestPointerUpdatePolicy::FsCompareUnderLock { .. }
+                | LatestPointerUpdatePolicy::SingleWriterUnconditional { .. }
         )
     }
 
@@ -183,10 +207,31 @@ impl StorageClient {
         config: StorageConfig,
         restore_request_costs: RestoreRequestCostStats,
     ) -> Result<Self> {
+        Self::try_create_with_cache_and_restore_request_costs(
+            db_path,
+            config,
+            None,
+            restore_request_costs,
+        )
+    }
+
+    pub(crate) fn try_create_with_cache_and_restore_request_costs(
+        db_path: String,
+        config: StorageConfig,
+        cache: Option<LocalObjectCache>,
+        restore_request_costs: RestoreRequestCostStats,
+    ) -> Result<Self> {
         let latest_pointer_update_policy = match &config.params {
             crate::config::StorageParams::Fs(fs) => LatestPointerUpdatePolicy::FsCompareUnderLock {
                 root: PathBuf::from(&fs.root),
             },
+            crate::config::StorageParams::S3(_)
+            | crate::config::StorageParams::Gcs(_)
+            | crate::config::StorageParams::Azb(_) => {
+                LatestPointerUpdatePolicy::SingleWriterUnconditional {
+                    backend: config.name.clone(),
+                }
+            }
             _ => LatestPointerUpdatePolicy::Unsupported {
                 backend: config.name.clone(),
             },
@@ -196,13 +241,28 @@ impl StorageClient {
             db_name: path_base(&db_path)?,
             latest_pointer_update_policy,
             restore_request_costs,
+            cache,
         })
     }
 
     pub fn try_create(db_path: String, config: StorageConfig) -> Result<Self> {
-        Self::try_create_with_restore_request_costs(
+        Self::try_create_with_cache_and_restore_request_costs(
             db_path,
             config,
+            None,
+            RestoreRequestCostStats::default(),
+        )
+    }
+
+    pub fn try_create_with_cache(
+        db_path: String,
+        config: StorageConfig,
+        cache: Option<LocalObjectCache>,
+    ) -> Result<Self> {
+        Self::try_create_with_cache_and_restore_request_costs(
+            db_path,
+            config,
+            cache,
             RestoreRequestCostStats::default(),
         )
     }
@@ -222,6 +282,11 @@ impl StorageClient {
         match &self.latest_pointer_update_policy {
             LatestPointerUpdatePolicy::FsCompareUnderLock { .. } => {
                 Error::StorageError("fs latest pointer update policy misconfigured".to_string())
+            }
+            LatestPointerUpdatePolicy::SingleWriterUnconditional { backend } => {
+                Error::InvalidConfig(format!(
+                    "conditional latest pointer update is unsupported for backend {backend}"
+                ))
             }
             LatestPointerUpdatePolicy::Unsupported { backend } => Error::InvalidConfig(format!(
                 "conditional latest pointer update is unsupported for backend {backend}"
@@ -255,11 +320,7 @@ impl StorageClient {
         generation.as_str().to_string()
     }
 
-    fn manifest_wal_pack_key(
-        &self,
-        start: &WalGenerationPos,
-        end: &WalGenerationPos,
-    ) -> String {
+    fn manifest_wal_pack_key(&self, start: &WalGenerationPos, end: &WalGenerationPos) -> String {
         format!(
             "{}/generations/{}/wal/ranges/{:010}_{:010}_{:010}_{:010}/{:010}_{:010}.wal.zst",
             self.db_name,
@@ -283,6 +344,32 @@ impl StorageClient {
     fn manifest_publish_root(&self) -> Result<PathBuf> {
         match &self.latest_pointer_update_policy {
             LatestPointerUpdatePolicy::FsCompareUnderLock { root } => Ok(root.clone()),
+            LatestPointerUpdatePolicy::SingleWriterUnconditional { .. } => Err(
+                Error::InvalidConfig(
+                    "manifest publish root is unavailable for non-fs single-writer backends"
+                        .to_string(),
+                ),
+            ),
+            LatestPointerUpdatePolicy::Unsupported { backend } => Err(Error::InvalidConfig(
+                format!("manifest publish path is unsupported for backend {backend}"),
+            )),
+        }
+    }
+
+    async fn acquire_manifest_publish_lock(
+        &self,
+        generation: &str,
+    ) -> Result<Option<FsPathLock>> {
+        match &self.latest_pointer_update_policy {
+            LatestPointerUpdatePolicy::FsCompareUnderLock { root } => Ok(Some(
+                Self::acquire_fs_path_lock(&Self::manifest_publish_lock_path(
+                    root,
+                    &self.db_name,
+                    generation,
+                ))
+                .await?,
+            )),
+            LatestPointerUpdatePolicy::SingleWriterUnconditional { .. } => Ok(None),
             LatestPointerUpdatePolicy::Unsupported { backend } => Err(Error::InvalidConfig(
                 format!("manifest publish path is unsupported for backend {backend}"),
             )),
@@ -299,7 +386,13 @@ impl StorageClient {
 
     async fn write_immutable_object(&self, key: &str, bytes: Vec<u8>) -> Result<()> {
         self.ensure_parent_exist(key).await?;
-        self.operator.write(key, bytes).await?;
+        self.operator.write(key, bytes.clone()).await?;
+        if let Some(cache) = &self.cache
+            && let Err(err) = cache.put(key, &bytes)
+        {
+            self.restore_request_costs.record_cache_write_failure();
+            warn!("cache write failed for {key}: {err}");
+        }
         Ok(())
     }
 
@@ -317,7 +410,13 @@ impl StorageClient {
         };
 
         match self.read_latest_pointer().await? {
-            Some((_current, guard)) => {
+            Some((current, guard)) => {
+                if Self::latest_pointer_regresses_to_older_generation(&current, &pointer) {
+                    return Err(Error::StorageError(format!(
+                        "reject latest pointer regression from {} to {}",
+                        current.current_generation, pointer.current_generation
+                    )));
+                }
                 self.write_latest_pointer_conditional(&pointer, Some(&guard))
                     .await
             }
@@ -332,7 +431,9 @@ impl StorageClient {
     fn latest_pointer_lock_path(latest_path: &Path) -> Result<PathBuf> {
         let file_name = latest_path
             .file_name()
-            .ok_or_else(|| Error::StorageError("latest pointer path missing file name".to_string()))?
+            .ok_or_else(|| {
+                Error::StorageError("latest pointer path missing file name".to_string())
+            })?
             .to_string_lossy()
             .to_string();
         Ok(latest_path.with_file_name(format!("{file_name}.lock")))
@@ -343,10 +444,7 @@ impl StorageClient {
             .parent()
             .ok_or_else(|| Error::StorageError("lock path missing parent".to_string()))?;
         std::fs::create_dir_all(parent).map_err(|err| {
-            Error::StorageError(format!(
-                "create lock directory {}: {err}",
-                parent.display()
-            ))
+            Error::StorageError(format!("create lock directory {}: {err}", parent.display()))
         })?;
 
         for _ in 0..200 {
@@ -358,7 +456,7 @@ impl StorageClient {
                 Ok(_) => {
                     return Ok(FsPathLock {
                         path: lock_path.to_path_buf(),
-                    })
+                    });
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
                     sleep(Duration::from_millis(10)).await;
@@ -367,7 +465,7 @@ impl StorageClient {
                     return Err(Error::StorageError(format!(
                         "acquire lock {}: {err}",
                         lock_path.display()
-                    )))
+                    )));
                 }
             }
         }
@@ -434,18 +532,17 @@ impl StorageClient {
                         return Err(Error::StorageError(format!(
                             "read latest pointer {}: {err}",
                             path.display()
-                        )))
+                        )));
                     }
                 };
 
                 if let Some(bytes) = current_bytes.as_ref() {
-                    let current_pointer = serde_json::from_slice::<LatestPointer>(bytes).map_err(
-                        |err| {
+                    let current_pointer =
+                        serde_json::from_slice::<LatestPointer>(bytes).map_err(|err| {
                             Error::StorageError(format!(
                                 "deserialize latest pointer under fs lock: {err}"
                             ))
-                        },
-                    )?;
+                        })?;
                     if Self::latest_pointer_regresses_to_older_generation(&current_pointer, pointer)
                     {
                         return Err(Error::StorageError(format!(
@@ -516,6 +613,15 @@ impl StorageClient {
                 })?;
                 Ok(())
             }
+            LatestPointerUpdatePolicy::SingleWriterUnconditional { .. } => {
+                let key = self.latest_pointer_key();
+                let payload = serde_json::to_vec(pointer).map_err(|err| {
+                    Error::StorageError(format!("serialize latest pointer: {err}"))
+                })?;
+                self.ensure_parent_exist(&key).await?;
+                self.operator.write(&key, payload).await?;
+                Ok(())
+            }
             LatestPointerUpdatePolicy::Unsupported { .. } => {
                 Err(self.unsupported_conditional_latest_update_error())
             }
@@ -545,9 +651,10 @@ impl StorageClient {
             Err(err) if err.kind() == opendal::ErrorKind::NotFound => return Ok(None),
             Err(err) => return Err(err.into()),
         };
-        let manifest = serde_json::from_slice::<GenerationManifest>(&bytes.to_bytes()).map_err(
-            |err| Error::StorageError(format!("deserialize generation manifest: {err}")),
-        )?;
+        let manifest =
+            serde_json::from_slice::<GenerationManifest>(&bytes.to_bytes()).map_err(|err| {
+                Error::StorageError(format!("deserialize generation manifest: {err}"))
+            })?;
         Ok(Some(manifest))
     }
 
@@ -639,16 +746,16 @@ impl StorageClient {
             ));
         }
 
-        let root = self.manifest_publish_root()?;
-        let _publish_lock = Self::acquire_fs_path_lock(&Self::manifest_publish_lock_path(
-            &root,
+        let _publish_lock = self
+            .acquire_manifest_publish_lock(pos.generation.as_str())
+            .await?;
+
+        let snapshot_key = snapshot_file(
             &self.db_name,
             pos.generation.as_str(),
-        ))
-        .await?;
-
-        let snapshot_key =
-            snapshot_file(&self.db_name, pos.generation.as_str(), pos.index, pos.offset);
+            pos.index,
+            pos.offset,
+        );
         self.write_immutable_object(&snapshot_key, compressed_data.clone())
             .await?;
 
@@ -688,13 +795,9 @@ impl StorageClient {
                 "manifest wal pack generation mismatch".to_string(),
             ));
         }
-        let root = self.manifest_publish_root()?;
-        let _publish_lock = Self::acquire_fs_path_lock(&Self::manifest_publish_lock_path(
-            &root,
-            &self.db_name,
-            start.generation.as_str(),
-        ))
-        .await?;
+        let _publish_lock = self
+            .acquire_manifest_publish_lock(start.generation.as_str())
+            .await?;
 
         let mut manifest = self
             .read_generation_manifest(start.generation.as_str())
@@ -758,10 +861,8 @@ impl StorageClient {
             .map_err(|err| Error::StorageError(format!("serialize generation manifest: {err}")))?
             .len();
 
-        Ok(
-            manifest.wal_packs.len() >= pack_threshold
-                || manifest_size_bytes >= manifest_size_threshold_bytes,
-        )
+        Ok(manifest.wal_packs.len() >= pack_threshold
+            || manifest_size_bytes >= manifest_size_threshold_bytes)
     }
 
     pub(crate) async fn purge_manifest_generation(&self, generation: &str) -> Result<()> {
@@ -896,10 +997,51 @@ impl StorageClient {
         Ok(snapshot_info)
     }
 
-    pub(crate) async fn read_object_by_key(&self, key: &str) -> Result<Vec<u8>> {
+    pub(crate) async fn read_object_by_key_checked(
+        &self,
+        key: &str,
+        expected_sha256: Option<&str>,
+    ) -> Result<Vec<u8>> {
+        if let Some(cache) = &self.cache {
+            match cache.get(key)? {
+                Some(bytes) => {
+                    if let Some(expected) = expected_sha256 {
+                        if Self::latest_pointer_revision(&bytes) == expected {
+                            self.restore_request_costs.record_cache_hit();
+                            return Ok(bytes);
+                        }
+                        warn!("cache checksum mismatch for {key}, treating as miss");
+                        cache.remove(key)?;
+                    } else {
+                        self.restore_request_costs.record_cache_hit();
+                        return Ok(bytes);
+                    }
+                    self.restore_request_costs.record_cache_miss();
+                }
+                None => {
+                    self.restore_request_costs.record_cache_miss();
+                }
+            }
+        }
+
         self.restore_request_costs.record_object_get();
         let data = self.operator.read(key).await?;
-        Ok(data.to_vec())
+        let bytes = data.to_vec();
+        if let Some(expected) = expected_sha256 {
+            let actual = Self::latest_pointer_revision(&bytes);
+            if actual != expected {
+                return Err(Error::StorageError(format!(
+                    "object checksum mismatch for {key}: expected {expected}, got {actual}"
+                )));
+            }
+        }
+        if let Some(cache) = &self.cache
+            && let Err(err) = cache.put(key, &bytes)
+        {
+            self.restore_request_costs.record_cache_write_failure();
+            warn!("cache write failed for {key}: {err}");
+        }
+        Ok(bytes)
     }
 
     pub async fn snapshots(&self, generation: &str) -> Result<Vec<SnapshotInfo>> {
@@ -997,18 +1139,17 @@ impl StorageClient {
         let bytes = self.operator.read(&wal_segment_file).await?.to_vec();
         Ok(bytes)
     }
-
 }
 
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
+    use super::LatestPointerUpdatePolicy;
     use super::RestoreRequestCostSnapshot;
     use super::RestoreRequestCostStats;
-    use super::snapshot_position_is_newer;
-    use super::LatestPointerUpdatePolicy;
     use super::StorageClient;
+    use super::snapshot_position_is_newer;
     use crate::base::Generation;
     use crate::base::compress_buffer;
     use crate::base::snapshot_file;
@@ -1021,6 +1162,7 @@ mod tests {
     use crate::storage::manifest::GenerationManifest;
     use crate::storage::manifest::LatestPointer;
     use crate::storage::manifest::ManifestWalPack;
+    use crate::storage::{DEFAULT_CACHE_SIZE_LIMIT_BYTES, LocalObjectCache};
     use chrono::Utc;
     use opendal::Operator;
     use opendal::raw::Access;
@@ -1033,6 +1175,7 @@ mod tests {
     use opendal::raw::RpRead;
     use opendal::raw::RpWrite;
     use opendal::services;
+    use sha2::{Digest, Sha256};
     use tempfile::tempdir;
 
     #[test]
@@ -1144,17 +1287,35 @@ mod tests {
                 backend: "memory".to_string(),
             },
             restore_request_costs: RestoreRequestCostStats::default(),
+            cache: None,
         }
     }
 
     fn memory_storage_client() -> StorageClient {
         StorageClient {
-            operator: Operator::new(services::Memory::default()).expect("op").finish(),
+            operator: Operator::new(services::Memory::default())
+                .expect("op")
+                .finish(),
             db_name: "db.db".to_string(),
             latest_pointer_update_policy: LatestPointerUpdatePolicy::Unsupported {
                 backend: "memory".to_string(),
             },
             restore_request_costs: RestoreRequestCostStats::default(),
+            cache: None,
+        }
+    }
+
+    fn single_writer_memory_storage_client(cache: Option<LocalObjectCache>) -> StorageClient {
+        StorageClient {
+            operator: Operator::new(services::Memory::default())
+                .expect("op")
+                .finish(),
+            db_name: "db.db".to_string(),
+            latest_pointer_update_policy: LatestPointerUpdatePolicy::SingleWriterUnconditional {
+                backend: "s3".to_string(),
+            },
+            restore_request_costs: RestoreRequestCostStats::default(),
+            cache,
         }
     }
 
@@ -1175,9 +1336,7 @@ mod tests {
         LatestPointer {
             format_version: 1,
             current_generation: generation.to_string(),
-            current_manifest_key: format!(
-                "db.db/manifests/generations/{generation}.manifest.json"
-            ),
+            current_manifest_key: format!("db.db/manifests/generations/{generation}.manifest.json"),
             current_manifest_sha256: "abc123".to_string(),
             created_at: Utc::now(),
         }
@@ -1488,12 +1647,19 @@ mod tests {
         assert!(std::fs::exists(&snapshot_path).expect("exists"));
         assert!(!std::fs::exists(root.join(format!("{snapshot_rel}.tmp"))).expect("exists"));
 
-        let (generation_id, _manifest_id, _lineage_id, _base_snapshot_id, _base_snapshot_sha256, base_snapshot, wal_packs) =
-            client
-                .read_manifest_restore_inputs()
-                .await
-                .expect("read manifest restore inputs")
-                .expect("manifest metadata");
+        let (
+            generation_id,
+            _manifest_id,
+            _lineage_id,
+            _base_snapshot_id,
+            _base_snapshot_sha256,
+            base_snapshot,
+            wal_packs,
+        ) = client
+            .read_manifest_restore_inputs()
+            .await
+            .expect("read manifest restore inputs")
+            .expect("manifest metadata");
         assert_eq!(generation_id, generation.as_str());
         assert_eq!(base_snapshot, snapshot_rel);
         assert!(wal_packs.is_empty());
@@ -1524,6 +1690,108 @@ mod tests {
             .expect_err("unsupported backend should reject manifest publish");
 
         assert_eq!(err.code(), Error::INVALID_CONFIG);
+    }
+
+    #[tokio::test]
+    async fn single_writer_object_backend_can_publish_manifest_snapshot() {
+        let client = single_writer_memory_storage_client(None);
+        let generation = Generation::new();
+
+        client
+            .publish_manifest_snapshot(
+                &WalGenerationPos {
+                    generation: generation.clone(),
+                    index: 1,
+                    offset: 4096,
+                },
+                compress_buffer(b"snapshot").expect("compress snapshot"),
+            )
+            .await
+            .expect("single-writer publish snapshot");
+
+        let (pointer, _guard) = client
+            .read_latest_pointer()
+            .await
+            .expect("read latest pointer")
+            .expect("latest pointer");
+        assert_eq!(pointer.current_generation, generation.as_str());
+    }
+
+    #[tokio::test]
+    async fn cache_first_read_hits_cache_and_skips_remote_get() {
+        let temp = tempdir().expect("tempdir");
+        let cache = LocalObjectCache::try_create(
+            temp.path().join("cache"),
+            DEFAULT_CACHE_SIZE_LIMIT_BYTES,
+        )
+        .expect("cache");
+        let client = single_writer_memory_storage_client(Some(cache.clone()));
+        let payload = b"hello-cache".to_vec();
+        let sha = format!("{:x}", Sha256::digest(&payload));
+        cache.put("db.db/objects/item", &payload).expect("seed cache");
+
+        let bytes = client
+            .read_object_by_key_checked("db.db/objects/item", Some(&sha))
+            .await
+            .expect("cache read");
+
+        assert_eq!(bytes, payload);
+        assert_eq!(client.restore_request_costs.snapshot().cache_hits, 1);
+        assert_eq!(client.restore_request_costs.snapshot().object_gets, 0);
+    }
+
+    #[tokio::test]
+    async fn cache_first_read_populates_cache_on_miss() {
+        let temp = tempdir().expect("tempdir");
+        let cache = LocalObjectCache::try_create(
+            temp.path().join("cache"),
+            DEFAULT_CACHE_SIZE_LIMIT_BYTES,
+        )
+        .expect("cache");
+        let client = single_writer_memory_storage_client(Some(cache.clone()));
+        let payload = b"remote-object".to_vec();
+        let sha = format!("{:x}", Sha256::digest(&payload));
+        client
+            .operator
+            .write("db.db/objects/item", payload.clone())
+            .await
+            .expect("seed remote object");
+
+        let bytes = client
+            .read_object_by_key_checked("db.db/objects/item", Some(&sha))
+            .await
+            .expect("remote read");
+
+        assert_eq!(bytes, payload);
+        assert_eq!(
+            cache.get("db.db/objects/item").expect("cache get"),
+            Some(b"remote-object".to_vec())
+        );
+        assert_eq!(client.restore_request_costs.snapshot().cache_misses, 1);
+        assert_eq!(client.restore_request_costs.snapshot().object_gets, 1);
+    }
+
+    #[tokio::test]
+    async fn cache_first_read_rejects_remote_checksum_mismatch() {
+        let temp = tempdir().expect("tempdir");
+        let cache = LocalObjectCache::try_create(
+            temp.path().join("cache"),
+            DEFAULT_CACHE_SIZE_LIMIT_BYTES,
+        )
+        .expect("cache");
+        let client = single_writer_memory_storage_client(Some(cache));
+        client
+            .operator
+            .write("db.db/objects/item", b"wrong".to_vec())
+            .await
+            .expect("seed remote object");
+
+        let err = client
+            .read_object_by_key_checked("db.db/objects/item", Some("deadbeef"))
+            .await
+            .expect_err("checksum mismatch should fail");
+
+        assert_eq!(err.code(), Error::STORAGE_ERROR);
     }
 
     #[tokio::test]
@@ -1607,12 +1875,19 @@ mod tests {
         first_result.expect("first publish");
         second_result.expect("second publish");
 
-        let (_generation_id, _manifest_id, _lineage_id, _base_snapshot_id, _base_snapshot_sha256, _base_snapshot, wal_packs) =
-            client
-                .read_manifest_restore_inputs()
-                .await
-                .expect("read manifest restore inputs")
-                .expect("manifest metadata");
+        let (
+            _generation_id,
+            _manifest_id,
+            _lineage_id,
+            _base_snapshot_id,
+            _base_snapshot_sha256,
+            _base_snapshot,
+            wal_packs,
+        ) = client
+            .read_manifest_restore_inputs()
+            .await
+            .expect("read manifest restore inputs")
+            .expect("manifest metadata");
 
         assert_eq!(wal_packs.len(), 2);
         assert_eq!(wal_packs[0].0, 4096);
@@ -1889,19 +2164,14 @@ mod tests {
             .expect("read manifest inputs")
             .expect("manifest metadata");
         let snapshot_key = metadata.5;
-        let wal_key = metadata
-            .6
-            .first()
-            .expect("wal pack")
-            .2
-            .clone();
+        let wal_key = metadata.6.first().expect("wal pack").2.clone();
 
         client
-            .read_object_by_key(&snapshot_key)
+            .read_object_by_key_checked(&snapshot_key, None)
             .await
             .expect("read snapshot");
         client
-            .read_object_by_key(&wal_key)
+            .read_object_by_key_checked(&wal_key, None)
             .await
             .expect("read wal pack");
 
@@ -1912,6 +2182,9 @@ mod tests {
                 generation_manifest_gets: 1,
                 object_gets: 2,
                 list_calls: 0,
+                cache_hits: 0,
+                cache_misses: 0,
+                cache_write_failures: 0,
             }
         );
     }

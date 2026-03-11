@@ -1,0 +1,79 @@
+name: Azblob integration test
+
+on:
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 'Checkout codes'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust toolchain
+        uses: ./.github/actions/setup
+
+      - name: Start Azurite
+        shell: bash
+        run: |
+          docker run -d --name azurite \
+            -p 10000:10000 \
+            mcr.microsoft.com/azure-storage/azurite \
+            azurite-blob --blobHost 0.0.0.0 --blobPort 10000 --skipApiVersionCheck
+          for _ in $(seq 1 30); do
+            code=$(curl -sS -o /dev/null -w '%{http_code}' 'http://127.0.0.1:10000/devstoreaccount1?comp=list' || true)
+            if [ "$code" = "403" ] || [ "$code" = "200" ]; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs azurite
+          exit 1
+
+      - name: Prepare Azure Blob SDK venv
+        shell: bash
+        run: |
+          python3 -m venv .venv-azblob
+          . .venv-azblob/bin/activate
+          pip install azure-storage-blob
+
+      - name: Create Azurite container
+        shell: bash
+        run: |
+          . .venv-azblob/bin/activate
+          python - <<'PY'
+          from azure.storage.blob import BlobServiceClient
+          conn = (
+              "DefaultEndpointsProtocol=http;"
+              "AccountName=devstoreaccount1;"
+              "AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;"
+              "BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;"
+          )
+          client = BlobServiceClient.from_connection_string(conn)
+          try:
+              client.create_container("replited-itest")
+          except Exception:
+              pass
+          PY
+
+      - name: 'Run integration test for azblob'
+        shell: bash
+        env:
+          REPLITED_TEST_AZB_ENDPOINT: http://127.0.0.1:10000/devstoreaccount1
+          REPLITED_TEST_AZB_CONTAINER: replited-itest
+          REPLITED_TEST_AZB_ACCOUNT_NAME: devstoreaccount1
+          REPLITED_TEST_AZB_ACCOUNT_KEY: Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==
+          REPLITED_TEST_AZB_ROOT: /replited
+        run: |
+          python3 -m unittest tests.integration_test
+          cargo build --release
+          python3 tests/integration_test.py 12000 ./target/release/replited --backend azb
+
+      - name: Dump Azurite logs on failure
+        if: failure()
+        shell: bash
+        run: docker logs azurite

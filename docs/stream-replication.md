@@ -2,7 +2,7 @@
 
 Stream replication enables real-time WAL (Write-Ahead Log) synchronization between Primary and Replica databases over gRPC.
 
-This document covers the `stream` lane only. Archival publish/restore is a separate manifest-backed `fs` path in the current breaking cut.
+This document covers the `stream` lane only. Archival publish/restore is a separate manifest-first lane with cache-first reads through the local fs spool/cache layer. In the current supported scope, `fs` is the fast canonical archival backend, `s3` is the reference object backend validated in CI, and `gcs` / `azb` follow the same manifest/cache runtime model for parity testing.
 
 ## Architecture Overview
 
@@ -25,6 +25,8 @@ This document covers the `stream` lane only. Archival publish/restore is a separ
 > [!IMPORTANT]
 > Stream replication does **not** require a separate storage backend (fs, s3, etc.) for bootstrapping.
 > The replica can stream the initial snapshot directly from the Primary (compressed with `zstd`) and then switch to WAL streaming.
+
+For archival restore, the truth source is the manifest metadata and object reads are cache-first: replited checks the local fs cache/spool first, then issues backend GETs only on cache miss.
 
 ### Primary Configuration
 
@@ -62,12 +64,12 @@ Notes:
 ## Initial Restore Flow
 
 1. **Replica** starts with `--force-restore` flag
-2. **Replica** connects to Primary and calls `stream_snapshot_v2`
+2. **Replica** connects to Primary and requests the snapshot stream
 3. **Primary** generates/serves a compressed snapshot stream (`zstd`) plus a snapshot boundary LSN
 4. **Replica** restores the snapshot locally and records the snapshot boundary LSN
-5. **Replica** switches to `stream_wal_v2` to apply real-time WAL updates
+5. **Replica** switches to WAL streaming to apply real-time updates
 
-## v2 LSN Contract
+## LSN Contract
 
 An LSN (Log Sequence Number) is the authoritative position of a replica in the WAL stream.
 It is defined as a 3-tuple: `LSN = (generation, index, offset)`.
@@ -88,12 +90,12 @@ If an offset is not aligned, the LSN is invalid and must not be used for streami
 
 ### Forbidden Resume Sources
 
-v2 replication must never derive an LSN from the live `-wal` file size. Local WAL files can be
+Stream replication must never derive an LSN from the live `-wal` file size. Local WAL files can be
 truncated, reset, or contain partial frames and are not authoritative. The replica must only
 resume from an explicit LSN recorded by the replication system (e.g. last applied or snapshot
 boundary).
 
-## v2 Error Taxonomy
+## Error Taxonomy
 
 Stream replication uses explicit error codes to drive replica state transitions.
 

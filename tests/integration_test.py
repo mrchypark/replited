@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""FS manifest archival/restore integration test used by GitHub Actions."""
+"""Manifest archival/restore integration test used by GitHub Actions."""
 
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sqlite3
 import subprocess
 import sys
 import time
+import unittest
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,12 +19,29 @@ sys.path.insert(0, str(Path(__file__).parent))
 from test_utils import TestEnv, compute_db_digest, run_integrity_check
 
 TABLE_NAME = "integration_rows"
+DEFAULT_S3_ENDPOINT = "http://127.0.0.1:4566"
+DEFAULT_S3_BUCKET = "replited-itest"
+DEFAULT_S3_REGION = "us-east-1"
+DEFAULT_S3_ACCESS_KEY_ID = "test"
+DEFAULT_S3_SECRET_ACCESS_KEY = "test"
+DEFAULT_S3_ROOT = "/replited"
+DEFAULT_GCS_ENDPOINT = "http://127.0.0.1:4443"
+DEFAULT_GCS_BUCKET = "replited-itest"
+DEFAULT_GCS_ROOT = "/replited"
+DEFAULT_AZB_ENDPOINT = "http://127.0.0.1:10000/devstoreaccount1"
+DEFAULT_AZB_CONTAINER = "replited-itest"
+DEFAULT_AZB_ACCOUNT_NAME = "devstoreaccount1"
+DEFAULT_AZB_ACCOUNT_KEY = "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
+DEFAULT_AZB_ROOT = "/replited"
 RESTORE_SUMMARY_RE = re.compile(
     r"restore_request_cost path=(?P<path>\w+) "
     r"latest_pointer_gets=(?P<latest_pointer_gets>\d+) "
     r"generation_manifest_gets=(?P<generation_manifest_gets>\d+) "
     r"object_gets=(?P<object_gets>\d+) "
-    r"list_calls=(?P<list_calls>\d+)"
+    r"list_calls=(?P<list_calls>\d+) "
+    r"cache_hits=(?P<cache_hits>\d+) "
+    r"cache_misses=(?P<cache_misses>\d+) "
+    r"cache_write_failures=(?P<cache_write_failures>\d+)"
 )
 
 
@@ -40,6 +59,9 @@ class RestoreDiagnostics:
     generation_manifest_gets: int
     object_gets: int
     list_calls: int
+    cache_hits: int
+    cache_misses: int
+    cache_write_failures: int
     raw_line: str
 
 
@@ -47,6 +69,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("timeout", type=int, help="timeout in seconds or milliseconds")
     parser.add_argument("binary")
+    parser.add_argument(
+        "--backend",
+        choices=["fs", "s3", "gcs", "azb"],
+        default="fs",
+        help="archival backend to validate",
+    )
     return parser.parse_args()
 
 
@@ -101,7 +129,45 @@ def write_rows(db_path: Path, start_seq: int, count: int) -> None:
     conn.close()
 
 
-def render_config(env: TestEnv, db_path: Path) -> str:
+def s3_settings() -> dict[str, str]:
+    return {
+        "endpoint": os.environ.get("REPLITED_TEST_S3_ENDPOINT", DEFAULT_S3_ENDPOINT),
+        "bucket": os.environ.get("REPLITED_TEST_S3_BUCKET", DEFAULT_S3_BUCKET),
+        "region": os.environ.get("REPLITED_TEST_S3_REGION", DEFAULT_S3_REGION),
+        "access_key_id": os.environ.get(
+            "REPLITED_TEST_S3_ACCESS_KEY_ID", DEFAULT_S3_ACCESS_KEY_ID
+        ),
+        "secret_access_key": os.environ.get(
+            "REPLITED_TEST_S3_SECRET_ACCESS_KEY", DEFAULT_S3_SECRET_ACCESS_KEY
+        ),
+        "root": os.environ.get("REPLITED_TEST_S3_ROOT", DEFAULT_S3_ROOT),
+    }
+
+
+def gcs_settings() -> dict[str, str]:
+    return {
+        "endpoint": os.environ.get("REPLITED_TEST_GCS_ENDPOINT", DEFAULT_GCS_ENDPOINT),
+        "bucket": os.environ.get("REPLITED_TEST_GCS_BUCKET", DEFAULT_GCS_BUCKET),
+        "root": os.environ.get("REPLITED_TEST_GCS_ROOT", DEFAULT_GCS_ROOT),
+        "credential": os.environ.get("REPLITED_TEST_GCS_CREDENTIAL", ""),
+    }
+
+
+def azb_settings() -> dict[str, str]:
+    return {
+        "endpoint": os.environ.get("REPLITED_TEST_AZB_ENDPOINT", DEFAULT_AZB_ENDPOINT),
+        "container": os.environ.get("REPLITED_TEST_AZB_CONTAINER", DEFAULT_AZB_CONTAINER),
+        "account_name": os.environ.get(
+            "REPLITED_TEST_AZB_ACCOUNT_NAME", DEFAULT_AZB_ACCOUNT_NAME
+        ),
+        "account_key": os.environ.get(
+            "REPLITED_TEST_AZB_ACCOUNT_KEY", DEFAULT_AZB_ACCOUNT_KEY
+        ),
+        "root": os.environ.get("REPLITED_TEST_AZB_ROOT", DEFAULT_AZB_ROOT),
+    }
+
+
+def render_config(env: TestEnv, db_path: Path, backend: str) -> str:
     root = str(env.root.resolve())
     shared = f"""
 [log]
@@ -110,6 +176,7 @@ dir = "{root}/logs"
 
 [[database]]
 db = "{db_path.resolve()}"
+cache_root = "{(env.root / 'cache').resolve()}"
 min_checkpoint_page_number = 10
 max_checkpoint_page_number = 200
 truncate_page_number = 1000
@@ -119,13 +186,57 @@ wal_retention_count = 5
 max_concurrent_snapshots = 2
 """.strip()
 
-    replicate = f"""
+    if backend == "fs":
+        replicate = f"""
 [[database.replicate]]
 name = "fs-backup"
 [database.replicate.params]
 type = "fs"
 root = "{env.backup_dir.resolve()}"
 """.strip()
+    elif backend == "s3":
+        settings = s3_settings()
+        replicate = f"""
+[[database.replicate]]
+name = "s3-backup"
+[database.replicate.params]
+type = "s3"
+endpoint = "{settings['endpoint']}"
+bucket = "{settings['bucket']}"
+region = "{settings['region']}"
+root = "{settings['root']}"
+access_key_id = "{settings['access_key_id']}"
+secret_access_key = "{settings['secret_access_key']}"
+""".strip()
+    elif backend == "gcs":
+        settings = gcs_settings()
+        replicate = f"""
+[[database.replicate]]
+name = "gcs-backup"
+[database.replicate.params]
+type = "gcs"
+endpoint = "{settings['endpoint']}"
+bucket = "{settings['bucket']}"
+root = "{settings['root']}"
+credential = "{settings['credential']}"
+allow_anonymous = true
+disable_vm_metadata = true
+""".strip()
+    elif backend == "azb":
+        settings = azb_settings()
+        replicate = f"""
+[[database.replicate]]
+name = "azb-backup"
+[database.replicate.params]
+type = "azb"
+endpoint = "{settings['endpoint']}"
+container = "{settings['container']}"
+account_name = "{settings['account_name']}"
+account_key = "{settings['account_key']}"
+root = "{settings['root']}"
+""".strip()
+    else:
+        raise ValueError(f"unsupported backend: {backend}")
 
     return shared + "\n\n" + replicate + "\n"
 
@@ -177,12 +288,16 @@ def parse_restore_diagnostics(log_text: str) -> RestoreDiagnostics | None:
         generation_manifest_gets=int(match.group("generation_manifest_gets")),
         object_gets=int(match.group("object_gets")),
         list_calls=int(match.group("list_calls")),
+        cache_hits=int(match.group("cache_hits")),
+        cache_misses=int(match.group("cache_misses")),
+        cache_write_failures=int(match.group("cache_write_failures")),
         raw_line=match.group(0),
     )
 
 
 def run_restore(
     binary: Path,
+    backend: str,
     config_path: Path,
     db_path: Path,
     output_db: Path,
@@ -190,26 +305,42 @@ def run_restore(
 ) -> tuple[subprocess.CompletedProcess, RestoreDiagnostics | None]:
     remove_restore_output(output_db)
     log_offset = log_path.stat().st_size if log_path.exists() else 0
-    result = subprocess.run(
-        [
-            str(binary),
-            "--config",
-            str(config_path.resolve()),
-            "restore",
-            "--db",
-            str(db_path.resolve()),
-            "--output",
-            str(output_db),
-        ],
-        capture_output=True,
-        text=True,
-    )
+    restore_timeout = 30 if backend == "fs" else 60
+    try:
+        result = subprocess.run(
+            [
+                str(binary),
+                "--config",
+                str(config_path.resolve()),
+                "restore",
+                "--db",
+                str(db_path.resolve()),
+                "--output",
+                str(output_db),
+                "--truth-source",
+                f"{backend}-backup",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=restore_timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        result = subprocess.CompletedProcess(
+            exc.cmd,
+            124,
+            stdout=exc.stdout or "",
+            stderr=f"restore timed out after {restore_timeout}s",
+        )
     _, log_delta = read_log_delta(log_path, log_offset)
-    return result, parse_restore_diagnostics(log_delta)
+    diagnostics_text = "\n".join(
+        chunk for chunk in [result.stdout, result.stderr, log_delta] if chunk
+    )
+    return result, parse_restore_diagnostics(diagnostics_text)
 
 
 def restore_until_digest(
     binary: Path,
+    backend: str,
     config_path: Path,
     db_path: Path,
     output_db: Path,
@@ -220,7 +351,9 @@ def restore_until_digest(
     last_error = "restore never attempted"
     last_diagnostics = None
     while time.time() < deadline:
-        result, diagnostics = run_restore(binary, config_path, db_path, output_db, log_path)
+        result, diagnostics = run_restore(
+            binary, backend, config_path, db_path, output_db, log_path
+        )
         last_diagnostics = diagnostics
         if result.returncode == 0:
             if diagnostics is None:
@@ -235,11 +368,12 @@ def restore_until_digest(
                         )
                     elif diagnostics.path != "manifest":
                         last_error = (
-                            f"fs restore expected manifest path but saw {diagnostics.path}"
+                            f"{backend} restore expected manifest path but saw "
+                            f"{diagnostics.path}"
                         )
                     elif diagnostics.list_calls != 0:
                         last_error = (
-                            "fs manifest restore expected list_calls=0 but saw "
+                            f"{backend} manifest restore expected list_calls=0 but saw "
                             f"{diagnostics.list_calls}"
                         )
                     else:
@@ -267,9 +401,8 @@ def print_restore_diagnostics(backend: str, diagnostics: RestoreDiagnostics) -> 
     print(f"restore diagnostics ({backend}): {diagnostics.raw_line}")
 
 
-def verify_archival_restore(binary: Path, timeout_sec: int) -> int:
-    backend = "fs"
-    env = TestEnv("fs_integration")
+def verify_archival_restore(binary: Path, backend: str, timeout_sec: int) -> int:
+    env = TestEnv(f"{backend}_integration")
     env.setup()
 
     db_path = env.root / "test.db"
@@ -281,7 +414,7 @@ def verify_archival_restore(binary: Path, timeout_sec: int) -> int:
 
     try:
         initialize_db(db_path)
-        config_path.write_text(render_config(env, db_path))
+        config_path.write_text(render_config(env, db_path, backend))
 
         primary = start_primary(binary, config_path, env.root, primary_log)
         time.sleep(2.0)
@@ -295,6 +428,7 @@ def verify_archival_restore(binary: Path, timeout_sec: int) -> int:
         expected_digest = compute_db_digest(str(db_path))
         ok, detail, diagnostics = restore_until_digest(
             binary,
+            backend,
             config_path,
             db_path,
             restore_output,
@@ -316,6 +450,7 @@ def verify_archival_restore(binary: Path, timeout_sec: int) -> int:
         expected_digest = compute_db_digest(str(db_path))
         ok, detail, diagnostics = restore_until_digest(
             binary,
+            backend,
             config_path,
             db_path,
             restore_output,
@@ -349,7 +484,60 @@ def main() -> int:
         return 2
 
     timeout_sec = effective_timeout(args.timeout)
-    return verify_archival_restore(binary, timeout_sec)
+    return verify_archival_restore(binary, args.backend, timeout_sec)
+
+
+class IntegrationHarnessTests(unittest.TestCase):
+    def test_parse_restore_diagnostics_accepts_expanded_cache_counters(self) -> None:
+        diagnostics = parse_restore_diagnostics(
+            "restore_request_cost path=manifest "
+            "latest_pointer_gets=1 generation_manifest_gets=2 object_gets=3 list_calls=0 "
+            "cache_hits=4 cache_misses=5 cache_write_failures=6"
+        )
+
+        self.assertIsNotNone(diagnostics)
+        assert diagnostics is not None
+        self.assertEqual(diagnostics.path, "manifest")
+        self.assertEqual(diagnostics.latest_pointer_gets, 1)
+        self.assertEqual(diagnostics.generation_manifest_gets, 2)
+        self.assertEqual(diagnostics.object_gets, 3)
+        self.assertEqual(diagnostics.list_calls, 0)
+        self.assertEqual(diagnostics.cache_hits, 4)
+        self.assertEqual(diagnostics.cache_misses, 5)
+        self.assertEqual(diagnostics.cache_write_failures, 6)
+
+    def test_render_config_supports_s3_backend(self) -> None:
+        env = TestEnv("integration_config_s3")
+        db_path = env.root / "db.sqlite"
+
+        config = render_config(env, db_path, "s3")
+
+        self.assertIn('type = "s3"', config)
+        self.assertIn(f'endpoint = "{DEFAULT_S3_ENDPOINT}"', config)
+        self.assertIn(f'bucket = "{DEFAULT_S3_BUCKET}"', config)
+        self.assertIn('cache_root = "', config)
+
+    def test_render_config_supports_gcs_backend(self) -> None:
+        env = TestEnv("integration_config_gcs")
+        db_path = env.root / "db.sqlite"
+
+        config = render_config(env, db_path, "gcs")
+
+        self.assertIn('type = "gcs"', config)
+        self.assertIn(f'endpoint = "{DEFAULT_GCS_ENDPOINT}"', config)
+        self.assertIn(f'bucket = "{DEFAULT_GCS_BUCKET}"', config)
+        self.assertIn("allow_anonymous = true", config)
+        self.assertIn("disable_vm_metadata = true", config)
+
+    def test_render_config_supports_azb_backend(self) -> None:
+        env = TestEnv("integration_config_azb")
+        db_path = env.root / "db.sqlite"
+
+        config = render_config(env, db_path, "azb")
+
+        self.assertIn('type = "azb"', config)
+        self.assertIn(f'endpoint = "{DEFAULT_AZB_ENDPOINT}"', config)
+        self.assertIn(f'container = "{DEFAULT_AZB_CONTAINER}"', config)
 
 
 if __name__ == "__main__":

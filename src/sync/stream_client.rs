@@ -3,12 +3,12 @@ use tonic::transport::Channel;
 
 use crate::error::Result;
 
-use crate::sync::replication::AckLsnV2Request;
-use crate::sync::replication::AckLsnV2Response;
-use crate::sync::replication::StreamSnapshotV2Request;
-use crate::sync::replication::StreamSnapshotV2Response;
-use crate::sync::replication::StreamWalV2Request;
-use crate::sync::replication::StreamWalV2Response;
+use crate::sync::replication::AckLsnRequest;
+use crate::sync::replication::AckLsnResponse;
+use crate::sync::replication::StreamSnapshotRequest;
+use crate::sync::replication::StreamSnapshotResponse;
+use crate::sync::replication::StreamWalRequest;
+use crate::sync::replication::StreamWalResponse;
 use crate::sync::replication::replication_client::ReplicationClient;
 
 #[derive(Clone, Debug)]
@@ -25,32 +25,33 @@ impl StreamClient {
         Ok(Self { client })
     }
 
-    pub async fn stream_wal_v2(
+    pub async fn stream_wal(
         &self,
-        request: StreamWalV2Request,
-    ) -> Result<Streaming<StreamWalV2Response>> {
-        let mut client = self.client.clone();
-        let response = client.stream_wal_v2(request).await.map_err(|e| {
-            crate::error::Error::StorageError(format!("Failed to stream wal v2: {e}"))
-        })?;
-        Ok(response.into_inner())
-    }
-
-    pub async fn stream_snapshot_v2(
-        &self,
-        request: StreamSnapshotV2Request,
-    ) -> Result<Streaming<StreamSnapshotV2Response>> {
-        let mut client = self.client.clone();
-        let response = client.stream_snapshot_v2(request).await.map_err(|e| {
-            crate::error::Error::StorageError(format!("Failed to stream snapshot v2: {e}"))
-        })?;
-        Ok(response.into_inner())
-    }
-
-    pub async fn ack_lsn_v2(&self, ack: AckLsnV2Request) -> Result<AckLsnV2Response> {
+        request: StreamWalRequest,
+    ) -> Result<Streaming<StreamWalResponse>> {
         let mut client = self.client.clone();
         let response = client
-            .ack_lsn_v2(ack)
+            .stream_wal(request)
+            .await
+            .map_err(|e| crate::error::Error::StorageError(format!("Failed to stream wal: {e}")))?;
+        Ok(response.into_inner())
+    }
+
+    pub async fn stream_snapshot(
+        &self,
+        request: StreamSnapshotRequest,
+    ) -> Result<Streaming<StreamSnapshotResponse>> {
+        let mut client = self.client.clone();
+        let response = client.stream_snapshot(request).await.map_err(|e| {
+            crate::error::Error::StorageError(format!("Failed to stream snapshot: {e}"))
+        })?;
+        Ok(response.into_inner())
+    }
+
+    pub async fn ack_lsn(&self, ack: AckLsnRequest) -> Result<AckLsnResponse> {
+        let mut client = self.client.clone();
+        let response = client
+            .ack_lsn(ack)
             .await
             .map_err(|e| crate::error::Error::StorageError(format!("Failed to ack lsn: {e}")))?;
         Ok(response.into_inner())

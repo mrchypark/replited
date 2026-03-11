@@ -12,10 +12,10 @@ use crate::database::WalGenerationPos;
 use crate::error::Result;
 use crate::sqlite::{WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE, align_frame};
 use crate::sync::StreamReplicationErrorCode;
-use crate::sync::replication::stream_snapshot_v2_response::Payload as StreamSnapshotV2Payload;
-use crate::sync::replication::stream_wal_v2_response::Payload as StreamWalV2Payload;
+use crate::sync::replication::stream_snapshot_response::Payload as StreamSnapshotPayload;
+use crate::sync::replication::stream_wal_response::Payload as StreamWalPayload;
 use crate::sync::replication::{
-    AckLsnV2Request, SnapshotMeta, StreamError, StreamSnapshotV2Request, StreamWalV2Request,
+    AckLsnRequest, SnapshotMeta, StreamError, StreamSnapshotRequest, StreamWalRequest,
 };
 use crate::sync::stream_client::StreamClient;
 use crate::sync::stream_protocol::{
@@ -45,7 +45,7 @@ pub(super) async fn stream_snapshot_and_restore(
         .open(&compressed_path)
         .map_err(|e| ReplicaStreamError::Io(e.to_string()))?;
 
-    let request = StreamSnapshotV2Request {
+    let request = StreamSnapshotRequest {
         db_identity: db_identity.to_string(),
         replica_id: replica_id.to_string(),
         session_id: session_id.to_string(),
@@ -53,7 +53,7 @@ pub(super) async fn stream_snapshot_and_restore(
     };
 
     let mut stream = client
-        .stream_snapshot_v2(request)
+        .stream_snapshot(request)
         .await
         .map_err(|e| ReplicaStreamError::Transport(e.to_string()))?;
 
@@ -72,7 +72,7 @@ pub(super) async fn stream_snapshot_and_restore(
         };
 
         match response.payload {
-            Some(StreamSnapshotV2Payload::Meta(snapshot_meta)) => {
+            Some(StreamSnapshotPayload::Meta(snapshot_meta)) => {
                 if meta.is_some() {
                     return Err(ReplicaStreamError::InvalidResponse(
                         "snapshot meta received twice".to_string(),
@@ -80,7 +80,7 @@ pub(super) async fn stream_snapshot_and_restore(
                 }
                 meta = Some(snapshot_meta);
             }
-            Some(StreamSnapshotV2Payload::Chunk(chunk)) => {
+            Some(StreamSnapshotPayload::Chunk(chunk)) => {
                 if meta.is_none() {
                     return Err(ReplicaStreamError::InvalidResponse(
                         "snapshot chunk before meta".to_string(),
@@ -92,7 +92,7 @@ pub(super) async fn stream_snapshot_and_restore(
                 hasher.update(&chunk);
                 total_bytes += chunk.len() as u64;
             }
-            Some(StreamSnapshotV2Payload::Error(err)) => {
+            Some(StreamSnapshotPayload::Error(err)) => {
                 return Err(map_stream_error(err));
             }
             None => {
@@ -192,7 +192,7 @@ pub(super) async fn stream_wal_and_apply(
             ack_floor = Some(start_pos);
         }
     }
-    let request = StreamWalV2Request {
+    let request = StreamWalRequest {
         db_identity: db_identity.to_string(),
         replica_id: replica_id.to_string(),
         session_id: session_id.to_string(),
@@ -200,7 +200,7 @@ pub(super) async fn stream_wal_and_apply(
     };
 
     let mut stream = client
-        .stream_wal_v2(request)
+        .stream_wal(request)
         .await
         .map_err(|e| ReplicaStreamError::Transport(e.to_string()))?;
 
@@ -223,7 +223,7 @@ pub(super) async fn stream_wal_and_apply(
         };
 
         match response.payload {
-            Some(StreamWalV2Payload::Chunk(chunk)) => {
+            Some(StreamWalPayload::Chunk(chunk)) => {
                 let chunk_start_token = chunk.start_lsn.as_ref().ok_or_else(|| {
                     ReplicaStreamError::InvalidResponse("chunk missing start lsn".to_string())
                 })?;
@@ -323,7 +323,7 @@ pub(super) async fn stream_wal_and_apply(
 
                 current_pos = chunk_next;
             }
-            Some(StreamWalV2Payload::Error(err)) => {
+            Some(StreamWalPayload::Error(err)) => {
                 return Err(map_stream_error(err));
             }
             None => {
@@ -355,17 +355,17 @@ pub(super) async fn ack_lsn_or_warn(
     session_id: &str,
     pos: &WalGenerationPos,
 ) -> Result<(), ReplicaStreamError> {
-    let ack = AckLsnV2Request {
+    let ack = AckLsnRequest {
         db_identity: db_identity.to_string(),
         replica_id: replica_id.to_string(),
         session_id: session_id.to_string(),
         last_applied_lsn: Some(lsn_token_from_pos(pos)),
     };
 
-    let response = match client.ack_lsn_v2(ack).await {
+    let response = match client.ack_lsn(ack).await {
         Ok(resp) => resp,
         Err(err) => {
-            warn!("ack_lsn_v2 transport failed: {err}");
+            warn!("ack_lsn transport failed: {err}");
             return Ok(());
         }
     };
@@ -375,7 +375,7 @@ pub(super) async fn ack_lsn_or_warn(
     }
 
     let err = response.error.ok_or_else(|| {
-        ReplicaStreamError::InvalidResponse("AckLsnV2Response rejected without error".to_string())
+        ReplicaStreamError::InvalidResponse("AckLsnResponse rejected without error".to_string())
     })?;
     Err(map_stream_error(err))
 }
