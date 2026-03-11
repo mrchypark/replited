@@ -2,6 +2,8 @@
 
 Stream replication enables real-time WAL (Write-Ahead Log) synchronization between Primary and Replica databases over gRPC.
 
+This document covers the `stream` lane only. Archival publish/restore is a separate manifest-backed `fs` path in the current breaking cut.
+
 ## Architecture Overview
 
 ```

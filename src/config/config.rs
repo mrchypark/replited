@@ -235,6 +235,18 @@ impl DbConfig {
             ));
         }
 
+        for storage in &self.replicate {
+            match &storage.params {
+                StorageParams::Fs(_) | StorageParams::Stream(_) => {}
+                other => {
+                    return Err(Error::InvalidConfig(format!(
+                        "manifest-only archival runtime supports only fs archival storage; unsupported backend in db {}: {}",
+                        self.db, other
+                    )))
+                }
+            }
+        }
+
         if self.min_checkpoint_page_number == 0 {
             return Err(Error::InvalidConfig(
                 "min_checkpoint_page_number cannot be zero",
@@ -291,7 +303,7 @@ impl Debug for StorageConfig {
 mod tests {
     use super::*;
 
-    use crate::config::StorageFsConfig;
+    use crate::config::{StorageFsConfig, StorageFtpConfig, StorageStreamConfig};
 
     fn create_valid_storage_config() -> StorageConfig {
         StorageConfig {
@@ -358,6 +370,31 @@ mod tests {
     fn test_db_config_validate_success() {
         let config = create_valid_db_config();
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_db_config_validate_rejects_unsupported_archival_backend() {
+        let mut config = create_valid_db_config();
+        config.replicate = vec![StorageConfig {
+            name: "ftp-backup".to_string(),
+            params: StorageParams::Ftp(Box::new(StorageFtpConfig::default())),
+        }];
+
+        let err = config
+            .validate()
+            .expect_err("unsupported archival backend should fail");
+        assert_eq!(err.code(), Error::INVALID_CONFIG);
+    }
+
+    #[test]
+    fn test_db_config_validate_allows_stream_backend() {
+        let mut config = create_valid_db_config();
+        config.replicate = vec![StorageConfig {
+            name: "stream-replica".to_string(),
+            params: StorageParams::Stream(Box::new(StorageStreamConfig::default())),
+        }];
+
+        config.validate().expect("stream backend should remain supported");
     }
 
     #[test]

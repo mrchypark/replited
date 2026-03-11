@@ -105,15 +105,27 @@ impl Database {
         }
         Ok(())
     }
+
+    pub(super) async fn handle_db_snapshot_new_generation_command(
+        &mut self,
+        index: usize,
+    ) -> Result<()> {
+        self.ensure_wal_exists().await?;
+        self.create_generation().await?;
+        self.handle_db_snapshot_command(index).await
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
 
     use tempfile::tempdir;
+    use tokio::sync::mpsc;
 
     use super::*;
+    use crate::sync::ReplicateCommand;
 
     fn stream_only_db_config(db_path: &str) -> DbConfig {
         let toml_str = format!(
@@ -167,5 +179,35 @@ addr = "http://127.0.0.1:50051"
             db.tx_connection.is_none(),
             "snapshot leaked read lock (tx_connection still set); err={err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn forced_new_generation_snapshot_command_emits_newer_generation() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("primary.db");
+
+        let config = stream_only_db_config(db_path.to_string_lossy().as_ref());
+        let (mut db, _rx) = Database::try_create(config).await.expect("create db");
+        let (sync_tx, mut sync_rx) = mpsc::channel(2);
+        db.sync_notifiers = vec![Some(sync_tx)];
+
+        db.handle_db_snapshot_command(0)
+            .await
+            .expect("first snapshot command");
+        let first_generation = match sync_rx.recv().await.expect("first snapshot notification") {
+            ReplicateCommand::Snapshot((pos, _compressed)) => pos.generation,
+            other => panic!("expected snapshot notification, got {other:?}"),
+        };
+
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        db.handle_db_snapshot_new_generation_command(0)
+            .await
+            .expect("forced new-generation snapshot command");
+        let second_generation = match sync_rx.recv().await.expect("second snapshot notification") {
+            ReplicateCommand::Snapshot((pos, _compressed)) => pos.generation,
+            other => panic!("expected snapshot notification, got {other:?}"),
+        };
+
+        assert!(second_generation > first_generation);
     }
 }

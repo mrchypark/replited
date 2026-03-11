@@ -1,6 +1,7 @@
 use clap::Parser;
 use clap::Subcommand;
 
+use crate::base::Generation;
 use crate::error::Error;
 use crate::error::Result;
 
@@ -30,6 +31,8 @@ pub enum ArgCommand {
     },
 
     Restore(RestoreOptions),
+
+    PurgeGeneration(PurgeGenerationOptions),
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -66,5 +69,61 @@ impl RestoreOptions {
         }
 
         Ok(())
+    }
+}
+
+#[derive(Parser, Debug, Clone)]
+pub struct PurgeGenerationOptions {
+    #[arg(short, long, default_value = "")]
+    pub db: String,
+
+    #[arg(long, default_value = "")]
+    pub generation: String,
+}
+
+impl PurgeGenerationOptions {
+    pub fn validate(&self) -> Result<()> {
+        if self.db.is_empty() {
+            return Err(Error::InvalidArg("arg MUST Specify db path in config"));
+        }
+
+        if self.generation.is_empty() {
+            return Err(Error::InvalidArg("arg MUST Specify generation"));
+        }
+
+        Generation::try_create(&self.generation).map_err(|err| {
+            Error::InvalidArg(format!("arg MUST Specify valid generation: {err}"))
+        })?;
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PurgeGenerationOptions;
+
+    #[test]
+    fn purge_generation_options_reject_invalid_generation_string() {
+        let err = PurgeGenerationOptions {
+            db: "/tmp/test.db".to_string(),
+            generation: "../../escape".to_string(),
+        }
+        .validate()
+        .expect_err("invalid generation should fail");
+
+        assert_eq!(err.code(), crate::error::Error::INVALID_ARG);
+    }
+
+    #[test]
+    fn purge_generation_options_accept_valid_generation_string() {
+        let generation = crate::base::Generation::new();
+
+        PurgeGenerationOptions {
+            db: "/tmp/test.db".to_string(),
+            generation: generation.as_str().to_string(),
+        }
+        .validate()
+        .expect("valid generation should pass");
     }
 }

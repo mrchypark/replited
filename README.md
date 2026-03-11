@@ -19,29 +19,30 @@
 
 ## Introduction
 
-Inspired by [Litestream](https://litestream.io/), with the power of [Rust](https://www.rust-lang.org/) and [OpenDAL](https://opendal.apache.org/), replited target to replicate sqlite to everywhere(file system,s3,ftp,google drive,dropbox,etc).
+Inspired by [Litestream](https://litestream.io/) and built in [Rust](https://www.rust-lang.org/), replited provides:
+- manifest-backed archival replication to `fs`
+- stream replication between a Primary and read-only replicas
 
 ## Why replited
 * Using sqlite's [WAL](https://sqlite.org/wal.html) mechanism, instead of backing up full data every time, do incremental backup of data to reduce the amount of synchronised data;
-* Support for multiple types of storage backends,such as s3,gcs,ftp,local file system,etc.
+* Support for two distinct replication lanes:
+  * archival replication to local file system storage (`fs`)
+  * low-latency stream replication over gRPC
 
 ## Support Backend
 
-| Type                       | Services                                                     |
-| -------------------------- | ------------------------------------------------------------ |
-| Standard Storage Protocols | ftp![CI](https://github.com/mrchypark/replited/actions/workflows/ftp_integration_test.yml/badge.svg) |
-| Object Storage Services    | [azblob] [gcs] <br> [s3]![CI](https://github.com/mrchypark/replited/actions/workflows/s3_integration_test.yml/badge.svg) |
-| File Storage Services      | fs![CI](https://github.com/mrchypark/replited/actions/workflows/fs_integration_test.yml/badge.svg) |
+| Lane | Supported backend |
+| --- | --- |
+| Archival replication | `fs` ![CI](https://github.com/mrchypark/replited/actions/workflows/fs_integration_test.yml/badge.svg) |
+| Stream replication | `stream` |
 
-[azblob]: https://azure.microsoft.com/en-us/services/storage/blobs/
-[gcs]: https://cloud.google.com/storage
-[s3]: https://aws.amazon.com/s3/
+Archival restore/publish is manifest-only in this breaking cut. Legacy archival compatibility backends such as `ftp`, `s3`, `gcs`, and `azblob` are not supported in the runtime path.
 
 
 
 ## Quick Start
 
-Start a daemon to replicate sqlite:
+Start a daemon to replicate sqlite to archival `fs` storage:
 
 ```shell
 replited --config {config file} replicate 
@@ -56,6 +57,11 @@ replited --config {config file} restore --db {db in config file} --output {outpu
 ## Config
 
 See [config.md](./config.md)
+
+Archival support in the current breaking cut:
+- `type = "fs"` for manifest-backed archival publish/restore
+- `type = "stream"` for Primary/Replica streaming
+- other archival backends are intentionally unsupported in runtime
 See stream-specific docs:
 - [Streaming Copy Config Guide](./docs/stream-copy-config.md)
 - [Replica Sidecar Config Guide](./docs/sidecar-config.md)

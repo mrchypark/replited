@@ -69,6 +69,7 @@ pub use snapshot::{SnapshotStreamData, snapshot_for_stream};
 #[derive(Clone, Debug)]
 pub enum DbCommand {
     Snapshot(usize),
+    SnapshotNewGeneration(usize),
 }
 
 #[derive(Debug, Clone)]
@@ -990,6 +991,9 @@ impl Database {
     pub async fn handle_db_command(&mut self, cmd: DbCommand) -> Result<()> {
         match cmd {
             DbCommand::Snapshot(i) => self.handle_db_snapshot_command(i).await?,
+            DbCommand::SnapshotNewGeneration(i) => {
+                self.handle_db_snapshot_new_generation_command(i).await?
+            }
         }
         Ok(())
     }
