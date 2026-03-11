@@ -3,12 +3,14 @@ use std::time::SystemTime;
 
 use chrono::DateTime;
 use chrono::Utc;
+use jiff::Timestamp;
 use log::debug;
 use log::error;
 use log::warn;
 use opendal::Metadata;
 use opendal::Metakey;
 use opendal::Operator;
+use tracing::instrument;
 
 use super::init_operator;
 use crate::base::Generation;
@@ -70,6 +72,11 @@ fn metadata_last_modified_or_epoch(metadata: &Metadata, entry_name: &str) -> Dat
             DateTime::<Utc>::from(SystemTime::UNIX_EPOCH)
         }
     }
+}
+
+fn now_utc_from_jiff() -> DateTime<Utc> {
+    let now_system_time: SystemTime = Timestamp::now().into();
+    DateTime::<Utc>::from(now_system_time)
 }
 
 fn snapshot_position_is_newer(index: u64, offset: u64, current: Option<(u64, u64)>) -> bool {
@@ -153,7 +160,7 @@ impl StorageClient {
             index: pos.index,
             offset: pos.offset,
             size: compressed_data.len() as u64,
-            created_at: Utc::now(),
+            created_at: now_utc_from_jiff(),
         };
 
         self.ensure_parent_exist(&snapshot_file).await?;
@@ -368,6 +375,7 @@ impl StorageClient {
         Ok(restore_wal_segments.into_iter().collect())
     }
 
+    #[instrument(skip_all, fields(db = %self.db_name))]
     pub async fn restore_info(&self, limit: Option<DateTime<Utc>>) -> Result<Option<RestoreInfo>> {
         let dir = remote_generations_dir(&self.db_name);
         debug!("restore_info: listing generations in {dir}");

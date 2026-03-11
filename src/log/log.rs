@@ -3,6 +3,7 @@ use std::num::NonZeroUsize;
 use logforth::append::file::FileBuilder;
 use logforth::layout::TextLayout;
 use logforth::record::LevelFilter;
+use tracing_subscriber::EnvFilter;
 
 use crate::config::LogConfig;
 use crate::config::LogLevel;
@@ -10,7 +11,7 @@ use crate::error::Error;
 use crate::error::Result;
 
 pub fn init_log(log_config: LogConfig) -> Result<()> {
-    let level: LevelFilter = match log_config.level {
+    let level: LevelFilter = match &log_config.level {
         LogLevel::Error => LevelFilter::Error,
         LogLevel::Warn => LevelFilter::Warn,
         LogLevel::Info => LevelFilter::Info,
@@ -30,6 +31,20 @@ pub fn init_log(log_config: LogConfig) -> Result<()> {
     logforth::starter_log::builder()
         .dispatch(|d| d.filter(level).append(file))
         .apply();
+
+    let tracing_level = match &log_config.level {
+        LogLevel::Error => "error",
+        LogLevel::Warn => "warn",
+        LogLevel::Info => "info",
+        LogLevel::Debug => "debug",
+        LogLevel::Trace => "trace",
+        LogLevel::Off => "off",
+    };
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::new(tracing_level))
+        .with_target(false)
+        .with_ansi(false)
+        .try_init();
 
     Ok(())
 }

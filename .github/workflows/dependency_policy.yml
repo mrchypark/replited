@@ -1,0 +1,25 @@
+name: Dependency policy
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  cargo-deny:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout codes
+        uses: actions/checkout@v4
+
+      - name: Setup build env
+        uses: ./.github/actions/setup
+
+      - name: Install cargo-deny
+        run: cargo install --locked --version 0.19.0 cargo-deny
+
+      - name: Run cargo-deny
+        continue-on-error: true
+        run: cargo deny check advisories bans sources --hide-inclusion-graph

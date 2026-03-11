@@ -389,8 +389,11 @@ async fn load_db_page_size(db_path: &str) -> Result<u64, ReplicaStreamError> {
 
 fn load_db_page_size_sync(db_path: &str) -> Result<u64, ReplicaStreamError> {
     let conn = Connection::open(db_path).map_err(|e| ReplicaStreamError::Io(e.to_string()))?;
-    conn.pragma_query_value(None, "page_size", |row| row.get(0))
-        .map_err(|e| ReplicaStreamError::Io(e.to_string()))
+    let page_size_i64: i64 = conn
+        .pragma_query_value(None, "page_size", |row| row.get(0))
+        .map_err(|e| ReplicaStreamError::Io(e.to_string()))?;
+    u64::try_from(page_size_i64)
+        .map_err(|_| ReplicaStreamError::Io(format!("invalid sqlite page_size: {page_size_i64}")))
 }
 
 fn expected_frames_from_wal_file(db_path: &str, page_size: u64) -> Result<u32, ReplicaStreamError> {

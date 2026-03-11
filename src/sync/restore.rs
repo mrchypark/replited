@@ -1,12 +1,14 @@
 use std::fs;
 
 use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use log::debug;
 use log::error;
 use log::info;
 use log::warn;
 use rusqlite::Connection;
 use tempfile::NamedTempFile;
+use tracing::instrument;
 
 use crate::base::parent_dir;
 use crate::config::DbConfig;
@@ -68,6 +70,7 @@ impl Restore {
         Ok(latest_restore_info)
     }
 
+    #[instrument(skip_all, fields(db = %self.db))]
     pub async fn run(&self) -> Result<Option<crate::database::WalGenerationPos>> {
         // Ensure output path does not already exist.
         if !self.options.follow {
@@ -266,9 +269,11 @@ fn parse_limit_timestamp(timestamp: &str) -> Result<Option<DateTime<Utc>>> {
         return Ok(None);
     }
 
-    let parsed = DateTime::parse_from_rfc3339(timestamp)
+    let parsed = timestamp
+        .parse::<Timestamp>()
         .map_err(|err| Error::InvalidArg(format!("invalid --timestamp {timestamp:?}: {err}")))?;
-    Ok(Some(parsed.with_timezone(&Utc)))
+    let parsed_system_time: std::time::SystemTime = parsed.into();
+    Ok(Some(DateTime::<Utc>::from(parsed_system_time)))
 }
 
 fn output_parent_dir(path: &str) -> Result<String> {
