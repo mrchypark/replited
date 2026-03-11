@@ -1,60 +1,71 @@
-# PocketBase Replication Example
+# PocketBase Live Example
 
-This example demonstrates how to use `replited` to replicate a PocketBase database in real-time.
+This example runs a real PocketBase primary and replica on the host machine and uses `replited` streaming replication between them.
 
-## Structure
+## Topology
 
-- **Primary**: PocketBase (8090) + Replited (Sidecar mode)
-- **Replica**: PocketBase (8091) + Replited (Sidecar mode)
+- Primary PocketBase: `127.0.0.1:8090`
+- Primary `replited`: stream server on `127.0.0.1:50051`
+- Replica `replited`: `replica-sidecar --exec "...pocketbase serve..."`
+- Replica PocketBase: `127.0.0.1:8091`
+
+The replica PocketBase process is supervised by `replica-sidecar`, which allows `replited` to gate PocketBase during restore and recovery.
 
 ## Prerequisites
 
-- Docker
-- Docker Compose
+- `cargo build --release`
+- `curl`
+- `unzip`
+- `python3`
 
-## Quick Start
+The demo script auto-downloads the official PocketBase binary into `example/bin/` if it is missing.
 
-1.  **Start Services**:
+## Canonical Path
 
-    ```bash
-    docker-compose up --build -d
-    ```
+The host-based script is the canonical example for this repository.
 
-2.  **Verify Replication**:
+- Use [run_pocketbase_live_demo.sh](/Users/cypark/Documents/project/replited/example/run_pocketbase_live_demo.sh) for the supported live demo.
+- The Docker Compose files in this folder are retained as legacy reference material and are not the primary maintained path.
 
-    - Open **Primary Admin UI**: http://127.0.0.1:8090/_/
-      - Create an admin account.
-      - Create a collection (e.g., `posts`) and add a record.
-    - Open **Replica Admin UI**: http://127.0.0.1:8091/_/
-      - Log in with the same credentials (it's replicated!).
-      - View the `posts` collection. You should see the record created in Primary.
-
-3.  **Check Logs**:
-    ```bash
-    docker-compose logs -f primary-replited replica-replited
-    ```
-
-## Child Process Mode (Recommended for Replica)
-
-This example uses the **Child Process Mode** for the Replica.
-In this mode, `replited` acts as the supervisor for the PocketBase process.
+## Run
 
 ```bash
-replited replica-sidecar --exec "/usr/local/bin/pocketbase serve ..."
+bash example/run_pocketbase_live_demo.sh
 ```
 
-**Benefits:**
+The script:
 
-1.  **Auto-Restore**: If replication fails (e.g. WAL checksum mismatch or Stuck WAL), `replited` can stop PocketBase, delete the corrupt DB, download a fresh snapshot, and restart PocketBase automatically.
-2.  **Schema Updates**: (Future) Can restart PocketBase when schema changes are detected to clear in-memory cache.
+1. Creates runtime directories under `example/runtime/`
+2. Starts PocketBase primary on the host
+3. Starts `replited replicate`
+4. Creates a PocketBase superuser on primary
+5. Starts `replica-sidecar --force-restore --exec "...pocketbase serve..."`
+6. Waits for the replica PocketBase health check
+7. Runs `example/verify_pocketbase.py`
 
-To support this, the `replica-replited` service uses a custom image (`example/replica.Dockerfile`) that contains both `replited` and `pocketbase` binaries.
+## What You Should See
 
-## Configuration
+- Primary Admin UI: [http://127.0.0.1:8090/_/](http://127.0.0.1:8090/_/)
+- Replica Admin UI: [http://127.0.0.1:8091/_/](http://127.0.0.1:8091/_/)
 
-- `config/primary.toml`: Configures `replited` to stream changes from `/pb_data/data.db` on port 50051.
-- `config/replica.toml`: Configures `replited` to connect to `primary-replited:50051` and apply changes to its local `/pb_data/data.db`.
+`verify_pocketbase.py` logs into the primary, creates a public `notes` collection, inserts a record, and confirms that the record appears on the replica.
 
-## Note
+## Non-Interactive Run
 
-The replica is **Read-Only** by definition of SQLite replication. Writing to the replica database will fail or cause divergence.
+To run the verification and exit immediately after success:
+
+```bash
+DEMO_HOLD=0 bash example/run_pocketbase_live_demo.sh
+```
+
+## Runtime Logs
+
+- `example/runtime/logs/primary-pocketbase.log`
+- `example/runtime/logs/primary-replited.log`
+- `example/runtime/logs/replica-sidecar.log`
+
+## Important Notes
+
+- The replica database is read-only from the application perspective.
+- The primary and replica each use distinct `cache_root` directories.
+- This example is host-based on purpose so it avoids Docker image/build instability and shows the actual release binary behavior.

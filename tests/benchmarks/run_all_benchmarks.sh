@@ -18,6 +18,9 @@ cargo build --release --manifest-path ../../Cargo.toml
 # Create output directory
 mkdir -p results
 
+echo "JSON summaries are written to tests/benchmarks/results/."
+echo "Transient DB/log artifacts are recreated under tests/output/benchmarks/ or local benchmark cwd directories."
+
 echo ""
 echo "=== Running Throughput Benchmark ==="
 python3 throughput_bench.py -n 300 -p 1024,10240 -o results/throughput_results.json
