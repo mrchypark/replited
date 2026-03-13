@@ -35,13 +35,13 @@ reqwest = { version = "0.12", default-features = false, features = [
   "rustls-tls-native-roots",
 ] }
 reqwest-hickory-resolver = "0.1"
-rusqlite = { version = "0.32.1", features = ["bundled"] }
+rusqlite = { version = "0.38.0", features = ["bundled"] }
 serde = { version = "1.0.164", features = ["derive", "rc"] }
 serde_json = "1.0"
 sha2 = "0.10"
 tempfile = "3.13.0"
-thiserror = { version = "1" }
-toml = "0.8.14"
+thiserror = { version = "2" }
+toml = "0.9"
 tokio = { version = "1.35.0", features = ["full"] }
 uuid = { version = "1.10.0", features = ["v7"] }
 tonic = "0.11"

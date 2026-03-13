@@ -111,7 +111,10 @@ impl Database {
         info!("Creating internal tables");
         Database::create_internal_tables(&connection)?;
 
-        let page_size = connection.pragma_query_value(None, "page_size", |row| row.get(0))?;
+        let page_size_i64: i64 =
+            connection.pragma_query_value(None, "page_size", |row| row.get(0))?;
+        let page_size = u64::try_from(page_size_i64)
+            .map_err(|_| Error::SqliteError(format!("invalid PRAGMA page_size: {page_size_i64}")))?;
         let wal_file = format!("{}-wal", config.db);
 
         // init path
