@@ -24,6 +24,7 @@ log = "0.4.17"
 
 
 logforth = { version = "0.28.1", features = ["starter-log"] }
+litetx = { path = "vendor/litetx" }
 lz4 = "1.26.0"
 parking_lot = "0.12.1"
 paste = "1.0.9"
@@ -68,5 +69,11 @@ path = "src/lib.rs"
 name = "replited"
 path = "src/main.rs"
 required-features = ["storage"]
+doctest = false
+test = true
+
+[[bin]]
+name = "ltx_probe"
+path = "src/bin/ltx_probe.rs"
 doctest = false
 test = true

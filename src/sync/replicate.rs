@@ -60,6 +60,7 @@ pub struct Replicate {
     position: Arc<RwLock<WalGenerationPos>>,
     state: ReplicateState,
     wait_snapshot_started_at: Option<Instant>,
+    pending_db_changed: Option<WalGenerationPos>,
     info: DatabaseInfo,
     config: StorageConfig,
 }
@@ -99,6 +100,7 @@ impl Replicate {
             config,
             state: ReplicateState::WaitDbChanged,
             wait_snapshot_started_at: None,
+            pending_db_changed: None,
             info,
         })
     }
@@ -319,6 +321,15 @@ impl Replicate {
         self.wait_snapshot_started_at = None;
     }
 
+    fn next_sync_target_after_snapshot(
+        pending: Option<WalGenerationPos>,
+        snapshot_pos: &WalGenerationPos,
+    ) -> WalGenerationPos {
+        pending
+            .filter(|pos| !pos.is_empty())
+            .unwrap_or_else(|| snapshot_pos.clone())
+    }
+
     fn manifest_snapshot_resume_position(pos: &WalGenerationPos) -> WalGenerationPos {
         WalGenerationPos {
             generation: pos.generation.clone(),
@@ -367,10 +378,11 @@ impl Replicate {
             .publish_manifest_snapshot(&pos, compressed_data)
             .await?;
         *self.position.write() = Self::manifest_snapshot_resume_position(&pos);
+        let next_pos = Self::next_sync_target_after_snapshot(self.pending_db_changed.take(), &pos);
 
         // change state from WaitSnapshot to WaitDbChanged
         self.leave_wait_snapshot();
-        self.sync(pos).await
+        self.sync(next_pos).await
     }
 
     async fn maybe_request_manifest_rollover(&mut self, generation: &Generation) -> Result<bool> {
@@ -496,6 +508,7 @@ impl Replicate {
                 );
                 self.leave_wait_snapshot();
             } else {
+                self.pending_db_changed = Some(pos);
                 return Ok(());
             }
         }
@@ -526,6 +539,7 @@ impl Replicate {
             );
             if snapshots.is_empty() {
                 // Create snapshot if no snapshots exist for generation.
+                self.pending_db_changed = Some(pos);
                 self.db_notifier
                     .send(DbCommand::Snapshot(self.index))
                     .await?;
@@ -592,6 +606,76 @@ mod tests {
         assert_eq!(resumed.generation, pos.generation);
         assert_eq!(resumed.index, pos.index);
         assert_eq!(resumed.offset, 0);
+    }
+
+    #[test]
+    fn next_sync_target_after_snapshot_prefers_pending_db_changed_position() {
+        use crate::base::Generation;
+        use crate::database::WalGenerationPos;
+
+        let generation = Generation::new();
+        let snapshot_pos = WalGenerationPos {
+            generation: generation.clone(),
+            index: 1,
+            offset: 4152,
+        };
+        let pending = WalGenerationPos {
+            generation,
+            index: 1,
+            offset: 16512,
+        };
+
+        let next = super::Replicate::next_sync_target_after_snapshot(
+            Some(pending.clone()),
+            &snapshot_pos,
+        );
+
+        assert_eq!(next, pending);
+    }
+
+    #[tokio::test]
+    async fn sync_requests_snapshot_and_remembers_pending_db_changed_position() {
+        use tempfile::tempdir;
+        use tokio::sync::mpsc;
+
+        use crate::base::Generation;
+        use crate::config::{StorageConfig, StorageFsConfig, StorageParams};
+        use crate::database::{DatabaseInfo, DbCommand, WalGenerationPos};
+
+        let temp = tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage");
+        let storage_cfg = StorageConfig {
+            name: "fs".to_string(),
+            params: StorageParams::Fs(Box::new(StorageFsConfig {
+                root: storage_root.to_string_lossy().to_string(),
+            })),
+        };
+        let (db_notifier, mut db_rx) = mpsc::channel(1);
+        let info = DatabaseInfo {
+            meta_dir: temp.path().to_string_lossy().to_string(),
+            page_size: 4096,
+        };
+        let mut replicate =
+            super::Replicate::new_for_test(
+                storage_cfg,
+                "data.db".to_string(),
+                0,
+                db_notifier,
+                info,
+            )
+                .await
+                .expect("create replicate");
+        let pos = WalGenerationPos {
+            generation: Generation::new(),
+            index: 1,
+            offset: 16512,
+        };
+
+        replicate.sync(pos.clone()).await.expect("request snapshot");
+
+        assert_eq!(replicate.state, super::ReplicateState::WaitSnapshot);
+        assert_eq!(replicate.pending_db_changed, Some(pos));
+        assert!(matches!(db_rx.recv().await, Some(DbCommand::Snapshot(0))));
     }
 
     #[test]

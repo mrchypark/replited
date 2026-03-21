@@ -43,6 +43,31 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+fn table_digest(db_path: &Path, table: &str) -> String {
+    let conn = Connection::open(db_path).expect("open digest db");
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT id, v FROM {table} ORDER BY id"
+        ))
+        .expect("prepare digest query");
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+            ))
+        })
+        .expect("query digest rows")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect digest rows");
+
+    let mut hasher = Sha256::new();
+    for (id, value) in rows {
+        hasher.update(format!("{id}:{value}\n"));
+    }
+    format!("{:x}", hasher.finalize())
+}
+
 #[derive(Serialize)]
 struct TestManifestWalPack {
     start_lsn: u64,
@@ -77,25 +102,26 @@ struct TestLatestPointer {
 
 fn seed_manifest_artifacts(
     backup_root: &Path,
+    db_name: &str,
     generation: &Generation,
     snapshot_bytes: &[u8],
     wal_bytes: &[u8],
 ) {
-    let snapshot_key = snapshot_file("db.db", generation.as_str(), 0, 0);
+    let snapshot_key = snapshot_file(db_name, generation.as_str(), 0, 0);
     let wal_key = format!(
-        "db.db/generations/{}/wal/ranges/0000000000_0000000000_0000000000_{:010}/0000000000_0000000000.wal.zst",
+        "{db_name}/generations/{}/wal/ranges/0000000000_0000000000_0000000000_{:010}/0000000000_0000000000.wal.zst",
         generation.as_str(),
         wal_bytes.len()
     );
     let manifest_key = format!(
-        "db.db/manifests/generations/{}.manifest.json",
+        "{db_name}/manifests/generations/{}.manifest.json",
         generation.as_str()
     );
 
     let snapshot_path = backup_root.join(&snapshot_key);
     let wal_path = backup_root.join(&wal_key);
     let manifest_path = backup_root.join(&manifest_key);
-    let latest_path = backup_root.join("db.db/pointers/latest.json");
+    let latest_path = backup_root.join(format!("{db_name}/pointers/latest.json"));
 
     fs::create_dir_all(snapshot_path.parent().expect("snapshot parent")).expect("snapshot dir");
     fs::create_dir_all(wal_path.parent().expect("wal parent")).expect("wal dir");
@@ -194,7 +220,13 @@ async fn restore_outputs_db_wal_shm_set_and_reads_latest_rows() {
     };
     let snapshot_bytes = fs::read(&src_db_path).expect("read source snapshot db");
     let generation = Generation::new();
-    seed_manifest_artifacts(&backup_root, &generation, &snapshot_bytes, &wal_bytes);
+    seed_manifest_artifacts(
+        &backup_root,
+        "db.db",
+        &generation,
+        &snapshot_bytes,
+        &wal_bytes,
+    );
 
     fs::write(
         &config_path,
@@ -287,4 +319,91 @@ async fn restore_outputs_db_wal_shm_set_and_reads_latest_rows() {
         fs::exists(format!("{output_path_str}-shm")).expect("shm exists"),
         "opening restored db should create SHM"
     );
+}
+
+#[tokio::test]
+async fn restore_with_large_manifest_wal_pack_matches_source_digest() {
+    let dir = tempdir().expect("tempdir");
+    let backup_root = dir.path().join("storage");
+    let src_db_path = dir.path().join("source.db");
+    let src_db_path_str = src_db_path.to_string_lossy().to_string();
+
+    {
+        let conn = Connection::open(&src_db_path_str).expect("open source db");
+        conn.execute_batch("PRAGMA journal_mode=WAL;")
+            .expect("enable wal");
+        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL);")
+            .expect("create table");
+        conn.execute("INSERT INTO t (v) VALUES ('seed');", [])
+            .expect("insert seed row");
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_row| Ok(()))
+            .expect("checkpoint seed row");
+    }
+
+    let conn = Connection::open(&src_db_path_str).expect("reopen source db");
+    conn.execute_batch("PRAGMA journal_mode=WAL;")
+        .expect("ensure wal");
+    conn.execute_batch("PRAGMA wal_autocheckpoint=0;")
+        .expect("disable autocheckpoint");
+    let tx = conn.unchecked_transaction().expect("begin tx");
+    for idx in 0..256_i64 {
+        tx.execute(
+            "INSERT INTO t (v) VALUES (?1);",
+            [format!("value-{idx:04}")],
+        )
+        .expect("insert row");
+    }
+    tx.commit().expect("commit rows");
+
+    let snapshot_bytes = fs::read(&src_db_path).expect("read source snapshot");
+    let wal_bytes = fs::read(format!("{src_db_path_str}-wal")).expect("read source wal");
+    drop(conn);
+    let expected_digest = table_digest(&src_db_path, "t");
+    let generation = Generation::new();
+    seed_manifest_artifacts(
+        &backup_root,
+        "source.db",
+        &generation,
+        &snapshot_bytes,
+        &wal_bytes,
+    );
+
+    let output_path = dir.path().join("restored.db");
+    let output_path_str = output_path.to_string_lossy().to_string();
+    let config = DbConfig {
+        db: "source.db".to_string(),
+        replicate: vec![StorageConfig {
+            name: "fs-backup".to_string(),
+            params: StorageParams::Fs(Box::new(StorageFsConfig {
+                root: backup_root.to_string_lossy().to_string(),
+            })),
+        }],
+        cache_root: Some(dir.path().join("cache").to_string_lossy().to_string()),
+        min_checkpoint_page_number: 1000,
+        max_checkpoint_page_number: 10000,
+        truncate_page_number: 500000,
+        checkpoint_interval_secs: 60,
+        monitor_interval_ms: 1000,
+        apply_checkpoint_frame_interval: 128,
+        apply_checkpoint_interval_ms: 2000,
+        wal_retention_count: 10,
+        max_concurrent_snapshots: 5,
+    };
+    let options = RestoreOptions {
+        db: "source.db".to_string(),
+        output: output_path_str.clone(),
+        follow: false,
+        interval: 1,
+        timestamp: String::new(),
+        truth_source: "fs-backup".to_string(),
+    };
+
+    remove_restore_output(&output_path);
+    run_restore(&config, &options)
+        .await
+        .expect("restore should succeed")
+        .expect("restore should return position");
+
+    let restored_digest = table_digest(&output_path, "t");
+    assert_eq!(restored_digest, expected_digest);
 }

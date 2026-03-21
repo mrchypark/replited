@@ -37,4 +37,9 @@ python3 archival_bench.py -n 2000 -p 4096 -o results/archival_results.json
 cleanup_replited
 
 echo ""
+echo "=== Running Snapshot Format Comparison Benchmark ==="
+python3 format_compare_bench.py -n 2000 -p 4096 -o results/format_compare_results.json
+cleanup_replited
+
+echo ""
 echo "All benchmarks complete! Results saved in results/"

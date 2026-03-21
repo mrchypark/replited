@@ -5,6 +5,7 @@ pub mod config;
 #[cfg(feature = "storage")]
 pub mod database;
 pub mod error;
+pub mod experimental;
 pub mod log;
 pub mod pb;
 pub mod sqlite;
