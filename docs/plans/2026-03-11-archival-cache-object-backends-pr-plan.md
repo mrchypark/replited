@@ -29,11 +29,11 @@ The ordering principle is:
 - Lets later PRs avoid mixed concerns in config parsing and runtime behavior
 
 **Files:**
-- Modify: `/Users/cypark/Documents/project/replited/src/config/config.rs`
-- Modify: `/Users/cypark/Documents/project/replited/src/config/storage_params.rs`
-- Modify: `/Users/cypark/Documents/project/replited/src/config/arg.rs`
-- Modify: `/Users/cypark/Documents/project/replited/src/cmd/replicate.rs`
-- Test: `/Users/cypark/Documents/project/replited/src/config/config.rs`
+- Modify: `src/config/config.rs`
+- Modify: `src/config/storage_params.rs`
+- Modify: `src/config/arg.rs`
+- Modify: `src/cmd/replicate.rs`
+- Test: `src/config/config.rs`
 
 **Scope**
 - Reintroduce canonical archival target vocabulary for `fs`, `s3`, `gcs`, `azblob`
@@ -56,9 +56,9 @@ The ordering principle is:
 - Startup cleanup and pruning are easier to validate before other code depends on them
 
 **Files:**
-- Create: `/Users/cypark/Documents/project/replited/src/storage/cache.rs`
-- Modify: `/Users/cypark/Documents/project/replited/src/storage/mod.rs`
-- Test: `/Users/cypark/Documents/project/replited/src/storage/cache.rs`
+- Create: `src/storage/cache.rs`
+- Modify: `src/storage/mod.rs`
+- Test: `src/storage/cache.rs`
 
 **Scope**
 - Exact-key immutable local object cache API
@@ -79,11 +79,11 @@ The ordering principle is:
 - Keeping this isolated limits blast radius if manifest publish semantics need adjustment
 
 **Files:**
-- Modify: `/Users/cypark/Documents/project/replited/src/storage/storage_client.rs`
-- Modify: `/Users/cypark/Documents/project/replited/src/storage/operator.rs`
-- Modify: `/Users/cypark/Documents/project/replited/src/sync/replicate.rs`
-- Test: `/Users/cypark/Documents/project/replited/src/storage/storage_client.rs`
-- Test: `/Users/cypark/Documents/project/replited/src/sync/replicate.rs`
+- Modify: `src/storage/storage_client.rs`
+- Modify: `src/storage/operator.rs`
+- Modify: `src/sync/replicate.rs`
+- Test: `src/storage/storage_client.rs`
+- Test: `src/sync/replicate.rs`
 
 **Scope**
 - Re-enable manifest-backed archival publish for `s3` as the reference object backend
@@ -104,12 +104,12 @@ The ordering principle is:
 - It is still narrower than bringing in more backends
 
 **Files:**
-- Modify: `/Users/cypark/Documents/project/replited/src/storage/storage_client.rs`
-- Modify: `/Users/cypark/Documents/project/replited/src/sync/restore.rs`
-- Modify: `/Users/cypark/Documents/project/replited/src/sync/restore/follow.rs`
-- Test: `/Users/cypark/Documents/project/replited/src/storage/storage_client.rs`
-- Test: `/Users/cypark/Documents/project/replited/src/sync/restore.rs`
-- Test: `/Users/cypark/Documents/project/replited/src/sync/restore/follow.rs`
+- Modify: `src/storage/storage_client.rs`
+- Modify: `src/sync/restore.rs`
+- Modify: `src/sync/restore/follow.rs`
+- Test: `src/storage/storage_client.rs`
+- Test: `src/sync/restore.rs`
+- Test: `src/sync/restore/follow.rs`
 
 **Scope**
 - Resolve manifest-referenced objects through local cache first
@@ -131,11 +131,11 @@ The ordering principle is:
 - This isolates the sharp edge of “same local technology, different roles” away from the reference backend work
 
 **Files:**
-- Modify: `/Users/cypark/Documents/project/replited/src/storage/storage_client.rs`
-- Modify: `/Users/cypark/Documents/project/replited/src/sync/replicate.rs`
-- Modify: `/Users/cypark/Documents/project/replited/src/config/config.rs`
-- Test: `/Users/cypark/Documents/project/replited/src/storage/storage_client.rs`
-- Test: `/Users/cypark/Documents/project/replited/src/config/config.rs`
+- Modify: `src/storage/storage_client.rs`
+- Modify: `src/sync/replicate.rs`
+- Modify: `src/config/config.rs`
+- Test: `src/storage/storage_client.rs`
+- Test: `src/config/config.rs`
 
 **Scope**
 - Keep `fs` as first-class archival publish backend
@@ -155,11 +155,11 @@ The ordering principle is:
 - It also makes later regressions easier to detect
 
 **Files:**
-- Modify: `/Users/cypark/Documents/project/replited/src/storage/storage_client.rs`
-- Modify: `/Users/cypark/Documents/project/replited/src/sync/restore.rs`
-- Modify: `/Users/cypark/Documents/project/replited/src/sync/restore/follow.rs`
-- Modify: `/Users/cypark/Documents/project/replited/tests/integration_test.py`
-- Modify: `/Users/cypark/Documents/project/replited/tests/release_e2e.py`
+- Modify: `src/storage/storage_client.rs`
+- Modify: `src/sync/restore.rs`
+- Modify: `src/sync/restore/follow.rs`
+- Modify: `tests/integration_test.py`
+- Modify: `tests/release_e2e.py`
 
 **Scope**
 - Add cache hit/miss diagnostics
@@ -179,11 +179,11 @@ The ordering principle is:
 - This keeps CI churn out of early refactor PRs
 
 **Files:**
-- Modify: `/Users/cypark/Documents/project/replited/tests/integration_test.py`
-- Modify: `/Users/cypark/Documents/project/replited/.github/workflows/fs_integration_test.yml`
-- Add or modify: `/Users/cypark/Documents/project/replited/.github/workflows/s3_integration_test.yml`
-- Modify: `/Users/cypark/Documents/project/replited/README.md`
-- Modify: `/Users/cypark/Documents/project/replited/docs/stream-replication.md`
+- Modify: `tests/integration_test.py`
+- Modify: `.github/workflows/fs_integration_test.yml`
+- Add or modify: `.github/workflows/s3_integration_test.yml`
+- Modify: `README.md`
+- Modify: `docs/stream-replication.md`
 
 **Scope**
 - Add canonical `s3` integration validation for manifest-first, cache-first restore
@@ -202,12 +202,12 @@ The ordering principle is:
 - They should reuse the proven `s3` model rather than influencing the core shape
 
 **Files:**
-- Modify: `/Users/cypark/Documents/project/replited/src/storage/operator.rs`
-- Modify: `/Users/cypark/Documents/project/replited/src/storage/storage_client.rs`
-- Modify: `/Users/cypark/Documents/project/replited/tests/integration_test.py`
-- Add or modify: `/Users/cypark/Documents/project/replited/.github/workflows/gcs_integration_test.yml`
-- Add or modify: `/Users/cypark/Documents/project/replited/.github/workflows/azblob_integration_test.yml`
-- Modify: `/Users/cypark/Documents/project/replited/README.md`
+- Modify: `src/storage/operator.rs`
+- Modify: `src/storage/storage_client.rs`
+- Modify: `tests/integration_test.py`
+- Add or modify: `.github/workflows/gcs_integration_test.yml`
+- Add or modify: `.github/workflows/azblob_integration_test.yml`
+- Modify: `README.md`
 
 **Scope**
 - Apply the same manifest-backed publish and cache-first restore rules to `gcs` and `azblob`
@@ -233,10 +233,10 @@ After each PR:
 - run `cargo test`
 
 After PR 4 and later:
-- run `/Users/cypark/Documents/project/replited/tests/integration_test.py` against `fs`
+- run `tests/integration_test.py` against `fs`
 
 After PR 7 and later:
-- run `/Users/cypark/Documents/project/replited/tests/integration_test.py` against `s3`
+- run `tests/integration_test.py` against `s3`
 - confirm normal restore path reports `LIST 0`
 
 After PR 8:

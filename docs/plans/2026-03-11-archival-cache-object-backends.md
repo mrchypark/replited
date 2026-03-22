@@ -156,11 +156,11 @@
 
 ### Task 1: Add canonical archival target model and cache-root contract
 **Files:**
-- Modify: `/Users/cypark/Documents/project/replited/src/config/config.rs`
-- Modify: `/Users/cypark/Documents/project/replited/src/config/storage_params.rs`
-- Modify: `/Users/cypark/Documents/project/replited/src/cmd/replicate.rs`
-- Modify: `/Users/cypark/Documents/project/replited/src/config/arg.rs`
-- Test: `/Users/cypark/Documents/project/replited/src/config/config.rs`
+- Modify: `src/config/config.rs`
+- Modify: `src/config/storage_params.rs`
+- Modify: `src/cmd/replicate.rs`
+- Modify: `src/config/arg.rs`
+- Test: `src/config/config.rs`
 
 **Steps:**
 1. Write a failing config test that `fs` and `s3` archival targets are accepted while `ftp` remains rejected.
@@ -172,11 +172,11 @@
 
 ### Task 2: Re-enable manifest publish for the reference object backend
 **Files:**
-- Modify: `/Users/cypark/Documents/project/replited/src/storage/storage_client.rs`
-- Modify: `/Users/cypark/Documents/project/replited/src/storage/operator.rs`
-- Modify: `/Users/cypark/Documents/project/replited/src/sync/replicate.rs`
-- Test: `/Users/cypark/Documents/project/replited/src/storage/storage_client.rs`
-- Test: `/Users/cypark/Documents/project/replited/src/sync/replicate.rs`
+- Modify: `src/storage/storage_client.rs`
+- Modify: `src/storage/operator.rs`
+- Modify: `src/sync/replicate.rs`
+- Test: `src/storage/storage_client.rs`
+- Test: `src/sync/replicate.rs`
 
 **Steps:**
 1. Write failing tests that `s3` no longer fails fast on manifest publish setup.
@@ -188,10 +188,10 @@
 
 ### Task 3: Introduce local cache/spool abstraction
 **Files:**
-- Create: `/Users/cypark/Documents/project/replited/src/storage/cache.rs`
-- Modify: `/Users/cypark/Documents/project/replited/src/storage/mod.rs`
-- Modify: `/Users/cypark/Documents/project/replited/src/storage/storage_client.rs`
-- Test: `/Users/cypark/Documents/project/replited/src/storage/cache.rs`
+- Create: `src/storage/cache.rs`
+- Modify: `src/storage/mod.rs`
+- Modify: `src/storage/storage_client.rs`
+- Test: `src/storage/cache.rs`
 
 **Steps:**
 1. Write failing tests for exact-key cache put/get/miss behavior.
@@ -202,9 +202,9 @@
 
 ### Task 4: Add cache budget and safe local recovery rules
 **Files:**
-- Modify: `/Users/cypark/Documents/project/replited/src/storage/cache.rs`
-- Modify: `/Users/cypark/Documents/project/replited/src/storage/storage_client.rs`
-- Test: `/Users/cypark/Documents/project/replited/src/storage/cache.rs`
+- Modify: `src/storage/cache.rs`
+- Modify: `src/storage/storage_client.rs`
+- Test: `src/storage/cache.rs`
 
 **Steps:**
 1. Write failing tests for startup cleanup of incomplete temp objects and budget-based pruning that does not remove pinned objects.
@@ -215,11 +215,11 @@
 
 ### Task 5: Make object reads cache-first with checksum admission
 **Files:**
-- Modify: `/Users/cypark/Documents/project/replited/src/storage/storage_client.rs`
-- Modify: `/Users/cypark/Documents/project/replited/src/sync/restore.rs`
-- Modify: `/Users/cypark/Documents/project/replited/src/sync/restore/follow.rs`
-- Test: `/Users/cypark/Documents/project/replited/src/storage/storage_client.rs`
-- Test: `/Users/cypark/Documents/project/replited/src/sync/restore.rs`
+- Modify: `src/storage/storage_client.rs`
+- Modify: `src/sync/restore.rs`
+- Modify: `src/sync/restore/follow.rs`
+- Test: `src/storage/storage_client.rs`
+- Test: `src/sync/restore.rs`
 
 **Steps:**
 1. Write failing tests for `read object -> cache hit avoids remote GET` and `cache miss populates cache`.
@@ -231,9 +231,9 @@
 
 ### Task 6: Keep `fs` as both cache and archival target
 **Files:**
-- Modify: `/Users/cypark/Documents/project/replited/src/storage/storage_client.rs`
-- Modify: `/Users/cypark/Documents/project/replited/src/sync/replicate.rs`
-- Test: `/Users/cypark/Documents/project/replited/src/storage/storage_client.rs`
+- Modify: `src/storage/storage_client.rs`
+- Modify: `src/sync/replicate.rs`
+- Test: `src/storage/storage_client.rs`
 
 **Steps:**
 1. Write a failing test that `fs` archival publish still works when the same local fs layer is also used as cache/spool.
@@ -244,11 +244,11 @@
 
 ### Task 7: Add explicit truth-source restore/follow selection
 **Files:**
-- Modify: `/Users/cypark/Documents/project/replited/src/sync/restore.rs`
-- Modify: `/Users/cypark/Documents/project/replited/src/sync/restore/follow.rs`
-- Modify: `/Users/cypark/Documents/project/replited/src/config/arg.rs`
-- Test: `/Users/cypark/Documents/project/replited/src/sync/restore.rs`
-- Test: `/Users/cypark/Documents/project/replited/src/sync/restore/follow.rs`
+- Modify: `src/sync/restore.rs`
+- Modify: `src/sync/restore/follow.rs`
+- Modify: `src/config/arg.rs`
+- Test: `src/sync/restore.rs`
+- Test: `src/sync/restore/follow.rs`
 
 **Steps:**
 1. Write failing tests for explicit truth-source selection across archival targets.
@@ -259,11 +259,11 @@
 
 ### Task 8: Add request-cost and cache-hit observability
 **Files:**
-- Modify: `/Users/cypark/Documents/project/replited/src/storage/storage_client.rs`
-- Modify: `/Users/cypark/Documents/project/replited/src/sync/restore.rs`
-- Modify: `/Users/cypark/Documents/project/replited/tests/integration_test.py`
-- Test: `/Users/cypark/Documents/project/replited/src/storage/storage_client.rs`
-- Test: `/Users/cypark/Documents/project/replited/tests/integration_test.py`
+- Modify: `src/storage/storage_client.rs`
+- Modify: `src/sync/restore.rs`
+- Modify: `tests/integration_test.py`
+- Test: `src/storage/storage_client.rs`
+- Test: `tests/integration_test.py`
 
 **Steps:**
 1. Write failing tests for stable restore diagnostics including cache hits/misses and remote GET counts.
@@ -274,10 +274,10 @@
 
 ### Task 9: Extend the reference model to `gcs` and `azblob`
 **Files:**
-- Modify: `/Users/cypark/Documents/project/replited/src/config/config.rs`
-- Modify: `/Users/cypark/Documents/project/replited/src/storage/operator.rs`
-- Modify: `/Users/cypark/Documents/project/replited/src/storage/storage_client.rs`
-- Test: `/Users/cypark/Documents/project/replited/src/storage/storage_client.rs`
+- Modify: `src/config/config.rs`
+- Modify: `src/storage/operator.rs`
+- Modify: `src/storage/storage_client.rs`
+- Test: `src/storage/storage_client.rs`
 
 **Steps:**
 1. Write failing tests that `gcs` and `azblob` follow the same manifest publish/read rules as the `s3` reference path.
@@ -288,11 +288,11 @@
 
 ### Task 10: Expand supported-surface integration gates
 **Files:**
-- Modify: `/Users/cypark/Documents/project/replited/tests/integration_test.py`
-- Modify: `/Users/cypark/Documents/project/replited/.github/workflows/fs_integration_test.yml`
-- Modify: `/Users/cypark/Documents/project/replited/.github/workflows/release.yml`
-- Modify: `/Users/cypark/Documents/project/replited/README.md`
-- Test: `/Users/cypark/Documents/project/replited/tests/integration_test.py`
+- Modify: `tests/integration_test.py`
+- Modify: `.github/workflows/fs_integration_test.yml`
+- Modify: `.github/workflows/release.yml`
+- Modify: `README.md`
+- Test: `tests/integration_test.py`
 
 **Steps:**
 1. Add a failing integration scenario for `fs` archival plus cache-first restore diagnostics.

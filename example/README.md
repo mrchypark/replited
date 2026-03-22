@@ -24,7 +24,7 @@ The demo script auto-downloads the official PocketBase binary into `example/bin/
 
 The host-based script is the canonical example for this repository.
 
-- Use [run_pocketbase_live_demo.sh](/Users/cypark/Documents/project/replited/example/run_pocketbase_live_demo.sh) for the supported live demo.
+- Use [run_pocketbase_live_demo.sh](./run_pocketbase_live_demo.sh) for the supported live demo.
 - The Docker Compose files in this folder are retained as legacy reference material and are not the primary maintained path.
 
 ## Run

@@ -13,9 +13,9 @@
 ### Task 1: Remove Legacy Restore Planner
 
 **Files:**
-- Modify: `/Users/cypark/Documents/project/replited/src/sync/restore.rs`
-- Modify: `/Users/cypark/Documents/project/replited/src/sync/restore/manifest_plan.rs`
-- Test: `/Users/cypark/Documents/project/replited/src/sync/restore.rs`
+- Modify: `src/sync/restore.rs`
+- Modify: `src/sync/restore/manifest_plan.rs`
+- Test: `src/sync/restore.rs`
 
 **Steps:**
 1. Delete `LegacyRestoreSource`, `ListRestoreSource`, `RestoreDataPlan::Legacy`, and legacy selection loops.
@@ -26,10 +26,10 @@
 ### Task 2: Remove Legacy Publish Fallbacks
 
 **Files:**
-- Modify: `/Users/cypark/Documents/project/replited/src/sync/replicate.rs`
-- Modify: `/Users/cypark/Documents/project/replited/src/storage/storage_client.rs`
-- Test: `/Users/cypark/Documents/project/replited/src/sync/replicate.rs`
-- Test: `/Users/cypark/Documents/project/replited/src/storage/storage_client.rs`
+- Modify: `src/sync/replicate.rs`
+- Modify: `src/storage/storage_client.rs`
+- Test: `src/sync/replicate.rs`
+- Test: `src/storage/storage_client.rs`
 
 **Steps:**
 1. Delete `Error::INVALID_CONFIG` fallback branches that call `write_snapshot()` and `write_wal_segment()`.
@@ -40,9 +40,9 @@
 ### Task 3: Convert Follow Path To Manifest-Only
 
 **Files:**
-- Modify: `/Users/cypark/Documents/project/replited/src/sync/restore/follow.rs`
-- Modify: `/Users/cypark/Documents/project/replited/src/sync/restore.rs`
-- Test: `/Users/cypark/Documents/project/replited/src/sync/restore/follow.rs`
+- Modify: `src/sync/restore/follow.rs`
+- Modify: `src/sync/restore.rs`
+- Test: `src/sync/restore/follow.rs`
 
 **Steps:**
 1. Remove dependence on `decide_restore_info()` and list-based discovery in follow mode.
@@ -53,12 +53,12 @@
 ### Task 4: Fail Fast On Unsupported Archival Backends
 
 **Files:**
-- Modify: `/Users/cypark/Documents/project/replited/src/storage/storage_client.rs`
-- Modify: `/Users/cypark/Documents/project/replited/src/cmd/purge_generation.rs`
-- Modify: `/Users/cypark/Documents/project/replited/src/config/mod.rs`
-- Modify: `/Users/cypark/Documents/project/replited/src/config/arg.rs`
-- Test: `/Users/cypark/Documents/project/replited/src/storage/storage_client.rs`
-- Test: `/Users/cypark/Documents/project/replited/src/cmd/purge_generation.rs`
+- Modify: `src/storage/storage_client.rs`
+- Modify: `src/cmd/purge_generation.rs`
+- Modify: `src/config/mod.rs`
+- Modify: `src/config/arg.rs`
+- Test: `src/storage/storage_client.rs`
+- Test: `src/cmd/purge_generation.rs`
 
 **Steps:**
 1. Turn unsupported archival backends into hard errors for manifest-only commands and runtime setup.
@@ -69,10 +69,10 @@
 ### Task 5: Rewrite Integration Surface
 
 **Files:**
-- Modify: `/Users/cypark/Documents/project/replited/tests/integration_test.py`
-- Modify: `/Users/cypark/Documents/project/replited/tests/release_e2e.py`
-- Modify: `/Users/cypark/Documents/project/replited/tests/restore_output_set.rs`
-- Modify: `/Users/cypark/Documents/project/replited/src/sync/restore/apply_wal.rs`
+- Modify: `tests/integration_test.py`
+- Modify: `tests/release_e2e.py`
+- Modify: `tests/restore_output_set.rs`
+- Modify: `src/sync/restore/apply_wal.rs`
 
 **Steps:**
 1. Remove test seeding that depends on legacy `write_snapshot()` / `write_wal_segment()` APIs.
@@ -83,12 +83,12 @@
 ### Task 6: Shrink CI and Docs To Supported Surface
 
 **Files:**
-- Modify: `/Users/cypark/Documents/project/replited/.github/workflows/fs_integration_test.yml`
-- Modify: `/Users/cypark/Documents/project/replited/.github/workflows/ftp_integration_test.yml`
-- Modify: `/Users/cypark/Documents/project/replited/.github/workflows/s3_integration_test.yml`
-- Modify: `/Users/cypark/Documents/project/replited/README.md`
-- Modify: `/Users/cypark/Documents/project/replited/docs/sidecar-config.md`
-- Modify: `/Users/cypark/Documents/project/replited/docs/stream-replication.md`
+- Modify: `.github/workflows/fs_integration_test.yml`
+- Modify: `.github/workflows/ftp_integration_test.yml`
+- Modify: `.github/workflows/s3_integration_test.yml`
+- Modify: `README.md`
+- Modify: `docs/sidecar-config.md`
+- Modify: `docs/stream-replication.md`
 
 **Steps:**
 1. Remove or disable FTP/S3 archival CI if they are no longer supported after the cut.
