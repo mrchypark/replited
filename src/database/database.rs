@@ -17,6 +17,7 @@ use std::time::SystemTime;
 use log::debug;
 use log::error;
 use log::info;
+use log::warn;
 use rusqlite::Connection;
 use rusqlite::DropBehavior;
 use tempfile::NamedTempFile;
@@ -135,6 +136,60 @@ struct SyncInfo {
 }
 
 impl Database {
+    fn reopen_main_connection(&mut self) -> Result<()> {
+        // Drop the old DB handle before reopening so SQLite can rebuild WAL state
+        // without another live connection still referencing deleted WAL files.
+        let placeholder = Connection::open_in_memory()?;
+        let stale = std::mem::replace(&mut self.connection, placeholder);
+        drop(stale);
+
+        let conn = Connection::open(&self.config.db)?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        Self::init_params(&self.config.db, &conn)?;
+        Self::create_internal_tables(&conn)?;
+        self.connection = conn;
+        Ok(())
+    }
+
+    fn has_generation_recovery_context(&self) -> bool {
+        let generation = match self.current_generation() {
+            Ok(generation) if !generation.is_empty() => generation,
+            _ => return false,
+        };
+        let shadow_wal_file = match self.current_shadow_wal_file(&generation) {
+            Ok(path) => path,
+            Err(_) => return false,
+        };
+        fs::exists(&shadow_wal_file).unwrap_or(false)
+    }
+
+    async fn force_wal_header_creation(&mut self) -> Result<bool> {
+        let had_read_lock = self.tx_connection.is_some();
+        let _ = self.release_read_lock();
+        self.reopen_main_connection()?;
+        let _ = fs::remove_file(&self.wal_file);
+        let _ = fs::remove_file(format!("{}-shm", self.config.db));
+        self.reopen_main_connection()?;
+        self.connection.execute(
+            "INSERT INTO _replited_seq (id, seq) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET seq = seq + 1;",
+            (),
+        )?;
+        sleep(Duration::from_millis(50)).await;
+
+        if !fs::exists(&self.wal_file)? {
+            if had_read_lock {
+                self.acquire_read_lock()?;
+            }
+            return Ok(false);
+        }
+
+        let has_header = fs::metadata(&self.wal_file)?.len() >= WAL_HEADER_SIZE;
+        if had_read_lock {
+            self.acquire_read_lock()?;
+        }
+        Ok(has_header)
+    }
+
     // acquire_read_lock begins a read transaction on the database to prevent checkpointing.
     fn acquire_read_lock(&mut self) -> Result<()> {
         if self.tx_connection.is_none() {
@@ -826,6 +881,17 @@ impl Database {
             sleep(Duration::from_millis(50)).await;
         }
 
+        if self.has_generation_recovery_context() {
+            warn!(
+                "db {} WAL header still missing after retries; deferring to generation recovery path",
+                self.config.db
+            );
+            if self.force_wal_header_creation().await? {
+                return Ok(());
+            }
+            return Ok(());
+        }
+
         Err(Error::SqliteWalError(format!(
             "wal {} header not found",
             self.wal_file,
@@ -1104,5 +1170,50 @@ root = "{backup_root}"
             .expect("timed out waiting for DbCommand");
 
         assert!(matches!(cmd, Some(DbCommand::Snapshot(1))));
+    }
+
+    #[tokio::test]
+    async fn sync_recovers_after_live_wal_is_deleted() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("primary.db");
+        let backup_root = dir.path().join("backup");
+
+        let config = test_db_config(
+            db_path.to_string_lossy().as_ref(),
+            backup_root.to_string_lossy().as_ref(),
+        );
+
+        let (mut db, _rx) = Database::try_create(config).await.expect("create db");
+        db.connection
+            .execute(
+                "CREATE TABLE IF NOT EXISTS wal_recovery (id INTEGER PRIMARY KEY, value TEXT NOT NULL)",
+                (),
+            )
+            .expect("create test table");
+        db.connection
+            .execute(
+                "INSERT INTO wal_recovery (value) VALUES ('before-delete')",
+                (),
+            )
+            .expect("seed row");
+
+        db.snapshot().await.expect("snapshot before WAL deletion");
+
+        std::fs::remove_file(&db.wal_file).expect("remove WAL");
+        std::fs::remove_file(format!("{}-shm", db.config.db)).expect("remove shm");
+
+        db.sync()
+            .await
+            .expect("sync should recover from a missing live WAL");
+
+        db.connection
+            .execute(
+                "INSERT INTO wal_recovery (value) VALUES ('after-recovery')",
+                (),
+            )
+            .expect("write after WAL recovery");
+        db.sync()
+            .await
+            .expect("follow-up sync should keep working after WAL recovery");
     }
 }
