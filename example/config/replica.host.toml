@@ -1,0 +1,19 @@
+[log]
+level = "Info"
+dir = "__REPLICA_LOG_DIR__"
+
+[[database]]
+db = "__REPLICA_DB__"
+cache_root = "__REPLICA_CACHE__"
+monitor_interval_ms = 50
+wal_retention_count = 20
+apply_checkpoint_frame_interval = 10
+apply_checkpoint_interval_ms = 100
+
+[[database.replicate]]
+name = "stream-primary"
+[database.replicate.params]
+type = "stream"
+addr = "http://127.0.0.1:50051"
+remote_db_name = "__PRIMARY_DB__"
+

@@ -7,7 +7,7 @@ on:
 
 jobs:
   plan:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: 'Checkout codes'
         uses: actions/checkout@v4
@@ -21,7 +21,6 @@ jobs:
       - name: 'Run integration test for fs'
         shell: bash
         run: |
-          cargo build --release 
-          ls 
-          pwd
-          python3 tests/integration_test.py 12000 fs ./target/release/replited
+          python3 -m unittest tests.integration_test
+          cargo build --release
+          python3 tests/integration_test.py 12000 ./target/release/replited --backend fs

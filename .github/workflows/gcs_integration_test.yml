@@ -1,0 +1,61 @@
+name: GCS integration test
+
+on:
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: 'Checkout codes'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust toolchain
+        uses: ./.github/actions/setup
+
+      - name: Start fake GCS server
+        shell: bash
+        run: |
+          docker run -d --name fake-gcs \
+            -p 4443:4443 \
+            fsouza/fake-gcs-server:1.52.3 \
+            -scheme http \
+            -host 0.0.0.0 \
+            -port 4443 \
+            -backend memory
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:4443/storage/v1/b >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs fake-gcs
+          exit 1
+
+      - name: Create fake GCS bucket
+        shell: bash
+        run: |
+          curl -fsS -X POST \
+            -H 'Content-Type: application/json' \
+            -d '{"name":"replited-itest"}' \
+            'http://127.0.0.1:4443/storage/v1/b?project=replited-test'
+
+      - name: 'Run integration test for gcs'
+        shell: bash
+        env:
+          REPLITED_TEST_GCS_ENDPOINT: http://127.0.0.1:4443
+          REPLITED_TEST_GCS_BUCKET: replited-itest
+          REPLITED_TEST_GCS_ROOT: /replited
+        run: |
+          python3 -m unittest tests.integration_test
+          cargo build --release
+          python3 tests/integration_test.py 12000 ./target/release/replited --backend gcs
+
+      - name: Dump fake GCS logs on failure
+        if: failure()
+        shell: bash
+        run: docker logs fake-gcs

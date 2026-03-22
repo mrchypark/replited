@@ -59,6 +59,7 @@ dir = "logs"
 
 [[database]]
 db = "primary.db"
+cache_root = "cache"
 min_checkpoint_page_number = 100
 max_checkpoint_page_number = 1000
 truncate_page_number = 50000
@@ -134,6 +135,7 @@ dir = "logs"
 
 [[database]]
 db = "primary.db"
+cache_root = "cache"
 min_checkpoint_page_number = 100
 max_checkpoint_page_number = 1000
 truncate_page_number = 50000

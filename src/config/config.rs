@@ -3,11 +3,13 @@ use std::fmt::Debug;
 use std::fmt::Display;
 use std::fmt::Formatter;
 use std::fs;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use serde::Serialize;
 
 use super::StorageParams;
+use crate::base::path_base;
 use crate::error::Error;
 use crate::error::Result;
 
@@ -104,6 +106,11 @@ pub struct DbConfig {
 
     // replicates of db file config
     pub replicate: Vec<StorageConfig>,
+
+    // Local fs cache/spool root for archival objects.
+    // If omitted, defaults under the database metadata directory.
+    #[serde(default)]
+    pub cache_root: Option<String>,
 
     // Minimum threshold of WAL size, in pages, before a passive checkpoint.
     // A passive checkpoint will attempt a checkpoint but fail if there are
@@ -203,6 +210,7 @@ impl Debug for DbConfig {
         f.debug_struct("ReplicateDbConfig")
             .field("db", &self.db)
             .field("storage", &self.replicate)
+            .field("cache_root", &self.cache_root)
             .field(
                 "min_checkpoint_page_number",
                 &self.min_checkpoint_page_number,
@@ -228,11 +236,63 @@ impl Debug for DbConfig {
 }
 
 impl DbConfig {
+    pub fn cache_root_path(&self) -> Result<String> {
+        match self.cache_root.as_deref().map(str::trim) {
+            Some("") | None => default_cache_root_for_db(&self.db),
+            Some(root) => Ok(root.to_string()),
+        }
+    }
+
     fn validate(&self) -> Result<()> {
         if self.replicate.is_empty() {
             return Err(Error::InvalidConfig(
                 "database MUST has at least one replicate config",
             ));
+        }
+
+        for storage in &self.replicate {
+            match &storage.params {
+                StorageParams::Fs(_)
+                | StorageParams::Stream(_)
+                | StorageParams::S3(_)
+                | StorageParams::Gcs(_)
+                | StorageParams::Azb(_) => {}
+                other => {
+                    return Err(Error::InvalidConfig(format!(
+                        "archival runtime does not support backend in db {}: {}",
+                        self.db, other
+                    )));
+                }
+            }
+        }
+
+        if let Some(cache_root) = &self.cache_root {
+            if cache_root.trim().is_empty() {
+                return Err(Error::InvalidConfig(
+                    "cache_root cannot be blank when explicitly configured",
+                ));
+            }
+        }
+
+        if self.cache_root.is_none() && !Path::new(&self.db).is_absolute() {
+            return Err(Error::InvalidConfig(
+                "cache_root must be configured when db path is relative",
+            ));
+        }
+
+        let cache_root = self.cache_root_path()?;
+        let resolved_cache_root = resolve_local_path(&cache_root)?;
+        for storage in &self.replicate {
+            if let StorageParams::Fs(fs) = &storage.params {
+                let resolved_fs_root = resolve_local_path(&fs.root)?;
+                if resolved_fs_root == resolved_cache_root {
+                    return Err(Error::InvalidConfig(format!(
+                        "cache_root {} must differ from fs archival target root {}",
+                        resolved_cache_root.display(),
+                        resolved_fs_root.display()
+                    )));
+                }
+            }
         }
 
         if self.min_checkpoint_page_number == 0 {
@@ -272,6 +332,32 @@ impl DbConfig {
     }
 }
 
+fn default_cache_root_for_db(db: &str) -> Result<String> {
+    let db_name = path_base(db)?;
+    let db_path = Path::new(db);
+    let parent = db_path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+
+    Ok(parent
+        .join(format!(".{db_name}-replited"))
+        .join("cache")
+        .to_string_lossy()
+        .into_owned())
+}
+
+fn resolve_local_path(path: &str) -> Result<PathBuf> {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        Ok(path.to_path_buf())
+    } else {
+        Ok(std::env::current_dir()?.join(path))
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageConfig {
     pub name: String,
@@ -291,7 +377,10 @@ impl Debug for StorageConfig {
 mod tests {
     use super::*;
 
-    use crate::config::StorageFsConfig;
+    use crate::config::{
+        StorageAzblobConfig, StorageFsConfig, StorageFtpConfig, StorageGcsConfig, StorageS3Config,
+        StorageStreamConfig,
+    };
 
     fn create_valid_storage_config() -> StorageConfig {
         StorageConfig {
@@ -320,6 +409,7 @@ mod tests {
         DbConfig {
             db: "/tmp/test.db".to_string(),
             replicate: vec![create_valid_storage_config()],
+            cache_root: None,
             min_checkpoint_page_number: DEFAULT_MIN_CHECKPOINT_PAGE_NUMBER,
             max_checkpoint_page_number: DEFAULT_MAX_CHECKPOINT_PAGE_NUMBER,
             truncate_page_number: DEFAULT_TRUNCATE_PAGE_NUMBER,
@@ -358,6 +448,133 @@ mod tests {
     fn test_db_config_validate_success() {
         let config = create_valid_db_config();
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_db_config_validate_rejects_unsupported_archival_backend() {
+        let mut config = create_valid_db_config();
+        config.replicate = vec![StorageConfig {
+            name: "ftp-backup".to_string(),
+            params: StorageParams::Ftp(Box::new(StorageFtpConfig::default())),
+        }];
+
+        let err = config
+            .validate()
+            .expect_err("unsupported archival backend should fail");
+        assert_eq!(err.code(), Error::INVALID_CONFIG);
+    }
+
+    #[test]
+    fn test_db_config_validate_allows_stream_backend() {
+        let mut config = create_valid_db_config();
+        config.replicate = vec![StorageConfig {
+            name: "stream-replica".to_string(),
+            params: StorageParams::Stream(Box::new(StorageStreamConfig::default())),
+        }];
+
+        config
+            .validate()
+            .expect("stream backend should remain supported");
+    }
+
+    #[test]
+    fn test_db_config_validate_allows_s3_archival_backend() {
+        let mut config = create_valid_db_config();
+        config.replicate = vec![StorageConfig {
+            name: "s3-backup".to_string(),
+            params: StorageParams::S3(Box::new(StorageS3Config::default())),
+        }];
+
+        config.validate().expect("s3 backend should be accepted");
+    }
+
+    #[test]
+    fn test_db_config_validate_allows_gcs_archival_backend() {
+        let mut config = create_valid_db_config();
+        config.replicate = vec![StorageConfig {
+            name: "gcs-backup".to_string(),
+            params: StorageParams::Gcs(Box::new(StorageGcsConfig::default())),
+        }];
+
+        config.validate().expect("gcs backend should be accepted");
+    }
+
+    #[test]
+    fn test_db_config_validate_allows_azblob_archival_backend() {
+        let mut config = create_valid_db_config();
+        config.replicate = vec![StorageConfig {
+            name: "azblob-backup".to_string(),
+            params: StorageParams::Azb(Box::new(StorageAzblobConfig::default())),
+        }];
+
+        config
+            .validate()
+            .expect("azblob backend should be accepted");
+    }
+
+    #[test]
+    fn test_db_config_cache_root_defaults_under_metadata_dir() {
+        let config = create_valid_db_config();
+
+        assert_eq!(
+            config.cache_root_path().expect("default cache root"),
+            "/tmp/.test.db-replited/cache"
+        );
+    }
+
+    #[test]
+    fn test_db_config_cache_root_prefers_explicit_value() {
+        let mut config = create_valid_db_config();
+        config.cache_root = Some("/var/lib/replited/cache".to_string());
+
+        assert_eq!(
+            config.cache_root_path().expect("explicit cache root"),
+            "/var/lib/replited/cache"
+        );
+    }
+
+    #[test]
+    fn test_db_config_validate_rejects_blank_explicit_cache_root() {
+        let mut config = create_valid_db_config();
+        config.cache_root = Some("   ".to_string());
+
+        let err = config
+            .validate()
+            .expect_err("blank explicit cache root should fail");
+        assert_eq!(err.code(), Error::INVALID_CONFIG);
+    }
+
+    #[test]
+    fn test_db_config_validate_requires_explicit_cache_root_for_relative_db_path() {
+        let mut config = create_valid_db_config();
+        config.db = "test.db".to_string();
+
+        let err = config
+            .validate()
+            .expect_err("relative db path without explicit cache_root should fail");
+        assert_eq!(err.code(), Error::INVALID_CONFIG);
+    }
+
+    #[test]
+    fn test_db_config_validate_allows_relative_db_path_with_explicit_cache_root() {
+        let mut config = create_valid_db_config();
+        config.db = "test.db".to_string();
+        config.cache_root = Some("/tmp/replited-cache".to_string());
+
+        config
+            .validate()
+            .expect("relative db path with explicit cache_root should pass");
+    }
+
+    #[test]
+    fn test_db_config_validate_rejects_cache_root_aliasing_fs_root() {
+        let mut config = create_valid_db_config();
+        config.cache_root = Some("/tmp/replited".to_string());
+
+        let err = config
+            .validate()
+            .expect_err("cache_root aliasing fs root should fail");
+        assert_eq!(err.code(), Error::INVALID_CONFIG);
     }
 
     #[test]
