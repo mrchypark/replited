@@ -38,6 +38,13 @@ pub async fn snapshot_for_stream(config: DbConfig) -> Result<SnapshotStreamData>
 }
 
 impl Database {
+    fn acquire_snapshot_write_lock(&self) -> Result<Connection> {
+        let conn = Connection::open(&self.config.db)?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        conn.execute_batch("BEGIN IMMEDIATE;")?;
+        Ok(conn)
+    }
+
     pub(super) async fn snapshot(&mut self) -> Result<(Vec<u8>, WalGenerationPos)> {
         // Always release the read lock on return, even on intermediate failures, so we don't
         // accidentally block future checkpoints.
@@ -52,27 +59,58 @@ impl Database {
                 self.create_generation().await?;
             }
 
-            // Issue a PASSIVE checkpoint to flush pages to disk.
-            // We use PASSIVE because TRUNCATE would delete the WAL header, causing create_generation to fail.
-            // With PASSIVE, the new generation will start with the existing WAL header and frames.
-            // The snapshot will contain the DB state including those frames.
-            // Restoring will re-apply those frames, which is safe.
-            self.checkpoint(CheckpointMode::Passive)?;
+            // Block concurrent writers so the checkpointed DB file and the published shadow-WAL
+            // position describe the same exact state.
+            let snapshot_write_lock = self.acquire_snapshot_write_lock()?;
 
-            // Acquire a read lock on the database during snapshot to prevent external checkpoints
-            // and ensure the DB file is stable while we compress it.
-            self.acquire_read_lock()?;
+            // Copy every committed WAL frame into the current shadow WAL before checkpointing it
+            // into the database file. This keeps the shadow position aligned with the snapshot DB.
+            let generation = self.current_generation()?;
+            let shadow_wal_file = self.current_shadow_wal_file(&generation)?;
+            self.copy_to_shadow_wal(&shadow_wal_file)?;
 
-            // Obtain current position.
             let pos = self.wal_generation_position()?;
             if pos.is_empty() {
                 return Err(Error::NoGenerationError("no generation"));
             }
 
+            let wal_header_before_checkpoint = WALHeader::read(&self.wal_file)?;
+
+            // Flush those exact frames into the DB file while writers are still blocked.
+            self.exec_checkpoint(CheckpointMode::Passive.as_str())?;
+
             info!("db {} snapshot created, pos: {:?}", self.config.db, pos);
 
             // compress db file
             let compressed_data = compress_file(&self.config.db)?;
+
+            // Mirror do_checkpoint(): force a post-snapshot WAL write so SQLite either keeps
+            // using the current header or visibly restarts the WAL right away. That lets us
+            // advance the shadow WAL immediately instead of deferring a spurious generation
+            // rollover to the next background sync.
+            snapshot_write_lock.execute(
+                "INSERT INTO _replited_seq (id, seq) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET seq = seq + 1;",
+                (),
+            )?;
+            snapshot_write_lock.execute_batch("COMMIT;")?;
+
+            let wal_header_after_snapshot = WALHeader::read(&self.wal_file)?;
+            let current_index = parse_wal_path(&shadow_wal_file)?;
+            let next_shadow_wal_file = self.shadow_wal_file(&generation, current_index + 1);
+            if wal_header_before_checkpoint != wal_header_after_snapshot {
+                debug!(
+                    "db {} snapshot rotated WAL header, seeding next shadow WAL index {}",
+                    self.config.db,
+                    current_index + 1
+                );
+            } else {
+                debug!(
+                    "db {} snapshot kept WAL header, still seeding next shadow WAL index {} for restorable archival",
+                    self.config.db,
+                    current_index + 1
+                );
+            }
+            self.init_shadow_wal_file(&next_shadow_wal_file)?;
 
             Ok((compressed_data.to_owned(), pos))
         }
@@ -105,15 +143,28 @@ impl Database {
         }
         Ok(())
     }
+
+    pub(super) async fn handle_db_snapshot_new_generation_command(
+        &mut self,
+        index: usize,
+    ) -> Result<()> {
+        self.ensure_wal_exists().await?;
+        self.create_generation().await?;
+        self.handle_db_snapshot_command(index).await
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
 
     use tempfile::tempdir;
+    use tokio::sync::mpsc;
 
     use super::*;
+    use crate::base::decompressed_data;
+    use crate::sync::ReplicateCommand;
 
     fn stream_only_db_config(db_path: &str) -> DbConfig {
         let toml_str = format!(
@@ -166,6 +217,172 @@ addr = "http://127.0.0.1:50051"
         assert!(
             db.tx_connection.is_none(),
             "snapshot leaked read lock (tx_connection still set); err={err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn forced_new_generation_snapshot_command_emits_newer_generation() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("primary.db");
+
+        let config = stream_only_db_config(db_path.to_string_lossy().as_ref());
+        let (mut db, _rx) = Database::try_create(config).await.expect("create db");
+        let (sync_tx, mut sync_rx) = mpsc::channel(2);
+        db.sync_notifiers = vec![Some(sync_tx)];
+
+        db.handle_db_snapshot_command(0)
+            .await
+            .expect("first snapshot command");
+        let first_generation = match sync_rx.recv().await.expect("first snapshot notification") {
+            ReplicateCommand::Snapshot((pos, _compressed)) => pos.generation,
+            other => panic!("expected snapshot notification, got {other:?}"),
+        };
+
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        db.handle_db_snapshot_new_generation_command(0)
+            .await
+            .expect("forced new-generation snapshot command");
+        let second_generation = match sync_rx.recv().await.expect("second snapshot notification") {
+            ReplicateCommand::Snapshot((pos, _compressed)) => pos.generation,
+            other => panic!("expected snapshot notification, got {other:?}"),
+        };
+
+        assert!(second_generation > first_generation);
+    }
+
+    #[tokio::test]
+    async fn snapshot_position_captures_unsynced_wal_before_checkpoint() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("primary.db");
+
+        let config = stream_only_db_config(db_path.to_string_lossy().as_ref());
+        let (mut db, _rx) = Database::try_create(config).await.expect("create db");
+
+        db.connection
+            .execute(
+                "CREATE TABLE IF NOT EXISTS snapshot_consistency (id INTEGER PRIMARY KEY, value TEXT NOT NULL)",
+                (),
+            )
+            .expect("create user table");
+        if db
+            .current_generation()
+            .expect("current generation")
+            .is_empty()
+        {
+            db.create_generation().await.expect("create generation");
+        }
+        let generation = db.current_generation().expect("current generation");
+        let shadow_wal_file = db
+            .current_shadow_wal_file(&generation)
+            .expect("current shadow wal");
+        let shadow_size_before = std::fs::metadata(&shadow_wal_file)
+            .expect("shadow wal metadata")
+            .len();
+
+        db.connection
+            .execute(
+                "INSERT INTO snapshot_consistency (value) VALUES ('before')",
+                (),
+            )
+            .expect("seed unsynced row");
+
+        let (compressed_data, snapshot_pos) = db.snapshot().await.expect("snapshot");
+
+        let restored_path = dir.path().join("restored.db");
+        std::fs::write(
+            &restored_path,
+            decompressed_data(compressed_data).expect("decompress snapshot"),
+        )
+        .expect("write restored db");
+        let restored_conn = Connection::open(&restored_path).expect("open restored db");
+        let restored_count: i64 = restored_conn
+            .query_row("SELECT COUNT(*) FROM snapshot_consistency", [], |row| {
+                row.get(0)
+            })
+            .expect("count restored rows");
+
+        assert_eq!(
+            restored_count, 1,
+            "snapshot DB should contain the pre-snapshot row"
+        );
+        assert!(
+            snapshot_pos.offset > shadow_size_before,
+            "snapshot position must advance to cover WAL frames copied into the snapshot DB; shadow_before={shadow_size_before} snapshot_pos={snapshot_pos:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_does_not_leave_shadow_wal_header_stale_for_next_sync() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("primary.db");
+
+        let config = stream_only_db_config(db_path.to_string_lossy().as_ref());
+        let (mut db, _rx) = Database::try_create(config).await.expect("create db");
+
+        db.connection
+            .execute(
+                "CREATE TABLE IF NOT EXISTS snapshot_followup (id INTEGER PRIMARY KEY, value TEXT NOT NULL)",
+                (),
+            )
+            .expect("create followup table");
+
+        db.snapshot().await.expect("initial snapshot");
+
+        let writer = Connection::open(&db.config.db).expect("open writer");
+        writer
+            .execute(
+                "INSERT INTO snapshot_followup (value) VALUES ('after-snapshot')",
+                (),
+            )
+            .expect("write after snapshot");
+
+        let verify = db.verify().expect("verify after snapshot");
+        assert_ne!(
+            verify.reason.as_deref(),
+            Some("wal header changed"),
+            "snapshot should leave shadow WAL ready for the next sync; verify={verify:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_always_seeds_next_shadow_wal_index_for_restoreable_followup() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("primary.db");
+
+        let config = stream_only_db_config(db_path.to_string_lossy().as_ref());
+        let (mut db, _rx) = Database::try_create(config).await.expect("create db");
+
+        db.connection
+            .execute(
+                "CREATE TABLE IF NOT EXISTS snapshot_rollover (id INTEGER PRIMARY KEY, value TEXT NOT NULL)",
+                (),
+            )
+            .expect("create rollover table");
+        db.connection
+            .execute(
+                "INSERT INTO snapshot_rollover (value) VALUES ('before-snapshot')",
+                (),
+            )
+            .expect("seed row");
+
+        let (_compressed_data, snapshot_pos) = db.snapshot().await.expect("snapshot");
+        let generation = db.current_generation().expect("current generation");
+        let (tail_index, _tail_size) = db
+            .current_shadow_index(&generation)
+            .expect("current shadow index");
+        let next_shadow_wal = db.shadow_wal_file(&generation, tail_index);
+
+        assert_eq!(
+            tail_index,
+            snapshot_pos.index + 1,
+            "snapshot should advance shadow WAL index so post-snapshot archival starts from offset 0"
+        );
+        assert!(
+            std::fs::metadata(&next_shadow_wal)
+                .expect("next shadow wal metadata")
+                .len()
+                > WAL_HEADER_SIZE,
+            "next shadow WAL should be seeded with a full header-bearing WAL image"
         );
     }
 }

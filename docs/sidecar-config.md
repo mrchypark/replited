@@ -11,6 +11,8 @@ It focuses on:
 Stream server/client configuration is documented separately in:
 - `docs/stream-copy-config.md`
 
+This guide is only for the `stream` lane. Archival restore/publish is manifest-backed `fs` only in the current breaking cut and is documented from the main README/restore flow, not here.
+
 ## 1. Command Usage
 
 Basic:

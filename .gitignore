@@ -59,7 +59,12 @@ tests/output/
 
 # Example data
 example/data/
+example/bin/
+example/runtime/
 example/verify_output.txt
+
+# Local demo / browser artifacts
+output/
 
 # Git worktrees (local only)
 .worktrees/

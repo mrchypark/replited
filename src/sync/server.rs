@@ -16,12 +16,11 @@ use crate::config::{Config, DbConfig};
 use crate::database::{DatabaseInfo, SnapshotStreamData, WalGenerationPos, snapshot_for_stream};
 use crate::pb::replication::replication_server::Replication;
 use crate::pb::replication::stream_error::Code as StreamErrorCode;
-use crate::pb::replication::stream_snapshot_v2_response::Payload as StreamSnapshotV2Payload;
-use crate::pb::replication::stream_wal_v2_response::Payload as StreamWalV2Payload;
+use crate::pb::replication::stream_snapshot_response::Payload as StreamSnapshotPayload;
+use crate::pb::replication::stream_wal_response::Payload as StreamWalPayload;
 use crate::pb::replication::{
-    AckLsnV2Request, AckLsnV2Response, LsnToken, SnapshotMeta, StreamError,
-    StreamSnapshotV2Request, StreamSnapshotV2Response, StreamWalV2Request, StreamWalV2Response,
-    WalChunkV2,
+    AckLsnRequest, AckLsnResponse, LsnToken, SnapshotMeta, StreamError, StreamSnapshotRequest,
+    StreamSnapshotResponse, StreamWalRequest, StreamWalResponse, WalChunk,
 };
 use crate::sqlite::{WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE, WALFrame, WALHeader};
 use crate::sync::replica_progress;
@@ -108,12 +107,12 @@ impl ReplicationServer {
 
 #[tonic::async_trait]
 impl Replication for ReplicationServer {
-    type StreamWalV2Stream = ReceiverStream<Result<StreamWalV2Response, Status>>;
+    type StreamWalStream = ReceiverStream<Result<StreamWalResponse, Status>>;
 
-    async fn stream_wal_v2(
+    async fn stream_wal(
         &self,
-        request: Request<StreamWalV2Request>,
-    ) -> Result<Response<Self::StreamWalV2Stream>, Status> {
+        request: Request<StreamWalRequest>,
+    ) -> Result<Response<Self::StreamWalStream>, Status> {
         let req = request.into_inner();
         let db_identity = req.db_identity.clone();
         let replica_id = req.replica_id.clone();
@@ -125,18 +124,18 @@ impl Replication for ReplicationServer {
 
         let (tx, rx) = mpsc::channel(8);
         tokio::spawn(async move {
-            stream_wal_v2_from_shadow(tx, db_identity, db_path, replica_id, req.start_lsn).await;
+            stream_wal_from_shadow(tx, db_identity, db_path, replica_id, req.start_lsn).await;
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
-    type StreamSnapshotV2Stream = ReceiverStream<Result<StreamSnapshotV2Response, Status>>;
+    type StreamSnapshotStream = ReceiverStream<Result<StreamSnapshotResponse, Status>>;
 
-    async fn stream_snapshot_v2(
+    async fn stream_snapshot(
         &self,
-        request: Request<StreamSnapshotV2Request>,
-    ) -> Result<Response<Self::StreamSnapshotV2Stream>, Status> {
+        request: Request<StreamSnapshotRequest>,
+    ) -> Result<Response<Self::StreamSnapshotStream>, Status> {
         let req = request.into_inner();
         let db_identity = req.db_identity.clone();
 
@@ -198,15 +197,15 @@ impl Replication for ReplicationServer {
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
-    async fn ack_lsn_v2(
+    async fn ack_lsn(
         &self,
-        request: Request<AckLsnV2Request>,
-    ) -> Result<Response<AckLsnV2Response>, Status> {
+        request: Request<AckLsnRequest>,
+    ) -> Result<Response<AckLsnResponse>, Status> {
         let req = request.into_inner();
         let db_identity = req.db_identity.clone();
         let replica_id = req.replica_id.clone();
         if replica_id.trim().is_empty() {
-            return Ok(Response::new(AckLsnV2Response {
+            return Ok(Response::new(AckLsnResponse {
                 accepted: false,
                 error: Some(stream_error_from_replication_error(
                     StreamReplicationError::InvalidLsn("replica_id is required".to_string()),
@@ -224,7 +223,7 @@ impl Replication for ReplicationServer {
         let pos = match lsn_token_to_pos(req.last_applied_lsn) {
             Ok(pos) => pos,
             Err(err) => {
-                return Ok(Response::new(AckLsnV2Response {
+                return Ok(Response::new(AckLsnResponse {
                     accepted: false,
                     error: Some(stream_error_from_replication_error(err, 0)),
                 }));
@@ -234,7 +233,7 @@ impl Replication for ReplicationServer {
         let meta_dir = match meta_dir_for_db_path(&db_path) {
             Some(dir) => dir,
             None => {
-                return Ok(Response::new(AckLsnV2Response {
+                return Ok(Response::new(AckLsnResponse {
                     accepted: false,
                     error: Some(stream_error_from_replication_error(
                         StreamReplicationError::LineageMismatch(format!(
@@ -250,7 +249,7 @@ impl Replication for ReplicationServer {
         match read_current_generation(&meta_dir) {
             Some(current_generation) if current_generation == pos.generation => {}
             Some(current_generation) => {
-                return Ok(Response::new(AckLsnV2Response {
+                return Ok(Response::new(AckLsnResponse {
                     accepted: false,
                     error: Some(stream_error_from_replication_error(
                         StreamReplicationError::LineageMismatch(format!(
@@ -263,7 +262,7 @@ impl Replication for ReplicationServer {
                 }));
             }
             None => {
-                return Ok(Response::new(AckLsnV2Response {
+                return Ok(Response::new(AckLsnResponse {
                     accepted: false,
                     error: Some(stream_error_from_replication_error(
                         StreamReplicationError::LineageMismatch(format!(
@@ -287,7 +286,7 @@ impl Replication for ReplicationServer {
                 err.attempted.index,
                 err.attempted.offset,
             );
-            return Ok(Response::new(AckLsnV2Response {
+            return Ok(Response::new(AckLsnResponse {
                 accepted: false,
                 error: Some(stream_error_from_replication_error(
                     StreamReplicationError::InvalidLsn(format!(
@@ -304,15 +303,15 @@ impl Replication for ReplicationServer {
             }));
         }
 
-        Ok(Response::new(AckLsnV2Response {
+        Ok(Response::new(AckLsnResponse {
             accepted: true,
             error: None,
         }))
     }
 }
 
-async fn stream_wal_v2_from_shadow(
-    tx: mpsc::Sender<Result<StreamWalV2Response, Status>>,
+async fn stream_wal_from_shadow(
+    tx: mpsc::Sender<Result<StreamWalResponse, Status>>,
     db_identity: String,
     db_path: PathBuf,
     replica_id: String,
@@ -481,7 +480,7 @@ fn open_stream_reader(
 }
 
 async fn stream_reader_chunks(
-    tx: &mpsc::Sender<Result<StreamWalV2Response, Status>>,
+    tx: &mpsc::Sender<Result<StreamWalResponse, Status>>,
     info: &DatabaseInfo,
     wal_path: &str,
     page_size: u64,
@@ -528,8 +527,8 @@ async fn stream_reader_chunks(
         }
 
         let next_pos = reader.position();
-        let response = StreamWalV2Response {
-            payload: Some(StreamWalV2Payload::Chunk(WalChunkV2 {
+        let response = StreamWalResponse {
+            payload: Some(StreamWalPayload::Chunk(WalChunk {
                 start_lsn: Some(lsn_token_from_pos(&chunk_start)),
                 next_lsn: Some(lsn_token_from_pos(&next_pos)),
                 wal_bytes: chunk,
@@ -681,7 +680,7 @@ fn validate_snapshot_request(
 }
 
 async fn send_snapshot_stream(
-    tx: &mpsc::Sender<Result<StreamSnapshotV2Response, Status>>,
+    tx: &mpsc::Sender<Result<StreamSnapshotResponse, Status>>,
     db_identity: &str,
     snapshot: &SnapshotStreamData,
 ) {
@@ -696,16 +695,16 @@ async fn send_snapshot_stream(
         snapshot_sha256,
     };
 
-    let response = StreamSnapshotV2Response {
-        payload: Some(StreamSnapshotV2Payload::Meta(meta)),
+    let response = StreamSnapshotResponse {
+        payload: Some(StreamSnapshotPayload::Meta(meta)),
     };
     if tx.send(Ok(response)).await.is_err() {
         return;
     }
 
     for chunk in snapshot.compressed_data.chunks(SNAPSHOT_CHUNK_SIZE) {
-        let response = StreamSnapshotV2Response {
-            payload: Some(StreamSnapshotV2Payload::Chunk(chunk.to_vec())),
+        let response = StreamSnapshotResponse {
+            payload: Some(StreamSnapshotPayload::Chunk(chunk.to_vec())),
         };
         if tx.send(Ok(response)).await.is_err() {
             return;
@@ -714,7 +713,7 @@ async fn send_snapshot_stream(
 }
 
 async fn send_replication_error(
-    tx: &mpsc::Sender<Result<StreamWalV2Response, Status>>,
+    tx: &mpsc::Sender<Result<StreamWalResponse, Status>>,
     error: StreamReplicationError,
 ) {
     if error.recovery_action() == ReplicaRecoveryAction::NeedsRestore {
@@ -722,8 +721,8 @@ async fn send_replication_error(
     } else {
         log::debug!("Primary: stream error {}: {}", error.code().as_str(), error);
     }
-    let response = StreamWalV2Response {
-        payload: Some(StreamWalV2Payload::Error(
+    let response = StreamWalResponse {
+        payload: Some(StreamWalPayload::Error(
             stream_error_from_replication_error(error, 0),
         )),
     };
@@ -731,12 +730,12 @@ async fn send_replication_error(
 }
 
 async fn send_stream_error(
-    tx: &mpsc::Sender<Result<StreamWalV2Response, Status>>,
+    tx: &mpsc::Sender<Result<StreamWalResponse, Status>>,
     code: StreamErrorCode,
     message: String,
 ) {
-    let response = StreamWalV2Response {
-        payload: Some(StreamWalV2Payload::Error(StreamError {
+    let response = StreamWalResponse {
+        payload: Some(StreamWalPayload::Error(StreamError {
             code: code as i32,
             message,
             retry_after_ms: 0,
@@ -772,7 +771,7 @@ fn snapshot_replication_error(
 }
 
 async fn send_snapshot_replication_error(
-    tx: &mpsc::Sender<Result<StreamSnapshotV2Response, Status>>,
+    tx: &mpsc::Sender<Result<StreamSnapshotResponse, Status>>,
     error: StreamReplicationError,
 ) {
     if error.recovery_action() == ReplicaRecoveryAction::NeedsRestore {
@@ -784,8 +783,8 @@ async fn send_snapshot_replication_error(
             error
         );
     }
-    let response = StreamSnapshotV2Response {
-        payload: Some(StreamSnapshotV2Payload::Error(
+    let response = StreamSnapshotResponse {
+        payload: Some(StreamSnapshotPayload::Error(
             stream_error_from_replication_error(error, 0),
         )),
     };
@@ -793,13 +792,13 @@ async fn send_snapshot_replication_error(
 }
 
 async fn send_snapshot_stream_error(
-    tx: &mpsc::Sender<Result<StreamSnapshotV2Response, Status>>,
+    tx: &mpsc::Sender<Result<StreamSnapshotResponse, Status>>,
     code: StreamErrorCode,
     message: String,
     retry_after_ms: u32,
 ) {
-    let response = StreamSnapshotV2Response {
-        payload: Some(StreamSnapshotV2Payload::Error(StreamError {
+    let response = StreamSnapshotResponse {
+        payload: Some(StreamSnapshotPayload::Error(StreamError {
             code: code as i32,
             message,
             retry_after_ms,

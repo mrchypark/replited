@@ -128,6 +128,7 @@ impl Database {
             meta_dir: meta_dir.clone(),
             page_size,
         };
+        let cache_root = config.cache_root_path()?;
         let db = Path::new(&config.db)
             .file_name()
             .and_then(|name| name.to_str())
@@ -148,6 +149,7 @@ impl Database {
                 index,
                 db_notifier.clone(),
                 info.clone(),
+                cache_root.clone(),
             )
             .await?;
             syncs.push(s.clone());
@@ -194,5 +196,54 @@ impl Database {
         }
 
         Ok((db, db_receiver))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+
+    use super::Database;
+    use crate::config::{DbConfig, StorageConfig, StorageFsConfig, StorageParams};
+
+    #[tokio::test]
+    async fn database_try_create_uses_explicit_cache_root_for_archival_runtime() {
+        let temp = tempdir().expect("tempdir");
+        let db_path = temp.path().join("primary.db");
+        let storage_root = temp.path().join("storage");
+        let cache_root = temp.path().join("custom-cache");
+
+        let config = DbConfig {
+            db: db_path.to_string_lossy().to_string(),
+            replicate: vec![StorageConfig {
+                name: "fs".to_string(),
+                params: StorageParams::Fs(Box::new(StorageFsConfig {
+                    root: storage_root.to_string_lossy().to_string(),
+                })),
+            }],
+            cache_root: Some(cache_root.to_string_lossy().to_string()),
+            min_checkpoint_page_number: 1000,
+            max_checkpoint_page_number: 10000,
+            truncate_page_number: 500000,
+            checkpoint_interval_secs: 60,
+            monitor_interval_ms: 1000,
+            apply_checkpoint_frame_interval: 128,
+            apply_checkpoint_interval_ms: 2000,
+            wal_retention_count: 10,
+            max_concurrent_snapshots: 5,
+        };
+
+        let (_db, _rx) = Database::try_create(config)
+            .await
+            .expect("create database");
+
+        assert!(
+            cache_root.exists(),
+            "configured cache_root should exist after startup"
+        );
+        assert!(
+            !temp.path().join(".primary.db-replited").join("cache").exists(),
+            "runtime should not fall back to hardcoded metadata cache when cache_root is configured"
+        );
     }
 }

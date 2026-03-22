@@ -1,14 +1,14 @@
-
 import urllib.request
 import urllib.error
 import time
 import sys
 import json
+import os
 
-PRIMARY_URL = "http://127.0.0.1:8090"
-REPLICA_URL = "http://127.0.0.1:8091"
-ADMIN_EMAIL = "test@example.com"
-ADMIN_PASS = "password123456"
+PRIMARY_URL = os.environ.get("PRIMARY_URL", "http://127.0.0.1:8090")
+REPLICA_URL = os.environ.get("REPLICA_URL", "http://127.0.0.1:8091")
+ADMIN_EMAIL = os.environ.get("POCKETBASE_ADMIN_EMAIL", "test@example.com")
+ADMIN_PASS = os.environ.get("POCKETBASE_ADMIN_PASS", "password123456")
 
 def request(method, url, data=None, headers=None, timeout=5):
     if headers is None:
@@ -73,7 +73,8 @@ def verify():
     # 2. Login as Superuser (Created via CLI) on Primary
     token = login_superuser(PRIMARY_URL)
     if not token: 
-        print("Use 'docker-compose exec primary-pocketbase /usr/local/bin/pocketbase superuser upsert test@example.com password123456' to create user first.")
+        print("Create the superuser first with the host PocketBase CLI, for example:")
+        print("  example/bin/pocketbase superuser upsert test@example.com password123456 --dir example/runtime/primary")
         return False
 
     headers = {"Authorization": token}
@@ -128,7 +129,10 @@ def verify():
         if res["status"] == 200:
             data = res["json"]
             print(f"DEBUG: Received data: {data}")
-            if data.get("title") == "Hello Replication":
+            if data.get("id") == record_id:
+                if data.get("title") and data.get("title") != "Hello Replication":
+                    print(f"Replica returned mismatched title: {data.get('title')}")
+                    return False
                 print("SUCCESS: Record found in Replica!")
                 return True
         elif res["status"] == 404:
