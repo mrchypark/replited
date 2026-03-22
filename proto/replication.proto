@@ -3,9 +3,9 @@ syntax = "proto3";
 package replication;
 
 service Replication {
-  rpc StreamWalV2(StreamWalV2Request) returns (stream StreamWalV2Response);
-  rpc StreamSnapshotV2(StreamSnapshotV2Request) returns (stream StreamSnapshotV2Response);
-  rpc AckLsnV2(AckLsnV2Request) returns (AckLsnV2Response);
+  rpc StreamWal(StreamWalRequest) returns (stream StreamWalResponse);
+  rpc StreamSnapshot(StreamSnapshotRequest) returns (stream StreamSnapshotResponse);
+  rpc AckLsn(AckLsnRequest) returns (AckLsnResponse);
 }
 
 message LsnToken {
@@ -14,27 +14,27 @@ message LsnToken {
   uint64 offset = 3;
 }
 
-message StreamWalV2Request {
+message StreamWalRequest {
   string db_identity = 1;
   string replica_id = 2;
   string session_id = 3;
   LsnToken start_lsn = 4;
 }
 
-message WalChunkV2 {
+message WalChunk {
   LsnToken start_lsn = 1;
   LsnToken next_lsn = 2;
   bytes wal_bytes = 3;
 }
 
-message StreamWalV2Response {
+message StreamWalResponse {
   oneof payload {
-    WalChunkV2 chunk = 1;
+    WalChunk chunk = 1;
     StreamError error = 2;
   }
 }
 
-message StreamSnapshotV2Request {
+message StreamSnapshotRequest {
   string db_identity = 1;
   string replica_id = 2;
   string session_id = 3;
@@ -50,7 +50,7 @@ message SnapshotMeta {
   bytes snapshot_sha256 = 6;
 }
 
-message StreamSnapshotV2Response {
+message StreamSnapshotResponse {
   oneof payload {
     SnapshotMeta meta = 1;
     bytes chunk = 2;
@@ -58,14 +58,14 @@ message StreamSnapshotV2Response {
   }
 }
 
-message AckLsnV2Request {
+message AckLsnRequest {
   string db_identity = 1;
   string replica_id = 2;
   string session_id = 3;
   LsnToken last_applied_lsn = 4;
 }
 
-message AckLsnV2Response {
+message AckLsnResponse {
   bool accepted = 1;
   StreamError error = 2;
 }

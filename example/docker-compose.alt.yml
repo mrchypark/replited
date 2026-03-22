@@ -1,3 +1,5 @@
+# Legacy reference example.
+# The canonical maintained PocketBase demo is example/run_pocketbase_live_demo.sh.
 services:
   primary-pocketbase:
     image: ghcr.io/muchobien/pocketbase:0.35.0

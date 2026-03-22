@@ -161,6 +161,10 @@ pub struct StorageGcsConfig {
     pub bucket: String,
     pub root: String,
     pub credential: String,
+    #[serde(default)]
+    pub allow_anonymous: bool,
+    #[serde(default)]
+    pub disable_vm_metadata: bool,
 }
 
 impl Default for StorageGcsConfig {
@@ -170,6 +174,8 @@ impl Default for StorageGcsConfig {
             bucket: String::new(),
             root: String::new(),
             credential: String::new(),
+            allow_anonymous: false,
+            disable_vm_metadata: false,
         }
     }
 }
@@ -180,6 +186,8 @@ impl Debug for StorageGcsConfig {
             .field("endpoint", &self.endpoint)
             .field("bucket", &self.bucket)
             .field("root", &self.root)
+            .field("allow_anonymous", &self.allow_anonymous)
+            .field("disable_vm_metadata", &self.disable_vm_metadata)
             .field("credential", &mask_string(&self.credential, 3))
             .finish()
     }

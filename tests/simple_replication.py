@@ -33,6 +33,7 @@ dir = "logs"
 
 [[database]]
 db = "primary.db"
+cache_root = "cache"
 max_concurrent_snapshots = 4
 wal_retention_secs = 86400
 wal_retention_count = 5 
@@ -101,6 +102,7 @@ dir = "logs"
 
 [[database]]
 db = "primary.db"
+cache_root = "cache"
 
 [[database.replicate]]
 name = "stream-replica"

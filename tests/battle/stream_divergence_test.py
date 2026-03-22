@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Stream v2 divergence test under lag + frequent snapshots.
+Stream divergence test under lag + frequent snapshots.
 
 Verifies that a lagging replica either converges to the primary
 or transitions to NeedsRestore with an explicit error code.
@@ -44,6 +44,7 @@ dir = "logs"
 
 [[database]]
 db = "primary.db"
+cache_root = "cache"
 max_concurrent_snapshots = 4
 wal_retention_secs = 60
 wal_retention_count = 2
@@ -83,6 +84,7 @@ dir = "logs"
 
 [[database]]
 db = "primary.db"
+cache_root = "cache"
 apply_checkpoint_frame_interval = 10
 apply_checkpoint_interval_ms = 200
 wal_retention_count = 2
@@ -343,7 +345,7 @@ def wait_for_replica_sync(
 
 
 def run_test(num_writes: int, snapshot_every: int, lag_seconds: int) -> DivergenceResult:
-    env = TestEnv("stream_v2_divergence")
+    env = TestEnv("stream_divergence")
     env.setup()
 
     result = DivergenceResult(
@@ -522,7 +524,7 @@ def run_test(num_writes: int, snapshot_every: int, lag_seconds: int) -> Divergen
 
 def print_report(result: DivergenceResult) -> bool:
     print("\n" + "=" * 60)
-    print("STREAM V2 DIVERGENCE TEST REPORT")
+    print("STREAM DIVERGENCE TEST REPORT")
     print("=" * 60)
     print(f"Converged:              {'YES' if result.converged else 'NO'}")
     print(f"NeedsRestore:           {'YES' if result.needs_restore else 'NO'}")
@@ -551,7 +553,7 @@ def print_report(result: DivergenceResult) -> bool:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Stream v2 divergence test")
+    parser = argparse.ArgumentParser(description="Stream divergence test")
     parser.add_argument("-n", "--num-writes", type=int, default=400)
     parser.add_argument("-s", "--snapshot-every", type=int, default=80)
     parser.add_argument("-l", "--lag-seconds", type=int, default=8)
