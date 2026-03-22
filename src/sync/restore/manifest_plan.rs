@@ -90,7 +90,7 @@ pub(crate) fn plan_manifest_restore(input: &ManifestPlannerInput) -> Result<Mani
     });
 
     let mut expected_index = snapshot.index;
-    let mut expected_offset = 0;
+    let mut expected_offset = snapshot.offset;
     let mut wal_segments_by_index: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
     let mut wal_objects: Vec<ManifestRestoreWalObject> = Vec::with_capacity(packs.len());
     let mut seen_pack_starts: BTreeMap<(u64, u64), ManifestPlannerWalPack> = BTreeMap::new();
@@ -137,6 +137,13 @@ pub(crate) fn plan_manifest_restore(input: &ManifestPlannerInput) -> Result<Mani
             )));
         }
 
+        if snapshot.offset > 0 && index == snapshot.index {
+            return Err(Error::StorageError(format!(
+                "manifest restore cannot start from same WAL index {} at snapshot offset {}; a new WAL index is required after snapshot publication",
+                index, snapshot.offset
+            )));
+        }
+
         let expected_key_position = if index == expected_index {
             offset == expected_offset
         } else {
@@ -173,7 +180,11 @@ pub(crate) fn plan_manifest_restore(input: &ManifestPlannerInput) -> Result<Mani
         .map(|(index, mut offsets)| {
             offsets.sort_unstable();
             offsets.dedup();
-            let expected_first_offset = 0;
+            let expected_first_offset = if index == snapshot.index {
+                snapshot.offset
+            } else {
+                0
+            };
             if offsets.first().copied().unwrap_or_default() != expected_first_offset {
                 return Err(Error::StorageError(format!(
                     "wal pack offsets for index {} must start at {}",
@@ -286,7 +297,7 @@ mod tests {
                 start_lsn: 0,
                 end_lsn: 16512,
                 object_key:
-                    "db.db/generations/019c3e53aea47afbbddfe5ebc2272e22/wal/ranges/0000000001_0000000000_0000000001_0000016512/0000000001_0000000000.wal.zst"
+                    "db.db/generations/019c3e53aea47afbbddfe5ebc2272e22/wal/ranges/0000000002_0000000000_0000000002_0000016512/0000000002_0000000000.wal.zst"
                         .to_string(),
                 sha256: "sha-a".to_string(),
                 size_bytes: 128,
@@ -297,7 +308,7 @@ mod tests {
                 start_lsn: 0,
                 end_lsn: 4096,
                 object_key:
-                    "db.db/generations/019c3e53aea47afbbddfe5ebc2272e22/wal/ranges/0000000002_0000000000_0000000002_0000004096/0000000002_0000000000.wal.zst"
+                    "db.db/generations/019c3e53aea47afbbddfe5ebc2272e22/wal/ranges/0000000003_0000000000_0000000003_0000004096/0000000003_0000000000.wal.zst"
                         .to_string(),
                 sha256: "sha-b".to_string(),
                 size_bytes: 128,
@@ -307,6 +318,29 @@ mod tests {
         ];
 
         let _plan = plan_manifest_restore(&input).expect("manifest plan");
+    }
+
+    #[test]
+    fn manifest_plan_rejects_same_index_pack_at_nonzero_snapshot_offset() {
+        let mut input = sample_input();
+        input.base_snapshot =
+            "db.db/generations/019c3e53aea47afbbddfe5ebc2272e22/snapshots/0000000001_0000004152.snapshot.zst"
+                .to_string();
+        input.wal_packs = vec![ManifestPlannerWalPack {
+            start_lsn: 4152,
+            end_lsn: 8304,
+            object_key:
+                "db.db/generations/019c3e53aea47afbbddfe5ebc2272e22/wal/ranges/0000000001_0000004152_0000000001_0000008304/0000000001_0000004152.wal.zst"
+                    .to_string(),
+            sha256: "sha-a".to_string(),
+            size_bytes: 128,
+            lineage_id: "lineage-01".to_string(),
+            base_snapshot_id: "snapshot-01".to_string(),
+        }];
+
+        let err = plan_manifest_restore(&input)
+            .expect_err("same-index continuation after nonzero snapshot offset should fail");
+        assert_eq!(err.code(), Error::STORAGE_ERROR);
     }
 
     #[test]

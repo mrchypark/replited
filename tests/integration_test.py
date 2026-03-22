@@ -409,7 +409,7 @@ def verify_archival_restore(binary: Path, backend: str, timeout_sec: int) -> int
     config_path = env.root / "primary.toml"
     restore_output = env.root / "restored.db"
     restore_log = replited_log_path(env)
-    primary_log = env.root / "primary.log"
+    primary_log = restore_log
     primary = None
 
     try:

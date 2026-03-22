@@ -76,7 +76,12 @@ impl super::Restore {
             let latest_plan = latest_selected.plan;
             if let Some(cache) = &self.cache {
                 let pinned = std::iter::once(latest_plan.snapshot_key.clone())
-                    .chain(latest_plan.wal_objects.iter().map(|wal| wal.object_key.clone()))
+                    .chain(
+                        latest_plan
+                            .wal_objects
+                            .iter()
+                            .map(|wal| wal.object_key.clone()),
+                    )
                     .collect::<Vec<_>>();
                 cache.set_pinned_keys(pinned);
             }
@@ -165,6 +170,7 @@ mod tests {
         wal_progress: &[(u64, u64, u64)],
     ) -> super::super::DiscoveredRestorePlan {
         super::super::DiscoveredRestorePlan {
+            manifest_id: "manifest-01".to_string(),
             snapshot: SnapshotInfo {
                 generation,
                 index: snapshot_index,
@@ -294,10 +300,9 @@ mod tests {
             "db.db/generations/{}/snapshots/0000000001_0000000000.snapshot.zst",
             generation.as_str()
         );
-        let compressed_snapshot = compress_buffer(
-            &std::fs::read(&source_snapshot_path).expect("read source snapshot"),
-        )
-        .expect("compress snapshot");
+        let compressed_snapshot =
+            compress_buffer(&std::fs::read(&source_snapshot_path).expect("read source snapshot"))
+                .expect("compress snapshot");
         let snapshot_sha256 = format!("{:x}", sha2::Sha256::digest(&compressed_snapshot));
         client
             .publish_manifest_snapshot(
@@ -327,6 +332,7 @@ mod tests {
         .expect("restore");
 
         let plan = super::super::DiscoveredRestorePlan {
+            manifest_id: "manifest-01".to_string(),
             snapshot,
             snapshot_key,
             snapshot_sha256,

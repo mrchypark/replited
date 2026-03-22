@@ -7,6 +7,7 @@ use std::time::{Duration, SystemTime};
 use chrono::DateTime;
 use chrono::Utc;
 use log::debug;
+use log::info;
 use log::warn;
 use opendal::Metadata;
 use opendal::Metakey;
@@ -14,8 +15,8 @@ use opendal::Operator;
 use sha2::{Digest, Sha256};
 use tokio::time::sleep;
 
-use super::init_operator;
 use super::LocalObjectCache;
+use super::init_operator;
 use super::manifest::GenerationManifest;
 use super::manifest::LatestPointer;
 use super::manifest::ManifestWalPack;
@@ -344,22 +345,19 @@ impl StorageClient {
     fn manifest_publish_root(&self) -> Result<PathBuf> {
         match &self.latest_pointer_update_policy {
             LatestPointerUpdatePolicy::FsCompareUnderLock { root } => Ok(root.clone()),
-            LatestPointerUpdatePolicy::SingleWriterUnconditional { .. } => Err(
-                Error::InvalidConfig(
+            LatestPointerUpdatePolicy::SingleWriterUnconditional { .. } => {
+                Err(Error::InvalidConfig(
                     "manifest publish root is unavailable for non-fs single-writer backends"
                         .to_string(),
-                ),
-            ),
+                ))
+            }
             LatestPointerUpdatePolicy::Unsupported { backend } => Err(Error::InvalidConfig(
                 format!("manifest publish path is unsupported for backend {backend}"),
             )),
         }
     }
 
-    async fn acquire_manifest_publish_lock(
-        &self,
-        generation: &str,
-    ) -> Result<Option<FsPathLock>> {
+    async fn acquire_manifest_publish_lock(&self, generation: &str) -> Result<Option<FsPathLock>> {
         match &self.latest_pointer_update_policy {
             LatestPointerUpdatePolicy::FsCompareUnderLock { root } => Ok(Some(
                 Self::acquire_fs_path_lock(&Self::manifest_publish_lock_path(
@@ -710,6 +708,14 @@ impl StorageClient {
             )));
         }
 
+        info!(
+            "manifest restore inputs generation={} manifest_id={} base_snapshot={} wal_pack_count={}",
+            manifest.generation,
+            manifest.manifest_id,
+            manifest.base_snapshot,
+            manifest.wal_packs.len()
+        );
+
         Ok(Some((
             manifest.generation,
             manifest.manifest_id,
@@ -773,6 +779,10 @@ impl StorageClient {
         let manifest_bytes = serde_json::to_vec(&manifest)
             .map_err(|err| Error::StorageError(format!("serialize generation manifest: {err}")))?;
         self.write_generation_manifest(&manifest).await?;
+        info!(
+            "published manifest snapshot generation={} manifest_id={} snapshot_key={} wal_pack_count=0",
+            manifest.generation, manifest.manifest_id, manifest.base_snapshot
+        );
         self.publish_latest_pointer_for_manifest(pos.generation.as_str(), &manifest_bytes)
             .await?;
         Ok(())
@@ -835,6 +845,22 @@ impl StorageClient {
         let manifest_bytes = serde_json::to_vec(&manifest)
             .map_err(|err| Error::StorageError(format!("serialize generation manifest: {err}")))?;
         self.write_generation_manifest(&manifest).await?;
+        let pack_object_key = manifest
+            .wal_packs
+            .last()
+            .map(|pack| pack.object_key.as_str())
+            .unwrap_or("");
+        info!(
+            "published manifest wal pack generation={} manifest_id={} wal_pack_count={} object_key={} range={}:{}-{}:{}",
+            manifest.generation,
+            manifest.manifest_id,
+            manifest.wal_packs.len(),
+            pack_object_key,
+            start.index,
+            start.offset,
+            end.index,
+            end.offset
+        );
         self.publish_latest_pointer_for_manifest(start.generation.as_str(), &manifest_bytes)
             .await?;
         Ok(())
@@ -1720,15 +1746,15 @@ mod tests {
     #[tokio::test]
     async fn cache_first_read_hits_cache_and_skips_remote_get() {
         let temp = tempdir().expect("tempdir");
-        let cache = LocalObjectCache::try_create(
-            temp.path().join("cache"),
-            DEFAULT_CACHE_SIZE_LIMIT_BYTES,
-        )
-        .expect("cache");
+        let cache =
+            LocalObjectCache::try_create(temp.path().join("cache"), DEFAULT_CACHE_SIZE_LIMIT_BYTES)
+                .expect("cache");
         let client = single_writer_memory_storage_client(Some(cache.clone()));
         let payload = b"hello-cache".to_vec();
         let sha = format!("{:x}", Sha256::digest(&payload));
-        cache.put("db.db/objects/item", &payload).expect("seed cache");
+        cache
+            .put("db.db/objects/item", &payload)
+            .expect("seed cache");
 
         let bytes = client
             .read_object_by_key_checked("db.db/objects/item", Some(&sha))
@@ -1743,11 +1769,9 @@ mod tests {
     #[tokio::test]
     async fn cache_first_read_populates_cache_on_miss() {
         let temp = tempdir().expect("tempdir");
-        let cache = LocalObjectCache::try_create(
-            temp.path().join("cache"),
-            DEFAULT_CACHE_SIZE_LIMIT_BYTES,
-        )
-        .expect("cache");
+        let cache =
+            LocalObjectCache::try_create(temp.path().join("cache"), DEFAULT_CACHE_SIZE_LIMIT_BYTES)
+                .expect("cache");
         let client = single_writer_memory_storage_client(Some(cache.clone()));
         let payload = b"remote-object".to_vec();
         let sha = format!("{:x}", Sha256::digest(&payload));
@@ -1774,11 +1798,9 @@ mod tests {
     #[tokio::test]
     async fn cache_first_read_rejects_remote_checksum_mismatch() {
         let temp = tempdir().expect("tempdir");
-        let cache = LocalObjectCache::try_create(
-            temp.path().join("cache"),
-            DEFAULT_CACHE_SIZE_LIMIT_BYTES,
-        )
-        .expect("cache");
+        let cache =
+            LocalObjectCache::try_create(temp.path().join("cache"), DEFAULT_CACHE_SIZE_LIMIT_BYTES)
+                .expect("cache");
         let client = single_writer_memory_storage_client(Some(cache));
         client
             .operator

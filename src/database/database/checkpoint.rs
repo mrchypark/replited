@@ -55,11 +55,6 @@ impl Database {
         None
     }
 
-    pub(super) fn checkpoint(&mut self, mode: CheckpointMode) -> Result<()> {
-        let generation = self.current_generation()?;
-        self.do_checkpoint(&generation, mode.as_str())
-    }
-
     // checkpoint performs a checkpoint on the WAL file and initializes a
     // new shadow WAL file.
     pub(super) fn do_checkpoint(&mut self, generation: &str, mode: &str) -> Result<()> {

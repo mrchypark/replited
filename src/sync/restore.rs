@@ -19,10 +19,10 @@ use crate::config::StorageConfig;
 use crate::error::Error;
 use crate::error::Result;
 use crate::sqlite::{WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE, WALHeader};
-use crate::storage::RestoreRequestCostSnapshot;
-use crate::storage::RestoreRequestCostStats;
 use crate::storage::DEFAULT_CACHE_SIZE_LIMIT_BYTES;
 use crate::storage::LocalObjectCache;
+use crate::storage::RestoreRequestCostSnapshot;
+use crate::storage::RestoreRequestCostStats;
 use crate::storage::StorageClient;
 
 mod follow;
@@ -40,6 +40,7 @@ struct Restore {
 
 #[derive(Debug, Clone)]
 struct DiscoveredRestorePlan {
+    manifest_id: String,
     snapshot: crate::storage::SnapshotInfo,
     snapshot_key: String,
     snapshot_sha256: String,
@@ -128,7 +129,7 @@ impl ManifestRestoreSource for StorageManifestRestoreSource {
 
         let plan = plan_manifest_restore(&ManifestPlannerInput {
             generation,
-            manifest_id,
+            manifest_id: manifest_id.clone(),
             lineage_id,
             base_snapshot_id,
             base_snapshot_sha256,
@@ -158,6 +159,7 @@ impl ManifestRestoreSource for StorageManifestRestoreSource {
         })?;
 
         Ok(Some(DiscoveredRestorePlan {
+            manifest_id,
             snapshot: plan.snapshot,
             snapshot_key: plan.snapshot_key,
             snapshot_sha256: plan.snapshot_sha256,
@@ -280,6 +282,15 @@ impl Restore {
             .decide_restore_plan_with_request_costs(limit, request_costs.clone())
             .await?;
         let latest_restore_plan = selected_restore_plan.plan;
+        info!(
+            "selected manifest restore generation={} manifest_id={} snapshot_key={} snapshot_pos={}:{} wal_objects={}",
+            latest_restore_plan.snapshot.generation,
+            latest_restore_plan.manifest_id,
+            latest_restore_plan.snapshot_key,
+            latest_restore_plan.snapshot.index,
+            latest_restore_plan.snapshot.offset,
+            latest_restore_plan.wal_objects.len()
+        );
         let client = StorageClient::try_create_with_cache_and_restore_request_costs(
             self.db.clone(),
             selected_restore_plan.storage_config,
@@ -454,12 +465,8 @@ impl Restore {
 
         if self.options.follow {
             drop(_keepalive_connection);
-            self.follow_loop(
-                latest_restore_plan.snapshot,
-                last_index,
-                last_offset,
-            )
-            .await?;
+            self.follow_loop(latest_restore_plan.snapshot, last_index, last_offset)
+                .await?;
             if let Some(cache) = &self.cache {
                 cache.clear_pinned_keys();
             }
@@ -721,6 +728,7 @@ mod tests {
             )
             .collect::<Vec<_>>();
         DiscoveredRestorePlan {
+            manifest_id: "manifest-01".to_string(),
             snapshot: SnapshotInfo {
                 generation,
                 index,
@@ -929,6 +937,7 @@ mod tests {
         let selected = SelectedRestorePlan {
             storage_config: sample_storage_config("/tmp/replited-a"),
             plan: DiscoveredRestorePlan {
+                manifest_id: "manifest-01".to_string(),
                 snapshot: SnapshotInfo {
                     generation: Generation::try_create(
                         "019c3e53aea47afbbddfe5ebc2272e22",

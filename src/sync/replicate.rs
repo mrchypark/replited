@@ -51,6 +51,21 @@ fn snapshot_position_is_newer(index: u64, offset: u64, current: Option<(u64, u64
     }
 }
 
+fn wal_generation_position_is_newer(
+    candidate: &WalGenerationPos,
+    current: Option<&WalGenerationPos>,
+) -> bool {
+    match current {
+        None => true,
+        Some(current) => {
+            candidate.generation > current.generation
+                || (candidate.generation == current.generation
+                    && (candidate.index > current.index
+                        || (candidate.index == current.index && candidate.offset > current.offset)))
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Replicate {
     db: String,
@@ -60,6 +75,7 @@ pub struct Replicate {
     position: Arc<RwLock<WalGenerationPos>>,
     state: ReplicateState,
     wait_snapshot_started_at: Option<Instant>,
+    pending_db_changed: Option<WalGenerationPos>,
     info: DatabaseInfo,
     config: StorageConfig,
 }
@@ -99,6 +115,7 @@ impl Replicate {
             config,
             state: ReplicateState::WaitDbChanged,
             wait_snapshot_started_at: None,
+            pending_db_changed: None,
             info,
         })
     }
@@ -320,10 +337,19 @@ impl Replicate {
     }
 
     fn manifest_snapshot_resume_position(pos: &WalGenerationPos) -> WalGenerationPos {
-        WalGenerationPos {
-            generation: pos.generation.clone(),
-            index: pos.index,
-            offset: 0,
+        pos.clone()
+    }
+
+    fn buffer_pending_db_changed(&mut self, pos: WalGenerationPos) {
+        if wal_generation_position_is_newer(&pos, self.pending_db_changed.as_ref()) {
+            self.pending_db_changed = Some(pos);
+        }
+    }
+
+    fn take_newest_known_position(&mut self, pos: WalGenerationPos) -> WalGenerationPos {
+        match self.pending_db_changed.take() {
+            Some(pending) if wal_generation_position_is_newer(&pending, Some(&pos)) => pending,
+            _ => pos,
         }
     }
 
@@ -370,7 +396,8 @@ impl Replicate {
 
         // change state from WaitSnapshot to WaitDbChanged
         self.leave_wait_snapshot();
-        self.sync(pos).await
+        let next_pos = self.take_newest_known_position(pos);
+        self.sync(next_pos).await
     }
 
     async fn maybe_request_manifest_rollover(&mut self, generation: &Generation) -> Result<bool> {
@@ -478,7 +505,7 @@ impl Replicate {
         }
     }
 
-    async fn sync(&mut self, pos: WalGenerationPos) -> Result<()> {
+    async fn sync(&mut self, mut pos: WalGenerationPos) -> Result<()> {
         info!(
             "db {} replicate {} replica sync pos: {:?}\n",
             self.db, self.config.name, pos
@@ -496,9 +523,12 @@ impl Replicate {
                 );
                 self.leave_wait_snapshot();
             } else {
+                self.buffer_pending_db_changed(pos);
                 return Ok(());
             }
         }
+
+        pos = self.take_newest_known_position(pos);
 
         if pos.offset == 0 {
             return Ok(());
@@ -578,7 +608,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_snapshot_resume_position_restarts_same_index_at_zero() {
+    fn manifest_snapshot_resume_position_keeps_exact_snapshot_position() {
         use crate::base::Generation;
         use crate::database::WalGenerationPos;
 
@@ -591,7 +621,31 @@ mod tests {
         let resumed = super::Replicate::manifest_snapshot_resume_position(&pos);
         assert_eq!(resumed.generation, pos.generation);
         assert_eq!(resumed.index, pos.index);
-        assert_eq!(resumed.offset, 0);
+        assert_eq!(resumed.offset, pos.offset);
+    }
+
+    #[test]
+    fn newer_generation_position_wins_across_pending_updates() {
+        use crate::base::Generation;
+        use crate::database::WalGenerationPos;
+
+        let current_generation =
+            Generation::try_create("019c3e53aea47afbbddfe5ebc2272e22").expect("current generation");
+        let next_generation =
+            Generation::try_create("019c3e53aea57afbbddfe5ebc2272e22").expect("next generation");
+
+        assert!(super::wal_generation_position_is_newer(
+            &WalGenerationPos {
+                generation: next_generation,
+                index: 0,
+                offset: 32,
+            },
+            Some(&WalGenerationPos {
+                generation: current_generation,
+                index: 999,
+                offset: 9999,
+            }),
+        ));
     }
 
     #[test]
@@ -627,16 +681,15 @@ mod tests {
                     page_size: 4096,
                 };
 
-                let replicate =
-                    super::Replicate::new_for_test(
-                        storage_cfg,
-                        "data.db".to_string(),
-                        0,
-                        db_notifier,
-                        info,
-                    )
-                        .await
-                        .expect("create replicate");
+                let replicate = super::Replicate::new_for_test(
+                    storage_cfg,
+                    "data.db".to_string(),
+                    0,
+                    db_notifier,
+                    info,
+                )
+                .await
+                .expect("create replicate");
 
                 let (tx, rx) = mpsc::channel(1);
                 drop(tx); // immediately close channel
@@ -679,10 +732,15 @@ mod tests {
             meta_dir: temp.path().to_string_lossy().to_string(),
             page_size: 4096,
         };
-        let replicate =
-            super::Replicate::new_for_test(storage_cfg, "data.db".to_string(), 0, db_notifier, info)
-                .await
-                .expect("create replicate");
+        let replicate = super::Replicate::new_for_test(
+            storage_cfg,
+            "data.db".to_string(),
+            0,
+            db_notifier,
+            info,
+        )
+        .await
+        .expect("create replicate");
 
         let snapshot_pos = WalGenerationPos {
             generation: generation.clone(),
@@ -739,8 +797,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn calculate_generation_position_uses_zero_offset_for_manifest_snapshot_when_no_wal_exists()
-     {
+    async fn calculate_generation_position_uses_exact_snapshot_offset_when_no_wal_exists() {
         use tempfile::tempdir;
         use tokio::sync::mpsc;
 
@@ -763,10 +820,15 @@ mod tests {
             meta_dir: temp.path().to_string_lossy().to_string(),
             page_size: 4096,
         };
-        let replicate =
-            super::Replicate::new_for_test(storage_cfg, "data.db".to_string(), 0, db_notifier, info)
-                .await
-                .expect("create replicate");
+        let replicate = super::Replicate::new_for_test(
+            storage_cfg,
+            "data.db".to_string(),
+            0,
+            db_notifier,
+            info,
+        )
+        .await
+        .expect("create replicate");
 
         let snapshot_pos = WalGenerationPos {
             generation: generation.clone(),
@@ -789,7 +851,7 @@ mod tests {
 
         assert_eq!(position.generation, generation);
         assert_eq!(position.index, snapshot_pos.index);
-        assert_eq!(position.offset, 0);
+        assert_eq!(position.offset, snapshot_pos.offset);
     }
 
     #[tokio::test]
@@ -815,10 +877,15 @@ mod tests {
             meta_dir: temp.path().to_string_lossy().to_string(),
             page_size: 4096,
         };
-        let replicate =
-            super::Replicate::new_for_test(storage_cfg, "data.db".to_string(), 0, db_notifier, info)
-                .await
-                .expect("create replicate");
+        let replicate = super::Replicate::new_for_test(
+            storage_cfg,
+            "data.db".to_string(),
+            0,
+            db_notifier,
+            info,
+        )
+        .await
+        .expect("create replicate");
 
         let snapshot_pos = WalGenerationPos {
             generation: generation.clone(),
@@ -865,10 +932,15 @@ mod tests {
             meta_dir: temp.path().to_string_lossy().to_string(),
             page_size: 4096,
         };
-        let replicate =
-            super::Replicate::new_for_test(storage_cfg, "data.db".to_string(), 0, db_notifier, info)
-                .await
-                .expect("create replicate");
+        let replicate = super::Replicate::new_for_test(
+            storage_cfg,
+            "data.db".to_string(),
+            0,
+            db_notifier,
+            info,
+        )
+        .await
+        .expect("create replicate");
 
         replicate
             .client
@@ -1003,10 +1075,15 @@ mod tests {
             meta_dir: temp.path().to_string_lossy().to_string(),
             page_size: 4096,
         };
-        let mut replicate =
-            super::Replicate::new_for_test(storage_cfg, "data.db".to_string(), 0, db_notifier, info)
-                .await
-                .expect("create replicate");
+        let mut replicate = super::Replicate::new_for_test(
+            storage_cfg,
+            "data.db".to_string(),
+            0,
+            db_notifier,
+            info,
+        )
+        .await
+        .expect("create replicate");
         replicate.state = super::ReplicateState::WaitSnapshot;
         replicate.wait_snapshot_started_at = Some(
             std::time::Instant::now()
@@ -1024,6 +1101,87 @@ mod tests {
         assert_eq!(replicate.state, super::ReplicateState::WaitSnapshot);
         assert!(replicate.wait_snapshot_started_at.is_some());
         assert!(matches!(db_rx.recv().await, Some(DbCommand::Snapshot(0))));
+    }
+
+    #[tokio::test]
+    async fn newer_generation_db_changed_is_replayed_after_wait_snapshot() {
+        use std::time::Duration;
+
+        use tempfile::tempdir;
+        use tokio::sync::mpsc;
+
+        use crate::base::{Generation, compress_buffer, shadow_wal_file};
+        use crate::config::{StorageConfig, StorageFsConfig, StorageParams};
+        use crate::database::{DatabaseInfo, DbCommand, WalGenerationPos};
+
+        let temp = tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage");
+        let storage_cfg = StorageConfig {
+            name: "fs".to_string(),
+            params: StorageParams::Fs(Box::new(StorageFsConfig {
+                root: storage_root.to_string_lossy().to_string(),
+            })),
+        };
+        let (db_notifier, mut db_rx) = mpsc::channel(4);
+        let info = DatabaseInfo {
+            meta_dir: temp.path().to_string_lossy().to_string(),
+            page_size: 4096,
+        };
+        let mut replicate = super::Replicate::new_for_test(
+            storage_cfg,
+            "data.db".to_string(),
+            0,
+            db_notifier,
+            info,
+        )
+        .await
+        .expect("create replicate");
+        replicate.state = super::ReplicateState::WaitSnapshot;
+
+        let old_generation =
+            Generation::try_create("019c3e53aea47afbbddfe5ebc2272e22").expect("old generation");
+        let new_generation =
+            Generation::try_create("019c3e53aea57afbbddfe5ebc2272e22").expect("new generation");
+        let old_pos = WalGenerationPos {
+            generation: old_generation.clone(),
+            index: 0,
+            offset: 32,
+        };
+
+        let old_shadow_wal =
+            shadow_wal_file(&temp.path().to_string_lossy(), old_generation.as_str(), 0);
+        std::fs::create_dir_all(
+            std::path::Path::new(&old_shadow_wal)
+                .parent()
+                .expect("shadow wal parent"),
+        )
+        .expect("create shadow wal parent");
+        std::fs::write(&old_shadow_wal, vec![0_u8; old_pos.offset as usize])
+            .expect("write old shadow wal");
+
+        replicate
+            .command(ReplicateCommand::DbChanged(WalGenerationPos {
+                generation: new_generation,
+                index: 0,
+                offset: 32,
+            }))
+            .await
+            .expect("buffer newer generation");
+        replicate
+            .command(ReplicateCommand::Snapshot((
+                old_pos,
+                compress_buffer(b"snapshot").expect("compress snapshot"),
+            )))
+            .await
+            .expect("publish old snapshot then request newer one");
+
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_millis(500), db_rx.recv())
+                .await
+                .expect("wait for db command"),
+            Some(DbCommand::Snapshot(0))
+        ));
+        assert_eq!(replicate.state, super::ReplicateState::WaitSnapshot);
     }
 
     #[tokio::test]
@@ -1050,10 +1208,15 @@ mod tests {
             meta_dir: temp.path().to_string_lossy().to_string(),
             page_size: 4096,
         };
-        let replicate =
-            super::Replicate::new_for_test(storage_cfg, "data.db".to_string(), 0, db_notifier, info)
-                .await
-                .expect("create replicate");
+        let replicate = super::Replicate::new_for_test(
+            storage_cfg,
+            "data.db".to_string(),
+            0,
+            db_notifier,
+            info,
+        )
+        .await
+        .expect("create replicate");
 
         replicate
             .client
@@ -1350,16 +1513,15 @@ mod tests {
             meta_dir: temp.path().to_string_lossy().to_string(),
             page_size: 4096,
         };
-        let mut replicate =
-            super::Replicate::new_for_test(
-                storage_cfg,
-                "data.db".to_string(),
-                0,
-                db_notifier,
-                info,
-            )
-                .await
-                .expect("create replicate");
+        let mut replicate = super::Replicate::new_for_test(
+            storage_cfg,
+            "data.db".to_string(),
+            0,
+            db_notifier,
+            info,
+        )
+        .await
+        .expect("create replicate");
 
         let err = replicate
             .command(ReplicateCommand::Snapshot((
@@ -1410,16 +1572,15 @@ mod tests {
             meta_dir: temp.path().to_string_lossy().to_string(),
             page_size: 4096,
         };
-        let mut replicate =
-            super::Replicate::new_for_test(
-                storage_cfg,
-                "data.db".to_string(),
-                0,
-                db_notifier,
-                info,
-            )
-                .await
-                .expect("create replicate");
+        let mut replicate = super::Replicate::new_for_test(
+            storage_cfg,
+            "data.db".to_string(),
+            0,
+            db_notifier,
+            info,
+        )
+        .await
+        .expect("create replicate");
 
         replicate
             .client
@@ -1496,16 +1657,15 @@ mod tests {
             meta_dir: temp.path().to_string_lossy().to_string(),
             page_size: 4096,
         };
-        let mut replicate =
-            super::Replicate::new_for_test(
-                storage_cfg,
-                "data.db".to_string(),
-                0,
-                db_notifier,
-                info,
-            )
-                .await
-                .expect("create replicate");
+        let mut replicate = super::Replicate::new_for_test(
+            storage_cfg,
+            "data.db".to_string(),
+            0,
+            db_notifier,
+            info,
+        )
+        .await
+        .expect("create replicate");
 
         replicate
             .client
