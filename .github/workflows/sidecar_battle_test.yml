@@ -22,6 +22,6 @@ jobs:
         shell: bash
         run: |
           cargo build --release
-          python3 tests/battle/sidecar_restore_test.py
-          python3 tests/battle/sidecar_retry_test.py
-          python3 tests/battle/sidecar_recover_test.py
+          python3 tests/battle/sidecar_restore_retry_recover_test.py --scenario restore
+          python3 tests/battle/sidecar_restore_retry_recover_test.py --scenario retry
+          python3 tests/battle/sidecar_restore_retry_recover_test.py --scenario recover
