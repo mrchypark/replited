@@ -337,10 +337,25 @@ def scenario_resume_without_restore() -> ScenarioResult:
             with replited_log.open("r") as handle:
                 handle.seek(restart_log_offset)
                 restart_log = handle.read()
+        state_lines = [
+            line.strip()
+            for line in restart_log.splitlines()
+            if "loop state:" in line
+        ]
+        first_state = state_lines[0] if state_lines else ""
         if "loop state: CatchingUp" not in restart_log:
             result.errors.append("Restarted replica did not enter CatchingUp state")
-        if "loop state: Bootstrapping" in restart_log:
-            result.errors.append("Restarted replica unexpectedly re-entered Bootstrapping")
+        elif "loop state: CatchingUp" not in first_state:
+            result.errors.append(
+                f"Restarted replica entered unexpected initial state: {first_state or 'missing'}"
+            )
+        if "loop state: Bootstrapping" in restart_log and (
+            "loop state: NeedsRestore" not in restart_log
+            and "LineageMismatch" not in restart_log
+        ):
+            result.errors.append(
+                "Restarted replica re-entered Bootstrapping without an explicit restore reason"
+            )
 
         assert_integrity(replica_db, result, "replica")
         result.success = not result.errors

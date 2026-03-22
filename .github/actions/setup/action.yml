@@ -4,6 +4,12 @@ description: 'Prepare Rust Build Environment'
 runs:
   using: "composite"
   steps:
+    - name: Setup Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.14"
+        check-latest: true
+
     - name: Install protobuf compiler
       shell: bash
       run: |
@@ -23,5 +29,7 @@ runs:
         echo "RUST_LOG=opendal=trace" >> $GITHUB_ENV
         # Enable sparse index
         echo "CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse" >> $GITHUB_ENV
-        # Make sure rust has been setup
+        # Make sure toolchains are the expected versions
+        python3 --version
+        rustc --version
         cargo version

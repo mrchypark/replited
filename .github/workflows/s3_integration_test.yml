@@ -7,7 +7,7 @@ on:
 
 jobs:
   plan:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     services:
       localstack:
         image: localstack/localstack:3.7.2
