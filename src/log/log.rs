@@ -43,9 +43,15 @@ pub fn init_log(log_config: LogConfig) -> Result<()> {
         .build()
         .map_err(Error::from_std_error)?;
 
-    logforth::starter_log::builder()
+    if let Err(error) = logforth::starter_log::builder()
         .dispatch(|d| d.filter(level).append(file))
-        .apply();
+        .try_apply()
+    {
+        let error_text = error.to_string();
+        if !error_text.contains("already setup") {
+            return Err(Error::from_string(error_text));
+        }
+    }
 
     Ok(())
 }
