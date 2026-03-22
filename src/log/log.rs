@@ -11,6 +11,21 @@ use crate::error::Error;
 use crate::error::Result;
 
 pub fn init_log(log_config: LogConfig) -> Result<()> {
+    let tracing_level = match &log_config.level {
+        LogLevel::Error => "error",
+        LogLevel::Warn => "warn",
+        LogLevel::Info => "info",
+        LogLevel::Debug => "debug",
+        LogLevel::Trace => "trace",
+        LogLevel::Off => "off",
+    };
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::new(tracing_level))
+        .with_target(false)
+        .with_ansi(false)
+        .try_init()
+        .map_err(|error| Error::from_string(error.to_string()))?;
+
     let level: LevelFilter = match &log_config.level {
         LogLevel::Error => LevelFilter::Error,
         LogLevel::Warn => LevelFilter::Warn,
@@ -31,20 +46,6 @@ pub fn init_log(log_config: LogConfig) -> Result<()> {
     logforth::starter_log::builder()
         .dispatch(|d| d.filter(level).append(file))
         .apply();
-
-    let tracing_level = match &log_config.level {
-        LogLevel::Error => "error",
-        LogLevel::Warn => "warn",
-        LogLevel::Info => "info",
-        LogLevel::Debug => "debug",
-        LogLevel::Trace => "trace",
-        LogLevel::Off => "off",
-    };
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::new(tracing_level))
-        .with_target(false)
-        .with_ansi(false)
-        .try_init();
 
     Ok(())
 }
