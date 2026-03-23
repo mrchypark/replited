@@ -2691,6 +2691,7 @@ dependencies = [
  "backtrace",
  "chrono",
  "clap",
+ "jiff",
  "log",
  "logforth",
  "lz4",
@@ -2712,6 +2713,8 @@ dependencies = [
  "toml",
  "tonic",
  "tonic-build",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
  "zstd",
 ]

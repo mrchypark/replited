@@ -3,6 +3,7 @@ use std::num::NonZeroUsize;
 use logforth::append::file::FileBuilder;
 use logforth::layout::TextLayout;
 use logforth::record::LevelFilter;
+use tracing_subscriber::EnvFilter;
 
 use crate::config::LogConfig;
 use crate::config::LogLevel;
@@ -10,7 +11,22 @@ use crate::error::Error;
 use crate::error::Result;
 
 pub fn init_log(log_config: LogConfig) -> Result<()> {
-    let level: LevelFilter = match log_config.level {
+    let tracing_level = match &log_config.level {
+        LogLevel::Error => "error",
+        LogLevel::Warn => "warn",
+        LogLevel::Info => "info",
+        LogLevel::Debug => "debug",
+        LogLevel::Trace => "trace",
+        LogLevel::Off => "off",
+    };
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::new(tracing_level))
+        .with_target(false)
+        .with_ansi(false)
+        .try_init()
+        .map_err(|error| Error::from_string(error.to_string()))?;
+
+    let level: LevelFilter = match &log_config.level {
         LogLevel::Error => LevelFilter::Error,
         LogLevel::Warn => LevelFilter::Warn,
         LogLevel::Info => LevelFilter::Info,
@@ -27,9 +43,15 @@ pub fn init_log(log_config: LogConfig) -> Result<()> {
         .build()
         .map_err(Error::from_std_error)?;
 
-    logforth::starter_log::builder()
+    if let Err(error) = logforth::starter_log::builder()
         .dispatch(|d| d.filter(level).append(file))
-        .apply();
+        .try_apply()
+    {
+        let error_text = error.to_string();
+        if !error_text.contains("already setup") {
+            return Err(Error::from_string(error_text));
+        }
+    }
 
     Ok(())
 }

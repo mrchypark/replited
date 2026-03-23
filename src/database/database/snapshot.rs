@@ -13,7 +13,7 @@ pub async fn snapshot_for_stream(config: DbConfig) -> Result<SnapshotStreamData>
 
     let page_size_i64: i64 = connection.pragma_query_value(None, "page_size", |row| row.get(0))?;
     let page_size = u64::try_from(page_size_i64)
-        .map_err(|_| Error::SqliteError(format!("invalid PRAGMA page_size: {page_size_i64}")))?;
+        .map_err(|_| Error::InvalidArg(format!("invalid sqlite page_size: {page_size_i64}")))?;
     let wal_file = format!("{}-wal", config.db);
     let meta_dir = Database::init_directory(&config)?;
 
