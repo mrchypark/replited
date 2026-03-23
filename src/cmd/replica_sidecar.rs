@@ -10,6 +10,7 @@ use crate::database::WalGenerationPos;
 use crate::error::{Error, Result};
 use crate::sync::stream_client::StreamClient;
 use crate::sync::{ReplicaRecoveryAction, StreamReplicationErrorCode};
+use rusqlite::Error as RusqliteError;
 
 mod local_state;
 mod process_manager;
@@ -33,6 +34,12 @@ enum ReplicaStreamError {
     Transport(String),
     InvalidResponse(String),
     Io(String),
+}
+
+impl From<RusqliteError> for ReplicaStreamError {
+    fn from(error: RusqliteError) -> Self {
+        ReplicaStreamError::Io(error.to_string())
+    }
 }
 
 enum BootstrapOutcome {

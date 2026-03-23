@@ -16,6 +16,7 @@ use super::ShadowWalReader;
 use crate::base::Generation;
 use crate::base::compress_buffer;
 use crate::base::decompressed_data;
+use crate::base::parse_wal_segment_path;
 use crate::config::StorageConfig;
 use crate::database::DatabaseInfo;
 use crate::database::DbCommand;
@@ -27,7 +28,7 @@ use crate::sqlite::WALHeader;
 use crate::sqlite::align_frame;
 use crate::storage::SnapshotInfo;
 use crate::storage::StorageClient;
-use crate::storage::WalSegmentInfo;
+use crate::storage::{GenerationManifest, WalSegmentInfo};
 use crate::storage::{DEFAULT_CACHE_SIZE_LIMIT_BYTES, LocalObjectCache};
 
 #[derive(Clone, Debug)]
@@ -228,21 +229,24 @@ impl Replicate {
         let segment = match segment {
             Err(e) => {
                 if e.code() == Error::NO_WALSEGMENT_ERROR {
-                    self
+                    let manifest = self
                         .client
                         .read_generation_manifest(generation.as_str())
                         .await?
                         .ok_or_else(|| {
-                        Error::StorageError(format!(
-                            "manifest-only archival runtime cannot resume generation {} without a generation manifest",
-                            generation.as_str()
-                        ))
-                    })?;
-                    return Ok(Self::manifest_snapshot_resume_position(&WalGenerationPos {
-                        generation,
-                        index: snapshot.index,
-                        offset: snapshot.offset,
-                    }));
+                            Error::StorageError(format!(
+                                "manifest-only archival runtime cannot resume generation {} without a generation manifest",
+                                generation.as_str()
+                            ))
+                        })?;
+                    return Self::manifest_snapshot_resume_position(
+                        &WalGenerationPos {
+                            generation,
+                            index: snapshot.index,
+                            offset: snapshot.offset,
+                        },
+                        &manifest,
+                    );
                 } else {
                     return Err(e);
                 }
@@ -336,8 +340,43 @@ impl Replicate {
         self.wait_snapshot_started_at = None;
     }
 
-    fn manifest_snapshot_resume_position(pos: &WalGenerationPos) -> WalGenerationPos {
-        pos.clone()
+    fn manifest_snapshot_resume_position(
+        snapshot: &WalGenerationPos,
+        manifest: &GenerationManifest,
+    ) -> Result<WalGenerationPos> {
+        let mut wal_packs = manifest
+            .wal_packs
+            .iter()
+            .map(|pack| {
+                let (index, offset) = parse_wal_segment_path(&pack.object_key)?;
+                if pack.start_lsn != offset {
+                    return Err(Error::StorageError(format!(
+                        "wal pack start_lsn {} does not match object key offset {}",
+                        pack.start_lsn, offset
+                    )));
+                }
+                if pack.end_lsn < pack.start_lsn {
+                    return Err(Error::StorageError(format!(
+                        "wal pack end_lsn {} precedes start_lsn {}",
+                        pack.end_lsn, pack.start_lsn
+                    )));
+                }
+                Ok((index, pack.end_lsn))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if wal_packs.is_empty() {
+            return Ok(snapshot.clone());
+        }
+
+        wal_packs.sort_unstable();
+        let (index, end_lsn) = wal_packs
+            .last()
+            .expect("wal pack list should be non-empty");
+        Ok(WalGenerationPos {
+            generation: snapshot.generation.clone(),
+            index: *index,
+            offset: *end_lsn,
+        })
     }
 
     fn buffer_pending_db_changed(&mut self, pos: WalGenerationPos) {
@@ -392,7 +431,7 @@ impl Replicate {
         self.client
             .publish_manifest_snapshot(&pos, compressed_data)
             .await?;
-        *self.position.write() = Self::manifest_snapshot_resume_position(&pos);
+        *self.position.write() = pos.clone();
 
         // change state from WaitSnapshot to WaitDbChanged
         self.leave_wait_snapshot();
@@ -600,6 +639,7 @@ mod tests {
 
     use super::ReplicateCommand;
     use super::snapshot_position_is_newer;
+    use crate::database::WalGenerationPos;
 
     #[test]
     fn snapshot_position_prefers_later_offset_when_index_matches() {
@@ -607,21 +647,140 @@ mod tests {
         assert!(!snapshot_position_is_newer(3, 500, Some((3, 900))));
     }
 
-    #[test]
-    fn manifest_snapshot_resume_position_keeps_exact_snapshot_position() {
+    #[tokio::test]
+    async fn calculate_generation_position_manifest_without_packs_uses_snapshot_position() {
         use crate::base::Generation;
         use crate::database::WalGenerationPos;
+        use crate::config::{StorageConfig, StorageFsConfig, StorageParams};
+        use crate::database::DatabaseInfo;
+        use tokio::sync::mpsc;
 
-        let pos = WalGenerationPos {
-            generation: Generation::new(),
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage");
+        let storage_cfg = StorageConfig {
+            name: "fs".to_string(),
+            params: StorageParams::Fs(Box::new(StorageFsConfig {
+                root: storage_root.to_string_lossy().to_string(),
+            })),
+        };
+
+        let (db_notifier, _db_rx) = mpsc::channel(1);
+        let generation = Generation::new();
+        let info = DatabaseInfo {
+            meta_dir: temp.path().to_string_lossy().to_string(),
+            page_size: 4096,
+        };
+        let replicate = super::Replicate::new_for_test(
+            storage_cfg,
+            "data.db".to_string(),
+            0,
+            db_notifier,
+            info,
+        )
+        .await
+        .expect("create replicate");
+
+        use crate::base::compress_buffer;
+        let snapshot_pos = WalGenerationPos {
+            generation: generation.clone(),
             index: 1,
             offset: 4152,
         };
+        replicate
+            .client
+            .publish_manifest_snapshot(
+                &snapshot_pos,
+                compress_buffer(b"snapshot").expect("compress snapshot"),
+            )
+            .await
+            .expect("publish snapshot");
 
-        let resumed = super::Replicate::manifest_snapshot_resume_position(&pos);
-        assert_eq!(resumed.generation, pos.generation);
-        assert_eq!(resumed.index, pos.index);
-        assert_eq!(resumed.offset, pos.offset);
+        let position = replicate
+            .calculate_generation_position(generation.as_str())
+            .await
+            .expect("calculate generation position");
+
+        assert_eq!(position.generation, snapshot_pos.generation);
+        assert_eq!(position.index, snapshot_pos.index);
+        assert_eq!(position.offset, snapshot_pos.offset);
+    }
+
+    #[tokio::test]
+    async fn calculate_generation_position_manifest_with_packs_uses_latest_pack() {
+        use crate::base::Generation;
+        use crate::base::compress_buffer;
+        use crate::config::{StorageConfig, StorageFsConfig, StorageParams};
+        use crate::database::DatabaseInfo;
+        use tokio::sync::mpsc;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let storage_root = temp.path().join("storage");
+        let storage_cfg = StorageConfig {
+            name: "fs".to_string(),
+            params: StorageParams::Fs(Box::new(StorageFsConfig {
+                root: storage_root.to_string_lossy().to_string(),
+            })),
+        };
+
+        let (db_notifier, _db_rx) = mpsc::channel(1);
+        let generation = Generation::new();
+        let info = DatabaseInfo {
+            meta_dir: temp.path().to_string_lossy().to_string(),
+            page_size: 4096,
+        };
+        let replicate = super::Replicate::new_for_test(
+            storage_cfg,
+            "data.db".to_string(),
+            0,
+            db_notifier,
+            info,
+        )
+        .await
+        .expect("create replicate");
+
+        let snapshot_pos = WalGenerationPos {
+            generation: generation.clone(),
+            index: 1,
+            offset: 4096,
+        };
+        replicate
+            .client
+            .publish_manifest_snapshot(
+                &snapshot_pos,
+                compress_buffer(b"snapshot").expect("compress snapshot"),
+            )
+            .await
+            .expect("publish snapshot");
+
+        let pack_data = vec![7_u8; 2048];
+        let pack_start = WalGenerationPos {
+            generation: generation.clone(),
+            index: 1,
+            offset: snapshot_pos.offset,
+        };
+        let pack_end = WalGenerationPos {
+            generation,
+            index: 1,
+            offset: snapshot_pos.offset + pack_data.len() as u64,
+        };
+        replicate
+            .publish_manifest_wal_pack(
+                &pack_start,
+                &pack_end,
+                compress_buffer(&pack_data).expect("compress pack"),
+                pack_data.len(),
+            )
+            .await
+            .expect("publish pack");
+
+        let position = replicate
+            .calculate_generation_position(snapshot_pos.generation.as_str())
+            .await
+            .expect("calculate generation position");
+
+        assert_eq!(position.generation, snapshot_pos.generation);
+        assert_eq!(position.index, pack_end.index);
+        assert_eq!(position.offset, pack_end.offset);
     }
 
     #[test]
