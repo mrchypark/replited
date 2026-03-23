@@ -54,21 +54,21 @@ echo ""
 echo "=========================================="
 echo "=== 5. Sidecar Restore Scenario ==="
 echo "=========================================="
-python3 sidecar_restore_test.py
+python3 sidecar_restore_retry_recover_test.py --scenario restore
 SIDECAR_RESTORE_RESULT=$?
 
 echo ""
 echo "=========================================="
 echo "=== 6. Sidecar Retry Scenario ==="
 echo "=========================================="
-python3 sidecar_retry_test.py
+python3 sidecar_restore_retry_recover_test.py --scenario retry
 SIDECAR_RETRY_RESULT=$?
 
 echo ""
 echo "=========================================="
 echo "=== 7. Sidecar Recover Scenario ==="
 echo "=========================================="
-python3 sidecar_recover_test.py
+python3 sidecar_restore_retry_recover_test.py --scenario recover
 SIDECAR_RECOVER_RESULT=$?
 
 echo ""
