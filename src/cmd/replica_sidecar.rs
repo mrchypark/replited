@@ -291,7 +291,9 @@ async fn handle_bootstrapping_state(
     )
     .await?;
 
-    if let Some(pm) = ctx.process_manager {
+    if let Some(pm) = ctx.process_manager
+        && should_release_reader_after_bootstrap(&outcome)
+    {
         pm.remove_blocker().await;
     }
 
@@ -346,6 +348,9 @@ async fn handle_catching_up_state(
             *resume_pos = Some(applied_lsn);
             *state = ReplicaState::Streaming;
             *invalid_lsn_retries = 0;
+            if let Some(pm) = ctx.process_manager {
+                pm.remove_blocker().await;
+            }
         }
         Err(err) => {
             handle_wal_cycle_error(
@@ -536,6 +541,38 @@ async fn run_bootstrap_cycle(
                 Ok(BootstrapOutcome::Continue)
             }
         },
+    }
+}
+
+fn should_release_reader_after_bootstrap(outcome: &BootstrapOutcome) -> bool {
+    !matches!(outcome, BootstrapOutcome::Bootstrapped(_))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BootstrapOutcome, should_release_reader_after_bootstrap};
+    use crate::base::Generation;
+    use crate::database::WalGenerationPos;
+
+    #[test]
+    fn bootstrapped_outcome_keeps_reader_blocked_for_catchup() {
+        let outcome = BootstrapOutcome::Bootstrapped(WalGenerationPos {
+            generation: Generation::new(),
+            index: 1,
+            offset: 123,
+        });
+
+        assert!(!should_release_reader_after_bootstrap(&outcome));
+    }
+
+    #[test]
+    fn non_bootstrapped_outcomes_release_reader() {
+        assert!(should_release_reader_after_bootstrap(
+            &BootstrapOutcome::Continue
+        ));
+        assert!(should_release_reader_after_bootstrap(
+            &BootstrapOutcome::NeedsRestore
+        ));
     }
 }
 

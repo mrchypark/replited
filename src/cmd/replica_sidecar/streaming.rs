@@ -235,19 +235,23 @@ pub(super) async fn stream_wal_and_apply(
                 let chunk_next = lsn_token_to_pos(Some(chunk_next_token.clone()))
                     .map_err(|e| ReplicaStreamError::InvalidResponse(e.to_string()))?;
 
-                if let Some(floor) = &ack_floor {
-                    if chunk_start.generation == floor.generation && chunk_start.index > floor.index
-                    {
-                        if can_accept_stream_advance_past_floor(db_path, floor, &chunk_start) {
-                            // The rewind floor is exactly at EOF and stream moved to the next
-                            // index. Treat floor as reached and continue.
-                            current_pos = floor.clone();
-                            suppress_ack = false;
-                        } else {
-                            return Err(ReplicaStreamError::Stream(
-                                StreamReplicationErrorCode::SnapshotBoundaryMismatch,
-                                "stream advanced past rewind floor".to_string(),
-                            ));
+                if should_enforce_replay_floor_transition(suppress_ack) {
+                    if let Some(floor) = &ack_floor {
+                        if chunk_start.generation == floor.generation
+                            && chunk_start.index > floor.index
+                        {
+                            if can_accept_stream_advance_past_floor(db_path, floor, &chunk_start)
+                            {
+                                // The rewind floor is exactly at EOF and stream moved to the next
+                                // index. Treat floor as reached and continue.
+                                current_pos = floor.clone();
+                                suppress_ack = false;
+                            } else {
+                                return Err(ReplicaStreamError::Stream(
+                                    StreamReplicationErrorCode::SnapshotBoundaryMismatch,
+                                    "stream advanced past rewind floor".to_string(),
+                                ));
+                            }
                         }
                     }
                 }
@@ -278,7 +282,8 @@ pub(super) async fn stream_wal_and_apply(
                 .await?;
                 store_shadow_wal_bytes(db_path, &chunk_start, &chunk.wal_bytes)
                     .map_err(|e| ReplicaStreamError::Io(e.to_string()))?;
-                persist_last_applied_lsn(db_path, &chunk_next)
+                let persisted_pos = persisted_lsn_after_chunk(ack_floor.as_ref(), &chunk_next);
+                persist_last_applied_lsn(db_path, &persisted_pos)
                     .map_err(|e| ReplicaStreamError::Io(e.to_string()))?;
 
                 let mut bytes_delta = chunk_next.offset.saturating_sub(chunk_start.offset);
@@ -294,7 +299,9 @@ pub(super) async fn stream_wal_and_apply(
 
                 let should_refresh = frames_since_refresh >= checkpoint_frame_interval
                     || last_refresh.elapsed() >= Duration::from_millis(checkpoint_interval_ms);
-                if should_refresh {
+                if should_refresh
+                    && should_refresh_during_replay(ack_floor.as_ref(), &chunk_next)
+                {
                     let expected_frames = expected_frames_from_wal_file(db_path, page_size)?;
                     refresh_wal_index(
                         db_path,
@@ -334,7 +341,7 @@ pub(super) async fn stream_wal_and_apply(
         }
     }
 
-    if frames_since_refresh > 0 {
+    if frames_since_refresh > 0 && should_refresh_during_replay(ack_floor.as_ref(), &current_pos) {
         let expected_frames = expected_frames_from_wal_file(db_path, page_size)?;
         refresh_wal_index(
             db_path,
@@ -807,6 +814,35 @@ fn lsn_reached(current: &WalGenerationPos, floor: &WalGenerationPos) -> bool {
     current.index == floor.index && current.offset >= floor.offset
 }
 
+fn persisted_lsn_after_chunk(
+    replay_floor: Option<&WalGenerationPos>,
+    chunk_next: &WalGenerationPos,
+) -> WalGenerationPos {
+    match replay_floor {
+        Some(floor) if floor.generation == chunk_next.generation => {
+            if floor.index > chunk_next.index
+                || (floor.index == chunk_next.index && floor.offset > chunk_next.offset)
+            {
+                return floor.clone();
+            }
+            chunk_next.clone()
+        }
+        _ => chunk_next.clone(),
+    }
+}
+
+fn should_refresh_during_replay(
+    replay_floor: Option<&WalGenerationPos>,
+    chunk_next: &WalGenerationPos,
+) -> bool {
+    let _ = chunk_next;
+    replay_floor.is_none()
+}
+
+fn should_enforce_replay_floor_transition(suppress_ack: bool) -> bool {
+    suppress_ack
+}
+
 fn can_accept_stream_advance_past_floor(
     db_path: &str,
     floor: &WalGenerationPos,
@@ -916,7 +952,9 @@ fn allow_shadow_wal_boundary_advance(
 mod tests {
     use super::{
         ReplicaStreamError, WalRefreshState, apply_wal_bytes, can_accept_stream_advance_past_floor,
-        refresh_wal_index, validate_snapshot_meta,
+        persisted_lsn_after_chunk, refresh_wal_index,
+        should_enforce_replay_floor_transition, should_refresh_during_replay,
+        validate_snapshot_meta,
     };
     use crate::base::Generation;
     use crate::cmd::replica_sidecar::process_manager::ProcessManager;
@@ -1041,6 +1079,66 @@ mod tests {
             &floor,
             &next
         ));
+    }
+
+    #[test]
+    fn persisted_lsn_does_not_regress_below_replay_floor() {
+        let generation = Generation::new();
+        let floor = WalGenerationPos {
+            generation: generation.clone(),
+            index: 5,
+            offset: 341_992,
+        };
+        let replay_chunk = WalGenerationPos {
+            generation,
+            index: 5,
+            offset: 259_592,
+        };
+
+        assert_eq!(
+            persisted_lsn_after_chunk(Some(&floor), &replay_chunk),
+            floor
+        );
+    }
+
+    #[test]
+    fn replay_below_floor_skips_checkpoint_refresh() {
+        let generation = Generation::new();
+        let floor = WalGenerationPos {
+            generation: generation.clone(),
+            index: 1,
+            offset: 325_512,
+        };
+        let replay_chunk = WalGenerationPos {
+            generation,
+            index: 1,
+            offset: 259_592,
+        };
+
+        assert!(!should_refresh_during_replay(Some(&floor), &replay_chunk));
+    }
+
+    #[test]
+    fn rewind_replay_disables_refresh_for_entire_cycle() {
+        let generation = Generation::new();
+        let floor = WalGenerationPos {
+            generation: generation.clone(),
+            index: 1,
+            offset: 325_512,
+        };
+        let next_index_chunk = WalGenerationPos {
+            generation,
+            index: 2,
+            offset: 259_592,
+        };
+
+        assert!(!should_refresh_during_replay(Some(&floor), &next_index_chunk));
+    }
+
+    #[test]
+    fn floor_transition_check_turns_off_after_floor_is_reached() {
+        assert!(!should_enforce_replay_floor_transition(false));
+        assert!(should_enforce_replay_floor_transition(true));
     }
 
     #[tokio::test]
