@@ -98,9 +98,6 @@ impl ReplicaSidecar {
         let mut handles = vec![];
 
         let process_manager = self.exec.clone().map(ProcessManager::new);
-        if let Some(pm) = &process_manager {
-            pm.start().await;
-        }
 
         for db_config in &self.config.database {
             let db_config = db_config.clone();
@@ -153,7 +150,7 @@ impl ReplicaSidecar {
         let mut consecutive_restore_count = 0;
         let mut last_restore_time = std::time::Instant::now();
         let mut invalid_lsn_retries = 0u8;
-        let mut reader_blocked = false;
+        let mut reader_blocked = initialize_reader_blocker(process_manager.as_ref()).await;
 
         let (bootstrap_ctx, wal_ctx) = build_loop_contexts(
             &stream_config.addr,
@@ -340,7 +337,6 @@ async fn handle_catching_up_state(
     .await
     {
         Ok(applied_lsn) => {
-            persist_last_applied_lsn(ctx.db_path, &applied_lsn)?;
             *last_applied_lsn = Some(applied_lsn.clone());
             *resume_pos = Some(applied_lsn);
             *state = ReplicaState::Streaming;
@@ -392,7 +388,6 @@ async fn handle_streaming_state(
     {
         Ok(applied_lsn) => {
             let no_progress = applied_lsn == start_pos;
-            persist_last_applied_lsn(ctx.db_path, &applied_lsn)?;
             *last_applied_lsn = Some(applied_lsn.clone());
             *resume_pos = Some(applied_lsn);
             *invalid_lsn_retries = 0;
@@ -546,10 +541,17 @@ async fn ensure_reader_blocked(
     if *reader_blocked {
         return;
     }
-    if let Some(pm) = process_manager {
-        pm.add_blocker().await;
-    }
+    let Some(pm) = process_manager else {
+        return;
+    };
+    pm.add_blocker().await;
     *reader_blocked = true;
+}
+
+async fn initialize_reader_blocker(process_manager: Option<&ProcessManager>) -> bool {
+    let mut reader_blocked = false;
+    ensure_reader_blocked(process_manager, &mut reader_blocked).await;
+    reader_blocked
 }
 
 async fn release_reader_blocker(
@@ -567,7 +569,7 @@ async fn release_reader_blocker(
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_reader_blocked, release_reader_blocker};
+    use super::{ensure_reader_blocked, initialize_reader_blocker, release_reader_blocker};
     use crate::cmd::replica_sidecar::process_manager::ProcessManager;
 
     #[tokio::test]
@@ -580,6 +582,23 @@ mod tests {
 
         assert!(reader_blocked);
         assert_eq!(pm.blocker_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn initialize_reader_blocker_claims_initial_blocker_when_managed() {
+        let pm = ProcessManager::new(String::new());
+
+        let reader_blocked = initialize_reader_blocker(Some(&pm)).await;
+
+        assert!(reader_blocked);
+        assert_eq!(pm.blocker_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn initialize_reader_blocker_is_noop_without_manager() {
+        let reader_blocked = initialize_reader_blocker(None).await;
+
+        assert!(!reader_blocked);
     }
 
     #[tokio::test]

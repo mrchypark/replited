@@ -235,7 +235,7 @@ pub(super) async fn stream_wal_and_apply(
                 let chunk_next = lsn_token_to_pos(Some(chunk_next_token.clone()))
                     .map_err(|e| ReplicaStreamError::InvalidResponse(e.to_string()))?;
 
-                if should_enforce_replay_floor_transition(suppress_ack) {
+                if suppress_ack {
                     if let Some(floor) = &ack_floor {
                         if chunk_start.generation == floor.generation
                             && chunk_start.index > floor.index
@@ -299,9 +299,7 @@ pub(super) async fn stream_wal_and_apply(
 
                 let should_refresh = frames_since_refresh >= checkpoint_frame_interval
                     || last_refresh.elapsed() >= Duration::from_millis(checkpoint_interval_ms);
-                if should_refresh
-                    && should_refresh_during_replay(ack_floor.as_ref(), &chunk_next)
-                {
+                if should_refresh && should_refresh_during_replay(ack_floor.as_ref()) {
                     let expected_frames = expected_frames_from_wal_file(db_path, page_size)?;
                     refresh_wal_index(
                         db_path,
@@ -341,7 +339,7 @@ pub(super) async fn stream_wal_and_apply(
         }
     }
 
-    if frames_since_refresh > 0 && should_refresh_during_replay(ack_floor.as_ref(), &current_pos) {
+    if frames_since_refresh > 0 && should_refresh_during_replay(ack_floor.as_ref()) {
         let expected_frames = expected_frames_from_wal_file(db_path, page_size)?;
         refresh_wal_index(
             db_path,
@@ -831,16 +829,8 @@ fn persisted_lsn_after_chunk(
     }
 }
 
-fn should_refresh_during_replay(
-    replay_floor: Option<&WalGenerationPos>,
-    chunk_next: &WalGenerationPos,
-) -> bool {
-    let _ = chunk_next;
+fn should_refresh_during_replay(replay_floor: Option<&WalGenerationPos>) -> bool {
     replay_floor.is_none()
-}
-
-fn should_enforce_replay_floor_transition(suppress_ack: bool) -> bool {
-    suppress_ack
 }
 
 fn can_accept_stream_advance_past_floor(
@@ -952,8 +942,7 @@ fn allow_shadow_wal_boundary_advance(
 mod tests {
     use super::{
         ReplicaStreamError, WalRefreshState, apply_wal_bytes, can_accept_stream_advance_past_floor,
-        persisted_lsn_after_chunk, refresh_wal_index,
-        should_enforce_replay_floor_transition, should_refresh_during_replay,
+        persisted_lsn_after_chunk, refresh_wal_index, should_refresh_during_replay,
         validate_snapshot_meta,
     };
     use crate::base::Generation;
@@ -1115,7 +1104,8 @@ mod tests {
             offset: 259_592,
         };
 
-        assert!(!should_refresh_during_replay(Some(&floor), &replay_chunk));
+        let _ = replay_chunk;
+        assert!(!should_refresh_during_replay(Some(&floor)));
     }
 
     #[test]
@@ -1132,13 +1122,8 @@ mod tests {
             offset: 259_592,
         };
 
-        assert!(!should_refresh_during_replay(Some(&floor), &next_index_chunk));
-    }
-
-    #[test]
-    fn floor_transition_check_turns_off_after_floor_is_reached() {
-        assert!(!should_enforce_replay_floor_transition(false));
-        assert!(should_enforce_replay_floor_transition(true));
+        let _ = next_index_chunk;
+        assert!(!should_refresh_during_replay(Some(&floor)));
     }
 
     #[tokio::test]
