@@ -71,12 +71,31 @@ impl ProcessManager {
     }
 
     pub(super) async fn remove_blocker(&self) {
-        let prev = self
-            .blockers
-            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        if prev == 1 {
-            // Last blocker removed, start the process.
-            self.start().await;
+        let mut current = self.blockers.load(std::sync::atomic::Ordering::SeqCst);
+        loop {
+            if current == 0 {
+                return;
+            }
+            match self.blockers.compare_exchange(
+                current,
+                current - 1,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    if current == 1 {
+                        // Last blocker removed, start the process.
+                        self.start().await;
+                    }
+                    return;
+                }
+                Err(actual) => current = actual,
+            }
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn blocker_count(&self) -> usize {
+        self.blockers.load(std::sync::atomic::Ordering::SeqCst)
     }
 }

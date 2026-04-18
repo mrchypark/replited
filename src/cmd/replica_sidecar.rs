@@ -153,6 +153,7 @@ impl ReplicaSidecar {
         let mut consecutive_restore_count = 0;
         let mut last_restore_time = std::time::Instant::now();
         let mut invalid_lsn_retries = 0u8;
+        let mut reader_blocked = false;
 
         let (bootstrap_ctx, wal_ctx) = build_loop_contexts(
             &stream_config.addr,
@@ -177,6 +178,7 @@ impl ReplicaSidecar {
                         &mut state,
                         &mut last_applied_lsn,
                         &mut resume_pos,
+                        &mut reader_blocked,
                     )
                     .await?;
                 }
@@ -187,6 +189,7 @@ impl ReplicaSidecar {
                         &mut last_applied_lsn,
                         &mut resume_pos,
                         &mut invalid_lsn_retries,
+                        &mut reader_blocked,
                     )
                     .await?;
                 }
@@ -274,10 +277,9 @@ async fn handle_bootstrapping_state(
     state: &mut ReplicaState,
     last_applied_lsn: &mut Option<WalGenerationPos>,
     resume_pos: &mut Option<WalGenerationPos>,
+    reader_blocked: &mut bool,
 ) -> Result<()> {
-    if let Some(pm) = ctx.process_manager {
-        pm.add_blocker().await;
-    }
+    ensure_reader_blocked(ctx.process_manager.as_ref(), reader_blocked).await;
 
     let outcome = run_bootstrap_cycle(
         ctx.stream_addr,
@@ -290,12 +292,6 @@ async fn handle_bootstrapping_state(
         invalid_lsn_retries,
     )
     .await?;
-
-    if let Some(pm) = ctx.process_manager
-        && should_release_reader_after_bootstrap(&outcome)
-    {
-        pm.remove_blocker().await;
-    }
 
     match outcome {
         BootstrapOutcome::Continue => {}
@@ -320,6 +316,7 @@ async fn handle_catching_up_state(
     last_applied_lsn: &mut Option<WalGenerationPos>,
     resume_pos: &mut Option<WalGenerationPos>,
     invalid_lsn_retries: &mut u8,
+    reader_blocked: &mut bool,
 ) -> Result<()> {
     let start_pos = match resume_pos.clone().or(last_applied_lsn.clone()) {
         Some(pos) => pos,
@@ -348,9 +345,7 @@ async fn handle_catching_up_state(
             *resume_pos = Some(applied_lsn);
             *state = ReplicaState::Streaming;
             *invalid_lsn_retries = 0;
-            if let Some(pm) = ctx.process_manager {
-                pm.remove_blocker().await;
-            }
+            release_reader_blocker(ctx.process_manager.as_ref(), reader_blocked).await;
         }
         Err(err) => {
             handle_wal_cycle_error(
@@ -544,35 +539,79 @@ async fn run_bootstrap_cycle(
     }
 }
 
-fn should_release_reader_after_bootstrap(outcome: &BootstrapOutcome) -> bool {
-    !matches!(outcome, BootstrapOutcome::Bootstrapped(_))
+async fn ensure_reader_blocked(
+    process_manager: Option<&ProcessManager>,
+    reader_blocked: &mut bool,
+) {
+    if *reader_blocked {
+        return;
+    }
+    if let Some(pm) = process_manager {
+        pm.add_blocker().await;
+    }
+    *reader_blocked = true;
+}
+
+async fn release_reader_blocker(
+    process_manager: Option<&ProcessManager>,
+    reader_blocked: &mut bool,
+) {
+    if !*reader_blocked {
+        return;
+    }
+    if let Some(pm) = process_manager {
+        pm.remove_blocker().await;
+    }
+    *reader_blocked = false;
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{BootstrapOutcome, should_release_reader_after_bootstrap};
-    use crate::base::Generation;
-    use crate::database::WalGenerationPos;
+    use super::{ensure_reader_blocked, release_reader_blocker};
+    use crate::cmd::replica_sidecar::process_manager::ProcessManager;
 
-    #[test]
-    fn bootstrapped_outcome_keeps_reader_blocked_for_catchup() {
-        let outcome = BootstrapOutcome::Bootstrapped(WalGenerationPos {
-            generation: Generation::new(),
-            index: 1,
-            offset: 123,
-        });
+    #[tokio::test]
+    async fn ensure_reader_blocked_adds_only_one_blocker_across_retries() {
+        let pm = ProcessManager::new(String::new());
+        let mut reader_blocked = false;
 
-        assert!(!should_release_reader_after_bootstrap(&outcome));
+        ensure_reader_blocked(Some(&pm), &mut reader_blocked).await;
+        ensure_reader_blocked(Some(&pm), &mut reader_blocked).await;
+
+        assert!(reader_blocked);
+        assert_eq!(pm.blocker_count(), 1);
     }
 
-    #[test]
-    fn non_bootstrapped_outcomes_release_reader() {
-        assert!(should_release_reader_after_bootstrap(
-            &BootstrapOutcome::Continue
-        ));
-        assert!(should_release_reader_after_bootstrap(
-            &BootstrapOutcome::NeedsRestore
-        ));
+    #[tokio::test]
+    async fn release_reader_blocker_is_noop_without_owned_blocker() {
+        let pm = ProcessManager::new(String::new());
+        let mut reader_blocked = false;
+
+        release_reader_blocker(Some(&pm), &mut reader_blocked).await;
+
+        assert!(!reader_blocked);
+        assert_eq!(pm.blocker_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn release_reader_blocker_balances_bootstrap_owned_blocker() {
+        let pm = ProcessManager::new(String::new());
+        let mut reader_blocked = false;
+
+        ensure_reader_blocked(Some(&pm), &mut reader_blocked).await;
+        release_reader_blocker(Some(&pm), &mut reader_blocked).await;
+
+        assert!(!reader_blocked);
+        assert_eq!(pm.blocker_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn process_manager_remove_blocker_is_noop_at_zero() {
+        let pm = ProcessManager::new(String::new());
+
+        pm.remove_blocker().await;
+
+        assert_eq!(pm.blocker_count(), 0);
     }
 }
 
