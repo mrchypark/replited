@@ -240,8 +240,7 @@ pub(super) async fn stream_wal_and_apply(
                         if chunk_start.generation == floor.generation
                             && chunk_start.index > floor.index
                         {
-                            if can_accept_stream_advance_past_floor(db_path, floor, &chunk_start)
-                            {
+                            if can_accept_stream_advance_past_floor(db_path, floor, &chunk_start) {
                                 // The rewind floor is exactly at EOF and stream moved to the next
                                 // index. Treat floor as reached and continue.
                                 current_pos = floor.clone();
@@ -966,14 +965,14 @@ mod tests {
     }
 
     #[test]
-    fn validate_snapshot_meta_rejects_size_mismatch() {
+    fn rejects_snapshot_metadata_when_declared_size_differs_from_received_bytes() {
         let meta = base_meta();
         let err = validate_snapshot_meta(&meta, 4, &[1, 2, 3, 4]).unwrap_err();
         assert!(matches!(err, super::ReplicaStreamError::InvalidResponse(_)));
     }
 
     #[test]
-    fn validate_snapshot_meta_rejects_hash_mismatch() {
+    fn rejects_snapshot_metadata_when_declared_hash_differs_from_received_bytes() {
         let meta = base_meta();
         let err = validate_snapshot_meta(&meta, 3, &[9, 9, 9, 9]).unwrap_err();
         assert!(matches!(err, super::ReplicaStreamError::InvalidResponse(_)));
@@ -997,7 +996,7 @@ mod tests {
     }
 
     #[test]
-    fn accepts_floor_eof_transition_to_next_index() {
+    fn allows_next_wal_index_once_replay_reaches_floor_eof() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let db_path = temp_dir.path().join("replica.db");
         fs::write(&db_path, []).expect("create db");
@@ -1034,7 +1033,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_floor_transition_when_floor_not_eof() {
+    fn rejects_next_wal_index_before_replay_reaches_floor_eof() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let db_path = temp_dir.path().join("replica.db");
         fs::write(&db_path, []).expect("create db");
@@ -1071,7 +1070,7 @@ mod tests {
     }
 
     #[test]
-    fn persisted_lsn_does_not_regress_below_replay_floor() {
+    fn persists_replay_floor_when_replayed_chunk_falls_behind_it() {
         let generation = Generation::new();
         let floor = WalGenerationPos {
             generation: generation.clone(),
@@ -1091,7 +1090,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_below_floor_skips_checkpoint_refresh() {
+    fn skips_checkpoint_refresh_while_replay_is_below_floor() {
         let generation = Generation::new();
         let floor = WalGenerationPos {
             generation: generation.clone(),
@@ -1109,7 +1108,7 @@ mod tests {
     }
 
     #[test]
-    fn rewind_replay_disables_refresh_for_entire_cycle() {
+    fn skips_checkpoint_refresh_for_full_replay_cycle_after_rewind() {
         let generation = Generation::new();
         let floor = WalGenerationPos {
             generation: generation.clone(),
@@ -1158,7 +1157,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_wal_index_retries_before_restore_without_process_manager() {
+    async fn tolerates_initial_stale_refreshes_without_managed_recovery() {
         let (_temp_dir, db_path) = create_test_wal_db();
         let mut state = WalRefreshState::new();
 
@@ -1177,7 +1176,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_wal_index_escalates_to_restore_after_threshold_without_process_manager() {
+    async fn requests_restore_after_repeated_stale_refreshes_without_managed_recovery() {
         let (_temp_dir, db_path) = create_test_wal_db();
         let mut state = WalRefreshState::new();
 
@@ -1203,7 +1202,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_wal_index_uses_recovery_path_with_process_manager() {
+    async fn requests_managed_recovery_when_refresh_stays_stale() {
         let (_temp_dir, db_path) = create_test_wal_db();
         let mut state = WalRefreshState::new();
         let process_manager = ProcessManager::new(String::new());

@@ -159,7 +159,7 @@ mod tests {
     use crate::error::Result;
 
     #[test]
-    fn test_path_base() -> Result<()> {
+    fn returns_last_path_component_for_normalized_paths() -> Result<()> {
         let path = "a/b/c";
         let base = path_base(path)?;
         assert_eq!(&base, "c");
@@ -178,7 +178,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_wal_path() -> Result<()> {
+    fn parses_wal_index_only_from_canonical_wal_file_names() -> Result<()> {
         let path = "a/b/c/0000000019.wal";
         let index = parse_wal_path(path)?;
         assert_eq!(index, 19);
@@ -194,7 +194,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_snapshot_path() -> Result<()> {
+    fn parses_snapshot_position_only_from_canonical_snapshot_file_names() -> Result<()> {
         let path = "a/b/c/0000000019_0000000100.snapshot.zst";
         let (index, offset) = parse_snapshot_path(path)?;
         assert_eq!(index, 19);
@@ -212,7 +212,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_walsegment_path() -> Result<()> {
+    fn parses_wal_segment_position_from_canonical_segment_file_names() -> Result<()> {
         let path = "a/b/c/0000000019_0000000020.wal.zst";
         let (index, offset) = parse_wal_segment_path(path)?;
         assert_eq!(index, 19);
@@ -227,7 +227,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parent_dir() -> Result<()> {
+    fn returns_parent_directory_when_path_has_one() -> Result<()> {
         let path = "/b/c/0000000019_0000000020.wal.zst";
         let dir = parent_dir(path);
         assert_eq!(dir, Some("/b/c".to_string()));

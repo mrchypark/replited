@@ -1118,7 +1118,7 @@ mod tests {
 
     use super::{Database, DbCommand};
 
-    fn test_db_config(db_path: &str, backup_root: &str) -> DbConfig {
+    fn replica_notification_fixture(db_path: &str, backup_root: &str) -> DbConfig {
         let toml_str = format!(
             r#"
 db = "{db_path}"
@@ -1155,7 +1155,7 @@ root = "{backup_root}"
         let db_path = dir.path().join("primary.db");
         let backup_root = dir.path().join("backup");
 
-        let config = test_db_config(
+        let config = replica_notification_fixture(
             db_path.to_string_lossy().as_ref(),
             backup_root.to_string_lossy().as_ref(),
         );
@@ -1178,7 +1178,7 @@ root = "{backup_root}"
         let db_path = dir.path().join("primary.db");
         let backup_root = dir.path().join("backup");
 
-        let config = test_db_config(
+        let config = replica_notification_fixture(
             db_path.to_string_lossy().as_ref(),
             backup_root.to_string_lossy().as_ref(),
         );

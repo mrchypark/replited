@@ -128,13 +128,13 @@ mod tests {
     // ========== align_frame tests ==========
 
     #[test]
-    fn test_align_frame_at_header_boundary() {
+    fn aligns_to_header_boundary_when_offset_starts_first_frame() {
         // Exactly at header size should return header size
         assert_eq!(WAL_HEADER_SIZE, align_frame(4096, WAL_HEADER_SIZE));
     }
 
     #[test]
-    fn test_align_frame_below_header() {
+    fn returns_zero_when_offset_is_before_wal_header() {
         // Below header size should return 0
         assert_eq!(0, align_frame(4096, 0));
         assert_eq!(0, align_frame(4096, 16));
@@ -142,7 +142,7 @@ mod tests {
     }
 
     #[test]
-    fn test_align_frame_first_frame() {
+    fn aligns_offsets_inside_first_frame_to_first_frame_start() {
         // First frame starts at header size (32)
         let page_size = 4096;
         let frame_size = WAL_FRAME_HEADER_SIZE + page_size;
@@ -159,7 +159,7 @@ mod tests {
     }
 
     #[test]
-    fn test_align_frame_second_frame() {
+    fn aligns_offsets_inside_second_frame_to_second_frame_start() {
         let page_size = 4096;
         let frame_size = WAL_FRAME_HEADER_SIZE + page_size;
         let second_frame_start = WAL_HEADER_SIZE + frame_size;
@@ -177,7 +177,7 @@ mod tests {
     }
 
     #[test]
-    fn test_align_frame_various_page_sizes() {
+    fn aligns_offsets_to_frame_boundaries_across_supported_page_sizes() {
         for page_size in [1024u64, 2048, 4096, 8192, 16384, 32768, 65536] {
             let frame_size = WAL_FRAME_HEADER_SIZE + page_size;
 
@@ -193,7 +193,7 @@ mod tests {
     // ========== checksum tests ==========
 
     #[test]
-    fn test_checksum_empty_initial_seeds() {
+    fn checksum_of_zero_bytes_with_empty_seeds_stays_zero() {
         // 8 bytes of zeros
         let data = [0u8; 8];
         let (s1, s2) = checksum(&data, 0, 0, false);
@@ -203,7 +203,7 @@ mod tests {
     }
 
     #[test]
-    fn test_checksum_with_nonzero_seeds() {
+    fn checksum_includes_nonzero_seed_values() {
         let data = [0u8; 8];
         let (s1, s2) = checksum(&data, 100, 200, false);
         // With seeds but zero data:
@@ -214,7 +214,7 @@ mod tests {
     }
 
     #[test]
-    fn test_checksum_little_endian() {
+    fn checksum_matches_little_endian_word_accumulation() {
         // Test data: [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]
         let data = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
         let (s1, s2) = checksum(&data, 0, 0, false);
@@ -233,7 +233,7 @@ mod tests {
     }
 
     #[test]
-    fn test_checksum_big_endian() {
+    fn checksum_matches_big_endian_word_accumulation() {
         let data = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
         let (s1, s2) = checksum(&data, 0, 0, true);
 
@@ -249,7 +249,7 @@ mod tests {
     }
 
     #[test]
-    fn test_checksum_multiple_iterations() {
+    fn checksum_processes_multiple_word_pairs_without_panicking() {
         // 24 bytes = 3 iterations of 8 bytes
         let data = [0xFFu8; 24];
         let (s1, s2) = checksum(&data, 0, 0, false);
@@ -260,7 +260,7 @@ mod tests {
     }
 
     #[test]
-    fn test_checksum_wrapping_overflow() {
+    fn checksum_wraps_on_overflow_without_panicking() {
         // Use max values to trigger overflow
         let data = [0xFF; 8];
         // Start with seeds near max
@@ -272,7 +272,7 @@ mod tests {
     }
 
     #[test]
-    fn test_checksum_consistency() {
+    fn checksum_is_deterministic_for_same_input() {
         let data = [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0];
 
         // Same input should produce same output
@@ -285,7 +285,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "data length must be a multiple of 8")]
-    fn test_checksum_invalid_length_panics() {
+    fn checksum_panics_when_input_length_is_not_multiple_of_eight() {
         let data = [0u8; 7]; // Not a multiple of 8
         checksum(&data, 0, 0, false);
     }
@@ -293,7 +293,7 @@ mod tests {
     // ========== CheckpointMode tests ==========
 
     #[test]
-    fn test_checkpoint_mode_as_str() {
+    fn checkpoint_mode_strings_match_sqlite_pragma_values() {
         assert_eq!("PASSIVE", CheckpointMode::Passive.as_str());
         assert_eq!("FULL", CheckpointMode::Full.as_str());
         assert_eq!("RESTART", CheckpointMode::Restart.as_str());
@@ -303,35 +303,35 @@ mod tests {
     // ========== from_be_bytes_at tests ==========
 
     #[test]
-    fn test_from_be_bytes_at_zero_offset() {
+    fn reads_big_endian_u32_from_zero_offset() {
         let data = [0x12, 0x34, 0x56, 0x78, 0x00, 0x00, 0x00, 0x00];
         let result = from_be_bytes_at(&data, 0).unwrap();
         assert_eq!(0x12345678, result);
     }
 
     #[test]
-    fn test_from_be_bytes_at_nonzero_offset() {
+    fn reads_big_endian_u32_from_nonzero_offset() {
         let data = [0x00, 0x00, 0x00, 0x00, 0xAB, 0xCD, 0xEF, 0x01];
         let result = from_be_bytes_at(&data, 4).unwrap();
         assert_eq!(0xABCDEF01, result);
     }
 
     #[test]
-    fn test_from_be_bytes_at_max_value() {
+    fn reads_big_endian_u32_max_value() {
         let data = [0xFF, 0xFF, 0xFF, 0xFF];
         let result = from_be_bytes_at(&data, 0).unwrap();
         assert_eq!(u32::MAX, result);
     }
 
     #[test]
-    fn test_from_be_bytes_at_min_value() {
+    fn reads_big_endian_u32_zero_value() {
         let data = [0x00, 0x00, 0x00, 0x00];
         let result = from_be_bytes_at(&data, 0).unwrap();
         assert_eq!(0, result);
     }
 
     #[test]
-    fn test_from_be_bytes_at_out_of_bounds_returns_error() {
+    fn returns_eof_error_when_big_endian_u32_read_runs_out_of_bounds() {
         let data = [0x00, 0x01, 0x02];
         let err = from_be_bytes_at(&data, 0).unwrap_err();
         assert_eq!(Error::UNEXPECTED_EOF_ERROR, err.code());

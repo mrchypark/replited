@@ -135,7 +135,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_valid_little_endian_header() {
+    fn reads_valid_little_endian_wal_header() {
         let header_bytes = create_valid_le_header(4096, 0x12345678, 0xABCDEF01);
         let mut cursor = Cursor::new(&header_bytes);
 
@@ -149,7 +149,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_valid_big_endian_header() {
+    fn reads_valid_big_endian_wal_header() {
         let header_bytes = create_valid_be_header(4096, 0x11223344, 0x55667788);
         let mut cursor = Cursor::new(&header_bytes);
 
@@ -162,7 +162,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_various_page_sizes() {
+    fn reads_wal_headers_across_supported_page_sizes() {
         // Test valid page sizes: 1024, 2048, 4096, 8192, 16384, 32768, 65536
         for page_size in [1024u32, 2048, 4096, 8192, 16384, 32768, 65536] {
             let header_bytes = create_valid_le_header(page_size, 0, 0);
@@ -177,7 +177,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reject_invalid_magic() {
+    fn rejects_header_with_unknown_magic_value() {
         let mut header = create_valid_le_header(4096, 0, 0);
         // Corrupt magic bytes
         header[0] = 0x00;
@@ -190,7 +190,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reject_invalid_page_size_not_power_of_two() {
+    fn rejects_header_with_page_size_that_is_not_power_of_two() {
         let mut header = create_valid_le_header(4096, 0, 0);
         // Set page size to 1000 (not a power of two)
         header[8..12].copy_from_slice(&1000u32.to_be_bytes());
@@ -206,7 +206,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reject_page_size_too_small() {
+    fn rejects_header_with_page_size_below_sqlite_minimum() {
         let mut header = create_valid_le_header(4096, 0, 0);
         // Set page size to 512 (less than 1024)
         header[8..12].copy_from_slice(&512u32.to_be_bytes());
@@ -222,7 +222,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reject_invalid_checksum() {
+    fn rejects_header_with_invalid_checksum() {
         let mut header = create_valid_le_header(4096, 0, 0);
         // Corrupt checksum
         header[24] = 0xFF;
@@ -235,7 +235,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reject_truncated_header() {
+    fn rejects_truncated_wal_header() {
         let header = vec![0u8; 16]; // Only 16 bytes, need 32
 
         let mut cursor = Cursor::new(&header);
@@ -245,7 +245,7 @@ mod tests {
     }
 
     #[test]
-    fn test_to_bytes_roundtrip() {
+    fn round_trips_header_bytes_through_serialization() {
         let original_bytes = create_valid_le_header(4096, 0xDEADBEEF, 0xCAFEBABE);
         let mut cursor = Cursor::new(&original_bytes);
 

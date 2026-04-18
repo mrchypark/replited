@@ -1,0 +1,277 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: replited-chaos
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: replited-config
+  namespace: replited-chaos
+data:
+  primary.toml: |
+    [log]
+    level = "Info"
+    dir = "/var/log/replited"
+
+    [[database]]
+    db = "/pb/primary/data.db"
+    cache_root = "/pb/primary/cache"
+    monitor_interval_ms = 50
+    checkpoint_interval_secs = 1
+    wal_retention_count = 20
+    apply_checkpoint_frame_interval = 20
+    apply_checkpoint_interval_ms = 200
+
+    [[database.replicate]]
+    name = "stream-primary"
+    [database.replicate.params]
+    type = "stream"
+    addr = "http://0.0.0.0:50051"
+  replica.toml: |
+    [log]
+    level = "Info"
+    dir = "/var/log/replited"
+
+    [[database]]
+    db = "/pb/replica/data.db"
+    cache_root = "/pb/replica/cache"
+    monitor_interval_ms = 50
+    wal_retention_count = 20
+    apply_checkpoint_frame_interval = 10
+    apply_checkpoint_interval_ms = 100
+
+    [[database.replicate]]
+    name = "stream-primary"
+    [database.replicate.params]
+    type = "stream"
+    addr = "http://primary-stream.replited-chaos.svc.cluster.local:50051"
+    remote_db_name = "/pb/primary/data.db"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: primary-api
+  namespace: replited-chaos
+spec:
+  selector:
+    app: primary-pocketbase
+  ports:
+    - name: http
+      port: 8090
+      targetPort: 8090
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: primary-stream
+  namespace: replited-chaos
+spec:
+  selector:
+    app: primary-pocketbase
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: 50051
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: replica-read
+  namespace: replited-chaos
+spec:
+  selector:
+    app: replica-pocketbase
+  ports:
+    - name: http
+      port: 8090
+      targetPort: 8090
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: replica-headless
+  namespace: replited-chaos
+spec:
+  clusterIP: None
+  selector:
+    app: replica-pocketbase
+  ports:
+    - name: http
+      port: 8090
+      targetPort: 8090
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: primary-pocketbase
+  namespace: replited-chaos
+spec:
+  serviceName: primary-api
+  replicas: 1
+  selector:
+    matchLabels:
+      app: primary-pocketbase
+  template:
+    metadata:
+      labels:
+        app: primary-pocketbase
+    spec:
+      terminationGracePeriodSeconds: 10
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+      volumes:
+        - name: primary-data
+          emptyDir: {}
+        - name: replited-logs
+          emptyDir: {}
+        - name: replited-config
+          configMap:
+            name: replited-config
+      containers:
+        - name: pocketbase
+          image: ghcr.io/muchobien/pocketbase:0.36.9
+          imagePullPolicy: IfNotPresent
+          command:
+            - /usr/local/bin/pocketbase
+          args:
+            - serve
+            - --http=0.0.0.0:8090
+            - --dir=/pb/primary
+          ports:
+            - containerPort: 8090
+              name: http
+          volumeMounts:
+            - name: primary-data
+              mountPath: /pb/primary
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 2
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+        - name: replited
+          image: __REPLITED_IMAGE__
+          imagePullPolicy: IfNotPresent
+          command:
+            - /usr/local/bin/replited
+            - --config
+            - /config/primary.toml
+            - replicate
+          ports:
+            - containerPort: 50051
+              name: grpc
+          volumeMounts:
+            - name: primary-data
+              mountPath: /pb/primary
+            - name: replited-logs
+              mountPath: /var/log/replited
+            - name: replited-config
+              mountPath: /config/primary.toml
+              subPath: primary.toml
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: replica-pocketbase
+  namespace: replited-chaos
+spec:
+  serviceName: replica-headless
+  podManagementPolicy: Parallel
+  replicas: 3
+  selector:
+    matchLabels:
+      app: replica-pocketbase
+  template:
+    metadata:
+      labels:
+        app: replica-pocketbase
+    spec:
+      terminationGracePeriodSeconds: 10
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
+        - key: node-role.kubernetes.io/master
+          operator: Exists
+          effect: NoSchedule
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: replica-pocketbase
+                topologyKey: kubernetes.io/hostname
+      volumes:
+        - name: replica-data
+          emptyDir: {}
+        - name: pocketbase-tools
+          emptyDir: {}
+        - name: replited-logs
+          emptyDir: {}
+        - name: replited-config
+          configMap:
+            name: replited-config
+      initContainers:
+        - name: pocketbase-tools
+          image: ghcr.io/muchobien/pocketbase:0.36.9
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -lc
+            - cp /usr/local/bin/pocketbase /tools/pocketbase && chmod +x /tools/pocketbase
+          volumeMounts:
+            - name: pocketbase-tools
+              mountPath: /tools
+      containers:
+        - name: replited-sidecar
+          image: __REPLITED_IMAGE__
+          imagePullPolicy: IfNotPresent
+          command:
+            - /usr/local/bin/replited
+            - --config
+            - /config/replica.toml
+            - replica-sidecar
+            - --force-restore
+            - --exec
+            - /tools/pocketbase serve --http 0.0.0.0:8090 --dir /pb/replica
+          ports:
+            - containerPort: 8090
+              name: http
+          volumeMounts:
+            - name: replica-data
+              mountPath: /pb/replica
+            - name: pocketbase-tools
+              mountPath: /tools
+            - name: replited-logs
+              mountPath: /var/log/replited
+            - name: replited-config
+              mountPath: /config/replica.toml
+              subPath: replica.toml
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 6

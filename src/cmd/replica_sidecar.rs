@@ -573,7 +573,7 @@ mod tests {
     use crate::cmd::replica_sidecar::process_manager::ProcessManager;
 
     #[tokio::test]
-    async fn ensure_reader_blocked_adds_only_one_blocker_across_retries() {
+    async fn keeps_single_startup_blocker_when_bootstrap_retries() {
         let pm = ProcessManager::new(String::new());
         let mut reader_blocked = false;
 
@@ -585,7 +585,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn initialize_reader_blocker_claims_initial_blocker_when_managed() {
+    async fn claims_startup_blocker_when_sidecar_manages_child_process() {
         let pm = ProcessManager::new(String::new());
 
         let reader_blocked = initialize_reader_blocker(Some(&pm)).await;
@@ -595,14 +595,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn initialize_reader_blocker_is_noop_without_manager() {
+    async fn leaves_reader_unblocked_without_managed_child_process() {
         let reader_blocked = initialize_reader_blocker(None).await;
 
         assert!(!reader_blocked);
     }
 
     #[tokio::test]
-    async fn release_reader_blocker_is_noop_without_owned_blocker() {
+    async fn keeps_blocker_count_unchanged_when_sidecar_never_claimed_one() {
         let pm = ProcessManager::new(String::new());
         let mut reader_blocked = false;
 
@@ -613,7 +613,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn release_reader_blocker_balances_bootstrap_owned_blocker() {
+    async fn releases_startup_blocker_after_catch_up_completes() {
         let pm = ProcessManager::new(String::new());
         let mut reader_blocked = false;
 
@@ -625,7 +625,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_manager_remove_blocker_is_noop_at_zero() {
+    async fn keeps_process_manager_blocker_count_at_zero_when_none_are_active() {
         let pm = ProcessManager::new(String::new());
 
         pm.remove_blocker().await;

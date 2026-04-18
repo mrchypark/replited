@@ -12,7 +12,6 @@ use reqwest_hickory_resolver::HickoryResolver;
 
 use crate::config::StorageAzblobConfig;
 use crate::config::StorageFsConfig;
-use crate::config::StorageFtpConfig;
 use crate::config::StorageGcsConfig;
 use crate::config::StorageParams;
 use crate::config::StorageS3Config;
@@ -26,7 +25,11 @@ pub fn init_operator(cfg: &StorageParams) -> Result<Operator> {
     let op = match cfg {
         StorageParams::Azb(cfg) => build_operator(init_azblob_operator(cfg)?)?,
         StorageParams::Fs(cfg) => build_operator(init_fs_operator(cfg)?)?,
-        StorageParams::Ftp(cfg) => build_operator(init_ftp_operator(cfg)?)?,
+        StorageParams::Ftp(_) => {
+            return Err(crate::error::Error::InvalidConfig(
+                "ftp storage backend is not supported by runtime".to_string(),
+            ));
+        }
         StorageParams::Gcs(cfg) => build_operator(init_gcs_operator(cfg)?)?,
         StorageParams::S3(cfg) => build_operator(init_s3_operator(cfg)?)?,
         StorageParams::Stream(_) => build_operator(services::Memory::default())?,
@@ -88,17 +91,6 @@ fn init_fs_operator(cfg: &StorageFsConfig) -> Result<impl Builder> {
         path = env::current_dir()?.join(path).display().to_string();
     }
     builder = builder.root(&path);
-
-    Ok(builder)
-}
-
-/// init_ftp_operator will init a opendal ftp operator.
-fn init_ftp_operator(cfg: &StorageFtpConfig) -> Result<impl Builder> {
-    let builder = services::Ftp::default()
-        .endpoint(&cfg.endpoint)
-        .root(&cfg.root)
-        .user(&cfg.username)
-        .password(&cfg.password);
 
     Ok(builder)
 }
