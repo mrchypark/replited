@@ -28,15 +28,6 @@ name = "name of fs"
 params.type = "fs"
 params.root = "/var/replited"
 
-# sample of ftp replicate config
-[[database.replicate]]
-name = "name of ftp"
-params.type = "ftp"
-params.endpoint = "ftps://127.0.0.1"
-params.root = "/var/replited"
-params.username = "username"
-params.password = "password"
-
 # sample of gcs replicate config
 [[database.replicate]]
 name = "name of gcs"

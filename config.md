@@ -5,7 +5,6 @@
 	- [Replicate Config](#replicate-config)
 		- [Azure blob Params](#azure-blob-params)
 		- [File System Params](#file-system-params)
-		- [Ftp Params](#ftp-params) 
 		- [Gcs Params](#gcs-params) 
 		- [S3 Params](#s3-params)
 		- [Stream Params](#stream-params)
@@ -23,6 +22,9 @@ replited use `toml` as its config file format, the structure of config is:
   * sqlite database file path;
   * one or more database replicate backend.
 
+Current runtime-supported backend targets are `fs`, `s3`, `gcs`, `azb`, and `stream`.
+The `ftp` storage shape still exists in serialized config types for compatibility, but configs using it are rejected by runtime validation.
+
 See config sample in [sample.toml](./etc/sample.toml)
 
 ## Log Config
@@ -37,6 +39,7 @@ See config sample in [sample.toml](./etc/sample.toml)
 | :---- | ---- |
 | db | sqlite database file path |
 | replicate | one or more database replicate backend |
+| cache_root | local fs cache/spool root for archival objects; required when `db` is relative |
 | min_checkpoint_page_number | passive checkpoint threshold (pages) |
 | max_checkpoint_page_number | forced checkpoint threshold (pages) |
 | truncate_page_number | forced truncation checkpoint threshold (pages) |
@@ -46,6 +49,10 @@ See config sample in [sample.toml](./etc/sample.toml)
 | apply_checkpoint_interval_ms | **replica-side**: max milliseconds between checkpoints (default 2000) |
 | wal_retention_count | number of shadow WAL segments retained locally on primary for gap fill (default 10) |
 | max_concurrent_snapshots | max concurrent snapshot streams allowed (default 5) |
+
+Path rule:
+- If `db` is absolute, `cache_root` may be omitted and defaults under `.<db-name>-replited/cache`.
+- If `db` is relative, `cache_root` must be set explicitly.
 
 ### Replicate Config
 | item  |  value    |
@@ -68,15 +75,6 @@ See config sample in [sample.toml](./etc/sample.toml)
 | :---- | ---- |
 | params.type | `"fs"` (alias: `"Fs"`) |
 | params.root | root directory of file system backend |
-
-#### Ftp Params
-| item  |  value    |
-| :---- | ---- |
-| params.type | `"ftp"` (alias: `"Ftp"`) |
-| params.endpoint | Endpoint of this ftp, use "ftps://127.0.0.1" by default. |
-| params.root | root directory of file system backend, use "/" by default. |
-| params.username | username of ftp backend. |
-| params.password | password of ftp backend. |
 
 #### Gcs Params
 | item  |  value    |
@@ -169,15 +167,19 @@ The sidecar will detect the mismatch and attempt auto-restore, but this may resu
 Use the `--exec` flag to automatically manage your application:
 
 ```bash
-replited replica-sidecar \
+replited --config replica.toml replica-sidecar \
   --exec "/path/to/your-app serve --http=0.0.0.0:8080" \
-  --config replica.toml
 ```
 
 **Benefits:**
 - Sidecar controls application lifecycle
 - Application only starts when replica is ready
+- During snapshot bootstrap in child-process mode, the reader stays blocked until the first catch-up cycle completes
 - Automatic restart on schema changes or WAL stuck
+
+Application auth note:
+- For apps like PocketBase, do not log in directly against the replica in normal operation.
+- Authenticate on the primary and use the issued token for authenticated replica reads.
 
 ---
 
