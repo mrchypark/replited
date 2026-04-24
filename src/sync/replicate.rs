@@ -28,8 +28,8 @@ use crate::sqlite::WALHeader;
 use crate::sqlite::align_frame;
 use crate::storage::SnapshotInfo;
 use crate::storage::StorageClient;
-use crate::storage::{GenerationManifest, WalSegmentInfo};
 use crate::storage::{DEFAULT_CACHE_SIZE_LIMIT_BYTES, LocalObjectCache};
+use crate::storage::{GenerationManifest, WalSegmentInfo};
 
 #[derive(Clone, Debug)]
 pub enum ReplicateCommand {
@@ -369,9 +369,7 @@ impl Replicate {
         }
 
         wal_packs.sort_unstable();
-        let (index, end_lsn) = wal_packs
-            .last()
-            .expect("wal pack list should be non-empty");
+        let (index, end_lsn) = wal_packs.last().expect("wal pack list should be non-empty");
         Ok(WalGenerationPos {
             generation: snapshot.generation.clone(),
             index: *index,
@@ -650,9 +648,9 @@ mod tests {
     #[tokio::test]
     async fn calculate_generation_position_manifest_without_packs_uses_snapshot_position() {
         use crate::base::Generation;
-        use crate::database::WalGenerationPos;
         use crate::config::{StorageConfig, StorageFsConfig, StorageParams};
         use crate::database::DatabaseInfo;
+        use crate::database::WalGenerationPos;
         use tokio::sync::mpsc;
 
         let temp = tempfile::tempdir().expect("tempdir");

@@ -236,16 +236,18 @@ mod tests {
             max_concurrent_snapshots: 5,
         };
 
-        let (_db, _rx) = Database::try_create(config)
-            .await
-            .expect("create database");
+        let (_db, _rx) = Database::try_create(config).await.expect("create database");
 
         assert!(
             cache_root.exists(),
             "configured cache_root should exist after startup"
         );
         assert!(
-            !temp.path().join(".primary.db-replited").join("cache").exists(),
+            !temp
+                .path()
+                .join(".primary.db-replited")
+                .join("cache")
+                .exists(),
             "runtime should not fall back to hardcoded metadata cache when cache_root is configured"
         );
     }
