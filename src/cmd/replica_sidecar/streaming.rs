@@ -281,8 +281,7 @@ pub(super) async fn stream_wal_and_apply(
                 .await?;
                 store_shadow_wal_bytes(db_path, &chunk_start, &chunk.wal_bytes)
                     .map_err(|e| ReplicaStreamError::Io(e.to_string()))?;
-                let persisted_pos = persisted_lsn_after_chunk(&chunk_next);
-                persist_last_applied_lsn(db_path, &persisted_pos)
+                persist_last_applied_lsn(db_path, &chunk_next)
                     .map_err(|e| ReplicaStreamError::Io(e.to_string()))?;
 
                 let mut bytes_delta = chunk_next.offset.saturating_sub(chunk_start.offset);
@@ -812,10 +811,6 @@ fn lsn_reached(current: &WalGenerationPos, floor: &WalGenerationPos) -> bool {
     current.index == floor.index && current.offset >= floor.offset
 }
 
-fn persisted_lsn_after_chunk(chunk_next: &WalGenerationPos) -> WalGenerationPos {
-    chunk_next.clone()
-}
-
 fn can_accept_stream_advance_past_floor(
     db_path: &str,
     floor: &WalGenerationPos,
@@ -925,7 +920,7 @@ fn allow_shadow_wal_boundary_advance(
 mod tests {
     use super::{
         ReplicaStreamError, WalRefreshState, apply_wal_bytes, can_accept_stream_advance_past_floor,
-        persisted_lsn_after_chunk, refresh_wal_index, validate_snapshot_meta,
+        refresh_wal_index, validate_snapshot_meta,
     };
     use crate::base::Generation;
     use crate::cmd::replica_sidecar::process_manager::ProcessManager;
@@ -1050,24 +1045,6 @@ mod tests {
             &floor,
             &next
         ));
-    }
-
-    #[test]
-    fn persists_replayed_chunk_progress_even_when_replay_floor_is_ahead() {
-        let generation = Generation::new();
-        let floor = WalGenerationPos {
-            generation: generation.clone(),
-            index: 5,
-            offset: 341_992,
-        };
-        let replay_chunk = WalGenerationPos {
-            generation,
-            index: 5,
-            offset: 259_592,
-        };
-
-        assert!(replay_chunk.offset < floor.offset);
-        assert_eq!(persisted_lsn_after_chunk(&replay_chunk), replay_chunk);
     }
 
     #[test]
