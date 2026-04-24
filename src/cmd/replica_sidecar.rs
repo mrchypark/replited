@@ -164,54 +164,59 @@ impl ReplicaSidecar {
             &process_manager,
         );
 
-        loop {
-            log::debug!("ReplicaSidecar::run_single_db loop state: {state:?}");
-            match state {
-                ReplicaState::Bootstrapping => {
-                    handle_bootstrapping_state(
-                        &bootstrap_ctx,
-                        &mut force_restore,
-                        &mut invalid_lsn_retries,
-                        &mut state,
-                        &mut last_applied_lsn,
-                        &mut resume_pos,
-                        &mut reader_blocked,
-                    )
-                    .await?;
-                }
-                ReplicaState::CatchingUp => {
-                    handle_catching_up_state(
-                        &wal_ctx,
-                        &mut state,
-                        &mut last_applied_lsn,
-                        &mut resume_pos,
-                        &mut invalid_lsn_retries,
-                        &mut reader_blocked,
-                    )
-                    .await?;
-                }
-                ReplicaState::Streaming => {
-                    handle_streaming_state(
-                        &wal_ctx,
-                        &mut state,
-                        &mut last_applied_lsn,
-                        &mut resume_pos,
-                        &mut invalid_lsn_retries,
-                    )
-                    .await?;
-                }
-                ReplicaState::NeedsRestore => {
-                    handle_needs_restore_state(
-                        &db_config.db,
-                        &mut consecutive_restore_count,
-                        &mut last_restore_time,
-                        &mut force_restore,
-                        &mut state,
-                    )
-                    .await;
+        let result: Result<()> = async {
+            loop {
+                log::debug!("ReplicaSidecar::run_single_db loop state: {state:?}");
+                match state {
+                    ReplicaState::Bootstrapping => {
+                        handle_bootstrapping_state(
+                            &bootstrap_ctx,
+                            &mut force_restore,
+                            &mut invalid_lsn_retries,
+                            &mut state,
+                            &mut last_applied_lsn,
+                            &mut resume_pos,
+                            &mut reader_blocked,
+                        )
+                        .await?;
+                    }
+                    ReplicaState::CatchingUp => {
+                        handle_catching_up_state(
+                            &wal_ctx,
+                            &mut state,
+                            &mut last_applied_lsn,
+                            &mut resume_pos,
+                            &mut invalid_lsn_retries,
+                            &mut reader_blocked,
+                        )
+                        .await?;
+                    }
+                    ReplicaState::Streaming => {
+                        handle_streaming_state(
+                            &wal_ctx,
+                            &mut state,
+                            &mut last_applied_lsn,
+                            &mut resume_pos,
+                            &mut invalid_lsn_retries,
+                        )
+                        .await?;
+                    }
+                    ReplicaState::NeedsRestore => {
+                        handle_needs_restore_state(
+                            &db_config.db,
+                            &mut consecutive_restore_count,
+                            &mut last_restore_time,
+                            &mut force_restore,
+                            &mut state,
+                        )
+                        .await;
+                    }
                 }
             }
         }
+        .await;
+
+        finalize_run_single_db(process_manager.as_ref(), &mut reader_blocked, result).await
     }
 }
 
@@ -567,10 +572,23 @@ async fn release_reader_blocker(
     *reader_blocked = false;
 }
 
+async fn finalize_run_single_db<T>(
+    process_manager: Option<&ProcessManager>,
+    reader_blocked: &mut bool,
+    result: Result<T>,
+) -> Result<T> {
+    release_reader_blocker(process_manager, reader_blocked).await;
+    result
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ensure_reader_blocked, initialize_reader_blocker, release_reader_blocker};
+    use super::{
+        ensure_reader_blocked, finalize_run_single_db, initialize_reader_blocker,
+        release_reader_blocker,
+    };
     use crate::cmd::replica_sidecar::process_manager::ProcessManager;
+    use crate::error::Error;
 
     #[tokio::test]
     async fn keeps_single_startup_blocker_when_bootstrap_retries() {
@@ -630,6 +648,23 @@ mod tests {
 
         pm.remove_blocker().await;
 
+        assert_eq!(pm.blocker_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn releases_startup_blocker_when_database_task_exits_with_error() {
+        let pm = ProcessManager::new(String::new());
+        let mut reader_blocked = initialize_reader_blocker(Some(&pm)).await;
+
+        let result = finalize_run_single_db::<()>(
+            Some(&pm),
+            &mut reader_blocked,
+            Err(Error::from_string("boom".into())),
+        )
+        .await;
+
+        assert!(matches!(result, Err(err) if err.message().contains("boom")));
+        assert!(!reader_blocked);
         assert_eq!(pm.blocker_count(), 0);
     }
 }

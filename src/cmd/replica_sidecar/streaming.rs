@@ -281,7 +281,7 @@ pub(super) async fn stream_wal_and_apply(
                 .await?;
                 store_shadow_wal_bytes(db_path, &chunk_start, &chunk.wal_bytes)
                     .map_err(|e| ReplicaStreamError::Io(e.to_string()))?;
-                let persisted_pos = persisted_lsn_after_chunk(ack_floor.as_ref(), &chunk_next);
+                let persisted_pos = persisted_lsn_after_chunk(&chunk_next);
                 persist_last_applied_lsn(db_path, &persisted_pos)
                     .map_err(|e| ReplicaStreamError::Io(e.to_string()))?;
 
@@ -296,9 +296,17 @@ pub(super) async fn stream_wal_and_apply(
                 };
                 frames_since_refresh = frames_since_refresh.saturating_add(frames_in_chunk);
 
+                if suppress_ack {
+                    if let Some(floor) = &ack_floor {
+                        if lsn_reached(&chunk_next, floor) {
+                            suppress_ack = false;
+                        }
+                    }
+                }
+
                 let should_refresh = frames_since_refresh >= checkpoint_frame_interval
                     || last_refresh.elapsed() >= Duration::from_millis(checkpoint_interval_ms);
-                if should_refresh && should_refresh_during_replay(ack_floor.as_ref()) {
+                if should_refresh && !suppress_ack {
                     let expected_frames = expected_frames_from_wal_file(db_path, page_size)?;
                     refresh_wal_index(
                         db_path,
@@ -313,13 +321,6 @@ pub(super) async fn stream_wal_and_apply(
 
                 // Best-effort ACK. Transport errors should not kill the replica.
                 // Explicit protocol errors must still propagate to trigger NeedsRestore.
-                if suppress_ack {
-                    if let Some(floor) = &ack_floor {
-                        if lsn_reached(&chunk_next, floor) {
-                            suppress_ack = false;
-                        }
-                    }
-                }
                 if !suppress_ack {
                     ack_lsn_or_warn(client, db_identity, replica_id, session_id, &chunk_next)
                         .await?;
@@ -338,7 +339,7 @@ pub(super) async fn stream_wal_and_apply(
         }
     }
 
-    if frames_since_refresh > 0 && should_refresh_during_replay(ack_floor.as_ref()) {
+    if frames_since_refresh > 0 && !suppress_ack {
         let expected_frames = expected_frames_from_wal_file(db_path, page_size)?;
         refresh_wal_index(
             db_path,
@@ -811,25 +812,8 @@ fn lsn_reached(current: &WalGenerationPos, floor: &WalGenerationPos) -> bool {
     current.index == floor.index && current.offset >= floor.offset
 }
 
-fn persisted_lsn_after_chunk(
-    replay_floor: Option<&WalGenerationPos>,
-    chunk_next: &WalGenerationPos,
-) -> WalGenerationPos {
-    match replay_floor {
-        Some(floor) if floor.generation == chunk_next.generation => {
-            if floor.index > chunk_next.index
-                || (floor.index == chunk_next.index && floor.offset > chunk_next.offset)
-            {
-                return floor.clone();
-            }
-            chunk_next.clone()
-        }
-        _ => chunk_next.clone(),
-    }
-}
-
-fn should_refresh_during_replay(replay_floor: Option<&WalGenerationPos>) -> bool {
-    replay_floor.is_none()
+fn persisted_lsn_after_chunk(chunk_next: &WalGenerationPos) -> WalGenerationPos {
+    chunk_next.clone()
 }
 
 fn can_accept_stream_advance_past_floor(
@@ -941,8 +925,7 @@ fn allow_shadow_wal_boundary_advance(
 mod tests {
     use super::{
         ReplicaStreamError, WalRefreshState, apply_wal_bytes, can_accept_stream_advance_past_floor,
-        persisted_lsn_after_chunk, refresh_wal_index, should_refresh_during_replay,
-        validate_snapshot_meta,
+        persisted_lsn_after_chunk, refresh_wal_index, validate_snapshot_meta,
     };
     use crate::base::Generation;
     use crate::cmd::replica_sidecar::process_manager::ProcessManager;
@@ -1070,7 +1053,7 @@ mod tests {
     }
 
     #[test]
-    fn persists_replay_floor_when_replayed_chunk_falls_behind_it() {
+    fn persists_replayed_chunk_progress_even_when_replay_floor_is_ahead() {
         let generation = Generation::new();
         let floor = WalGenerationPos {
             generation: generation.clone(),
@@ -1083,14 +1066,33 @@ mod tests {
             offset: 259_592,
         };
 
-        assert_eq!(
-            persisted_lsn_after_chunk(Some(&floor), &replay_chunk),
-            floor
-        );
+        assert!(replay_chunk.offset < floor.offset);
+        assert_eq!(persisted_lsn_after_chunk(&replay_chunk), replay_chunk);
     }
 
     #[test]
-    fn skips_checkpoint_refresh_while_replay_is_below_floor() {
+    fn allows_checkpoint_refresh_once_replay_reaches_floor() {
+        let mut suppress_ack = true;
+        let floor = WalGenerationPos {
+            generation: Generation::new(),
+            index: 1,
+            offset: 325_512,
+        };
+        let chunk_next = WalGenerationPos {
+            generation: floor.generation.clone(),
+            index: 1,
+            offset: 325_512,
+        };
+
+        if suppress_ack && super::lsn_reached(&chunk_next, &floor) {
+            suppress_ack = false;
+        }
+
+        assert!(!suppress_ack);
+    }
+
+    #[test]
+    fn keeps_checkpoint_refresh_suppressed_while_replay_is_still_below_floor() {
         let generation = Generation::new();
         let floor = WalGenerationPos {
             generation: generation.clone(),
@@ -1103,26 +1105,7 @@ mod tests {
             offset: 259_592,
         };
 
-        let _ = replay_chunk;
-        assert!(!should_refresh_during_replay(Some(&floor)));
-    }
-
-    #[test]
-    fn skips_checkpoint_refresh_for_full_replay_cycle_after_rewind() {
-        let generation = Generation::new();
-        let floor = WalGenerationPos {
-            generation: generation.clone(),
-            index: 1,
-            offset: 325_512,
-        };
-        let next_index_chunk = WalGenerationPos {
-            generation,
-            index: 2,
-            offset: 259_592,
-        };
-
-        let _ = next_index_chunk;
-        assert!(!should_refresh_during_replay(Some(&floor)));
+        assert!(!super::lsn_reached(&replay_chunk, &floor));
     }
 
     #[tokio::test]
