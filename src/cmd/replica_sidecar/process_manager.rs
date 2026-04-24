@@ -130,10 +130,17 @@ impl Drop for ReaderBlocker {
         if !pm.release_blocker_count() {
             return;
         }
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                pm.start().await;
-            });
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    pm.start().await;
+                });
+            }
+            Err(err) => {
+                log::warn!(
+                    "ProcessManager: reader blocker dropped without a Tokio runtime; child restart skipped: {err}"
+                );
+            }
         }
     }
 }
