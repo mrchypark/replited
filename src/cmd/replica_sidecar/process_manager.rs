@@ -11,6 +11,10 @@ pub(super) struct ProcessManager {
     blockers: Arc<std::sync::atomic::AtomicUsize>,
 }
 
+pub(super) struct ReaderBlocker {
+    process_manager: Option<ProcessManager>,
+}
+
 impl ProcessManager {
     pub(super) fn new(cmd: String) -> Self {
         Self {
@@ -70,13 +74,73 @@ impl ProcessManager {
         }
     }
 
+    pub(super) async fn block_reader(&self) -> ReaderBlocker {
+        self.add_blocker().await;
+        ReaderBlocker {
+            process_manager: Some(self.clone()),
+        }
+    }
+
     pub(super) async fn remove_blocker(&self) {
-        let prev = self
-            .blockers
-            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
-        if prev == 1 {
+        if self.release_blocker_count() {
             // Last blocker removed, start the process.
             self.start().await;
+        }
+    }
+
+    fn release_blocker_count(&self) -> bool {
+        let mut current = self.blockers.load(std::sync::atomic::Ordering::SeqCst);
+        loop {
+            if current == 0 {
+                return false;
+            }
+            match self.blockers.compare_exchange(
+                current,
+                current - 1,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    return current == 1;
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn blocker_count(&self) -> usize {
+        self.blockers.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl ReaderBlocker {
+    pub(super) async fn release(mut self) {
+        if let Some(pm) = self.process_manager.take() {
+            pm.remove_blocker().await;
+        }
+    }
+}
+
+impl Drop for ReaderBlocker {
+    fn drop(&mut self) {
+        let Some(pm) = self.process_manager.take() else {
+            return;
+        };
+        if !pm.release_blocker_count() {
+            return;
+        }
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    pm.start().await;
+                });
+            }
+            Err(err) => {
+                log::warn!(
+                    "ProcessManager: reader blocker dropped without a Tokio runtime; child restart skipped: {err}"
+                );
+            }
         }
     }
 }

@@ -47,6 +47,7 @@ During bootstrap:
 
 - With `--force-restore`, sidecar deletes local `db`, `db-wal`, `db-shm` first.
 - Sidecar downloads snapshot from Primary stream and restores local DB.
+- With `--exec`, the child reader stays blocked through bootstrap and the first catch-up cycle, then is released once the replica reaches steady streaming.
 
 During streaming:
 
@@ -66,12 +67,14 @@ Configure in `[[database]]` inside replica config:
 | Key | Default | Required | Sidecar usage |
 | --- | --- | --- | --- |
 | `db` | none | yes | Local replica SQLite path |
+| `cache_root` | derived from db metadata dir | no for absolute `db`, yes for relative `db` | Local fs cache/spool root |
 | `apply_checkpoint_frame_interval` | `128` | no | WAL frames before forced refresh checkpoint |
 | `apply_checkpoint_interval_ms` | `2000` | no | Max ms between refresh checkpoints |
 | `replicate` | none | yes | Must include one stream target |
 
 Validation constraints:
 
+- Relative `db` paths require explicit `cache_root`.
 - `apply_checkpoint_frame_interval` must be `> 0`.
 - `replicate` must not be empty.
 
@@ -103,6 +106,7 @@ Behavior:
 - Sidecar starts the child process.
 - During sensitive restore/recovery sections, sidecar can temporarily stop the child process.
 - After blocker sections complete, sidecar starts it again.
+- After snapshot bootstrap, sidecar keeps the child blocked until the first catch-up pass completes so readers do not open the replica too early.
 
 Why use this:
 
@@ -138,6 +142,10 @@ replited --config replica.toml replica-sidecar \
   --force-restore \
   --exec "pocketbase serve --http=0.0.0.0:8090 --dir=/pb_data/replica"
 ```
+
+PocketBase auth pattern:
+- Treat the replica as read-only, including auth/session flows.
+- Authenticate on the primary and use the issued token for authenticated reads against the replica.
 
 ## 6. Operational Recommendations
 

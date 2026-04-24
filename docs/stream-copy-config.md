@@ -34,7 +34,7 @@ max_concurrent_snapshots = 5
 name = "stream-primary"
 [database.replicate.params]
 type = "stream"
-addr = "127.0.0.1:50051"
+addr = "http://127.0.0.1:50051"
 ```
 
 Start command:
@@ -77,6 +77,7 @@ Notes:
 | --- | --- | --- | --- |
 | `db` | none | yes | SQLite file path for this database entry |
 | `replicate` | none | yes | Replication targets; must include at least one item |
+| `cache_root` | derived from db metadata dir | no for absolute `db`, yes for relative `db` | Local fs cache/spool root for archival objects |
 | `min_checkpoint_page_number` | `1000` | no | Passive checkpoint threshold (pages) |
 | `max_checkpoint_page_number` | `10000` | no | Forced checkpoint threshold (pages) |
 | `truncate_page_number` | `500000` | no | Forced truncate checkpoint threshold (pages) |
@@ -87,6 +88,7 @@ Notes:
 Validation constraints:
 
 - `replicate` must not be empty.
+- Relative `db` paths require explicit `cache_root`.
 - `min_checkpoint_page_number` must be `> 0`.
 - `min_checkpoint_page_number <= max_checkpoint_page_number`.
 
@@ -103,6 +105,10 @@ Address rule by role:
 
 - Primary server bind: `addr` may be `127.0.0.1:50051` or `http://127.0.0.1:50051`.
 - Replica client connect: use `http://...` explicitly.
+
+Current runtime archival backends:
+- Supported: `fs`, `s3`, `gcs`, `azb`
+- Not accepted by runtime validation: `ftp`
 
 ## 4. Recommended Profiles
 

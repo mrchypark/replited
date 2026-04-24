@@ -19,6 +19,7 @@ The replica PocketBase process is supervised by `replica-sidecar`, which allows 
 - `python3`
 
 The demo script auto-downloads the official PocketBase binary into `example/bin/` if it is missing.
+The maintained default version in the script is PocketBase `v0.36.9`.
 
 ## Canonical Path
 
@@ -49,6 +50,7 @@ The script:
 - Replica Admin UI: [http://127.0.0.1:8091/_/](http://127.0.0.1:8091/_/)
 
 `verify_pocketbase.py` logs into the primary, creates a public `notes` collection, inserts a record, and confirms that the record appears on the replica.
+It intentionally does not log into the replica.
 
 ## Non-Interactive Run
 
@@ -67,5 +69,6 @@ DEMO_HOLD=0 bash example/run_pocketbase_live_demo.sh
 ## Important Notes
 
 - The replica database is read-only from the application perspective.
+- For authenticated reads, log in on the primary and use the primary-issued token against the replica. Avoid direct replica login flows in normal operation.
 - The primary and replica each use distinct `cache_root` directories.
 - This example is host-based on purpose so it avoids Docker image/build instability and shows the actual release binary behavior.

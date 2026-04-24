@@ -27,8 +27,9 @@ struct CacheEntry {
 impl LocalObjectCache {
     pub fn try_create(root: impl Into<PathBuf>, max_bytes: u64) -> Result<Self> {
         let root = root.into();
-        fs::create_dir_all(&root)
-            .map_err(|err| Error::StorageError(format!("create cache root {}: {err}", root.display())))?;
+        fs::create_dir_all(&root).map_err(|err| {
+            Error::StorageError(format!("create cache root {}: {err}", root.display()))
+        })?;
 
         let cache = Self {
             root: Arc::new(root),
@@ -76,17 +77,16 @@ impl LocalObjectCache {
         let path = self.path_for_key(key);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|err| {
-                Error::StorageError(format!(
-                    "create cache parent {}: {err}",
-                    parent.display()
-                ))
+                Error::StorageError(format!("create cache parent {}: {err}", parent.display()))
             })?;
         }
 
         let temp_path = path.with_file_name(format!(
             "{}.tmp",
             path.file_name()
-                .ok_or_else(|| Error::StorageError("cache object path missing file name".to_string()))?
+                .ok_or_else(|| Error::StorageError(
+                    "cache object path missing file name".to_string()
+                ))?
                 .to_string_lossy()
         ));
 
@@ -154,9 +154,9 @@ impl LocalObjectCache {
     }
 
     fn walk_and_cleanup_tmp(&self, dir: &Path) -> Result<()> {
-        for entry in fs::read_dir(dir)
-            .map_err(|err| Error::StorageError(format!("read cache directory {}: {err}", dir.display())))?
-        {
+        for entry in fs::read_dir(dir).map_err(|err| {
+            Error::StorageError(format!("read cache directory {}: {err}", dir.display()))
+        })? {
             let entry = entry.map_err(|err| {
                 Error::StorageError(format!("read cache entry in {}: {err}", dir.display()))
             })?;
@@ -185,9 +185,9 @@ impl LocalObjectCache {
     }
 
     fn collect_entries(&self, dir: &Path, out: &mut Vec<CacheEntry>) -> Result<()> {
-        for entry in fs::read_dir(dir)
-            .map_err(|err| Error::StorageError(format!("read cache directory {}: {err}", dir.display())))?
-        {
+        for entry in fs::read_dir(dir).map_err(|err| {
+            Error::StorageError(format!("read cache directory {}: {err}", dir.display()))
+        })? {
             let entry = entry.map_err(|err| {
                 Error::StorageError(format!("read cache entry in {}: {err}", dir.display()))
             })?;
@@ -224,7 +224,9 @@ impl LocalObjectCache {
                 key: relative_key,
                 path,
                 size: metadata.len(),
-                modified: metadata.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
+                modified: metadata
+                    .modified()
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
             });
         }
         Ok(())
@@ -271,8 +273,8 @@ mod tests {
     #[test]
     fn cache_prune_preserves_pinned_keys() {
         let temp = tempdir().expect("tempdir");
-        let cache = LocalObjectCache::try_create(temp.path().join("cache"), 8)
-            .expect("cache create");
+        let cache =
+            LocalObjectCache::try_create(temp.path().join("cache"), 8).expect("cache create");
 
         cache.put("db/old", b"1234").expect("cache put old");
         std::thread::sleep(std::time::Duration::from_millis(5));

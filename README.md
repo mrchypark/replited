@@ -19,19 +19,19 @@
 
 ## Introduction
 
-Inspired by [Litestream](https://litestream.io/), with the power of [Rust](https://www.rust-lang.org/) and [OpenDAL](https://opendal.apache.org/), replited target to replicate sqlite to everywhere(file system,s3,ftp,google drive,dropbox,etc).
+Inspired by [Litestream](https://litestream.io/), with the power of [Rust](https://www.rust-lang.org/) and [OpenDAL](https://opendal.apache.org/), replited replicates SQLite to supported archival backends and live stream replicas.
 
 ## Why replited
 * Using sqlite's [WAL](https://sqlite.org/wal.html) mechanism, instead of backing up full data every time, do incremental backup of data to reduce the amount of synchronised data;
-* Support for multiple types of storage backends,such as s3,gcs,ftp,local file system,etc.
+* Supports multiple runtime backends such as `fs`, `s3`, `gcs`, `azb`, plus direct `stream` replication.
 
 ## Support Backend
 
-| Type                       | Services                                                     |
-| -------------------------- | ------------------------------------------------------------ |
-| Standard Storage Protocols | ftp |
-| Object Storage Services    | [azblob] [gcs] <br> [s3] |
-| File Storage Services      | fs |
+| Type                    | Services               |
+| ----------------------- | ---------------------- |
+| Object Storage Services | [azblob] [gcs] [s3]    |
+| File Storage Services   | fs                     |
+| Live Replication        | stream                 |
 
 [azblob]: https://azure.microsoft.com/en-us/services/storage/blobs/
 [gcs]: https://cloud.google.com/storage
@@ -59,6 +59,10 @@ See [config.md](./config.md)
 See stream-specific docs:
 - [Streaming Copy Config Guide](./docs/stream-copy-config.md)
 - [Replica Sidecar Config Guide](./docs/sidecar-config.md)
+
+Config path rule
+- If `db` is an absolute path, `cache_root` may be omitted and defaults under the DB metadata directory.
+- If `db` is a relative path, `cache_root` must be set explicitly.
 
 Replica-side WAL checkpoint tuning (new)
 - `apply_checkpoint_frame_interval` (default: 128): number of WAL frames to buffer before checkpointing. Lower values surface new schema/data faster at the cost of more I/O.
@@ -115,9 +119,12 @@ Treat `{output}`, `{output}-wal`, `{output}-shm` as a single restore output set.
 
 **Do NOT write to the replica database.** If you need to write, write to the primary instead.
 
+Application note:
+- Some apps can write local state during authentication/session flows. With PocketBase, the safe pattern is to authenticate on the primary and use the primary-issued token for authenticated reads against the replica.
+
 For automatic write blocking, use **Child Process Mode** with `--exec` flag:
 ```bash
-replited replica-sidecar --exec "/path/to/your-app serve"
+replited --config replica.toml replica-sidecar --exec "/path/to/your-app serve"
 ```
 This ensures your application only connects to the replica when it's safe to read.
 
@@ -177,6 +184,8 @@ replited --config replica.toml replica-sidecar \
   --exec "pocketbase serve --http=0.0.0.0:8090 --dir=/pb_data"
 ```
 
+See the maintained host example in [example/README.md](./example/README.md). The canonical live demo currently targets PocketBase `v0.36.9`.
+
 **PocketBase Configuration Notes**:
 - PocketBase uses WAL mode by default with `?_pragma=journal_mode(WAL)`
 - Connection pool: `DataMaxOpenConns: 10`, `DataMaxIdleConns: 5`
@@ -221,7 +230,8 @@ remote_db_name = "/pb_data/data.db"
 
 **Known Issues**:
 - PocketBase may report "database is locked" under high concurrent load (see [Issue #875](https://github.com/pocketbase/pocketbase/issues/875))
-- Solution: Use Child Process Mode to ensure proper shutdown sequencing
+- Use Child Process Mode to ensure proper shutdown sequencing
+- Avoid direct replica login flows in normal operation; authenticate on the primary and send read requests to the replica with the issued token when auth is required
 
 ### TrailBase Integration
 

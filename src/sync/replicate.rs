@@ -28,8 +28,8 @@ use crate::sqlite::WALHeader;
 use crate::sqlite::align_frame;
 use crate::storage::SnapshotInfo;
 use crate::storage::StorageClient;
-use crate::storage::{GenerationManifest, WalSegmentInfo};
 use crate::storage::{DEFAULT_CACHE_SIZE_LIMIT_BYTES, LocalObjectCache};
+use crate::storage::{GenerationManifest, WalSegmentInfo};
 
 #[derive(Clone, Debug)]
 pub enum ReplicateCommand {
@@ -369,9 +369,7 @@ impl Replicate {
         }
 
         wal_packs.sort_unstable();
-        let (index, end_lsn) = wal_packs
-            .last()
-            .expect("wal pack list should be non-empty");
+        let (index, end_lsn) = wal_packs.last().expect("wal pack list should be non-empty");
         Ok(WalGenerationPos {
             generation: snapshot.generation.clone(),
             index: *index,
@@ -650,9 +648,9 @@ mod tests {
     #[tokio::test]
     async fn calculate_generation_position_manifest_without_packs_uses_snapshot_position() {
         use crate::base::Generation;
-        use crate::database::WalGenerationPos;
         use crate::config::{StorageConfig, StorageFsConfig, StorageParams};
         use crate::database::DatabaseInfo;
+        use crate::database::WalGenerationPos;
         use tokio::sync::mpsc;
 
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1432,12 +1430,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sync_snapshot_fails_fast_on_unsupported_manifest_publish_backend() {
+    async fn replicate_creation_fails_fast_on_unsupported_snapshot_manifest_publish_backend() {
         use tokio::sync::mpsc;
 
-        use crate::base::Generation;
         use crate::config::{StorageConfig, StorageFtpConfig, StorageParams};
-        use crate::database::{DatabaseInfo, WalGenerationPos};
+        use crate::database::DatabaseInfo;
         use crate::error::Error;
 
         let (db_notifier, _db_rx) = mpsc::channel(1);
@@ -1449,7 +1446,7 @@ mod tests {
                 .to_string(),
             page_size: 4096,
         };
-        let mut replicate = super::Replicate::new_for_test(
+        let err = super::Replicate::new_for_test(
             StorageConfig {
                 name: "ftp".to_string(),
                 params: StorageParams::Ftp(Box::new(StorageFtpConfig::default())),
@@ -1460,32 +1457,17 @@ mod tests {
             info,
         )
         .await
-        .expect("create replicate");
-        replicate.state = super::ReplicateState::WaitSnapshot;
-
-        let err = replicate
-            .sync_snapshot(
-                WalGenerationPos {
-                    generation: Generation::new(),
-                    index: 1,
-                    offset: 4096,
-                },
-                crate::base::compress_buffer(b"snapshot").expect("compress"),
-            )
-            .await
-            .expect_err("unsupported backend should fail fast");
+        .expect_err("unsupported backend should fail fast during replicate creation");
 
         assert_eq!(err.code(), Error::INVALID_CONFIG);
-        assert_eq!(replicate.position().offset, 0);
     }
 
     #[tokio::test]
-    async fn replicate_main_returns_error_on_snapshot_manifest_publish_failure() {
+    async fn replicate_creation_fails_fast_before_snapshot_manifest_publish_main_loop() {
         use tokio::sync::mpsc;
 
-        use crate::base::Generation;
         use crate::config::{StorageConfig, StorageFtpConfig, StorageParams};
-        use crate::database::{DatabaseInfo, WalGenerationPos};
+        use crate::database::DatabaseInfo;
         use crate::error::Error;
 
         let (db_notifier, _db_rx) = mpsc::channel(1);
@@ -1497,7 +1479,7 @@ mod tests {
                 .to_string(),
             page_size: 4096,
         };
-        let mut replicate = super::Replicate::new_for_test(
+        let err = super::Replicate::new_for_test(
             StorageConfig {
                 name: "ftp".to_string(),
                 params: StorageParams::Ftp(Box::new(StorageFtpConfig::default())),
@@ -1508,25 +1490,7 @@ mod tests {
             info,
         )
         .await
-        .expect("create replicate");
-        replicate.state = super::ReplicateState::WaitSnapshot;
-
-        let (tx, rx) = mpsc::channel(1);
-        tx.send(ReplicateCommand::Snapshot((
-            WalGenerationPos {
-                generation: Generation::new(),
-                index: 1,
-                offset: 4096,
-            },
-            crate::base::compress_buffer(b"snapshot").expect("compress"),
-        )))
-        .await
-        .expect("send snapshot");
-        drop(tx);
-
-        let err = super::Replicate::main(replicate, rx)
-            .await
-            .expect_err("main should escalate manifest publish failure");
+        .expect_err("unsupported backend should fail fast during replicate creation");
 
         assert_eq!(err.code(), Error::INVALID_CONFIG);
     }
@@ -1597,12 +1561,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publish_manifest_wal_pack_fails_fast_on_unsupported_backend() {
+    async fn replicate_creation_fails_fast_on_unsupported_wal_pack_publish_backend() {
         use tokio::sync::mpsc;
 
-        use crate::base::Generation;
         use crate::config::{StorageConfig, StorageFtpConfig, StorageParams};
-        use crate::database::{DatabaseInfo, WalGenerationPos};
+        use crate::database::DatabaseInfo;
         use crate::error::Error;
 
         let (db_notifier, _db_rx) = mpsc::channel(1);
@@ -1614,7 +1577,7 @@ mod tests {
                 .to_string(),
             page_size: 4096,
         };
-        let replicate = super::Replicate::new_for_test(
+        let err = super::Replicate::new_for_test(
             StorageConfig {
                 name: "ftp".to_string(),
                 params: StorageParams::Ftp(Box::new(StorageFtpConfig::default())),
@@ -1625,26 +1588,7 @@ mod tests {
             info,
         )
         .await
-        .expect("create replicate");
-
-        let generation = Generation::new();
-        let err = replicate
-            .publish_manifest_wal_pack(
-                &WalGenerationPos {
-                    generation: generation.clone(),
-                    index: 1,
-                    offset: 0,
-                },
-                &WalGenerationPos {
-                    generation,
-                    index: 1,
-                    offset: 1024,
-                },
-                crate::base::compress_buffer(b"wal-pack").expect("compress"),
-                b"wal-pack".len(),
-            )
-            .await
-            .expect_err("unsupported backend should fail fast");
+        .expect_err("unsupported backend should fail fast during replicate creation");
 
         assert_eq!(err.code(), Error::INVALID_CONFIG);
     }

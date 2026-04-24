@@ -392,7 +392,7 @@ mod tests {
     }
 
     #[test]
-    fn test_storage_config_debug_label() {
+    fn storage_config_debug_label_matches_backend_name() {
         let config = create_valid_storage_config();
         let debug = format!("{config:?}");
         assert!(
@@ -425,14 +425,14 @@ mod tests {
     // ========== LogConfig tests ==========
 
     #[test]
-    fn test_log_config_default() {
+    fn log_config_defaults_to_info_level() {
         let log_config = LogConfig::default();
         assert_eq!(LogLevel::Info, log_config.level);
         assert_eq!("/var/log/replited", log_config.dir);
     }
 
     #[test]
-    fn test_log_config_display() {
+    fn log_config_display_includes_level_and_file_settings() {
         let log_config = LogConfig {
             level: LogLevel::Debug,
             dir: "/custom/log".to_string(),
@@ -445,13 +445,13 @@ mod tests {
     // ========== DbConfig validation tests ==========
 
     #[test]
-    fn test_db_config_validate_success() {
+    fn db_config_validation_succeeds_for_supported_archival_setup() {
         let config = create_valid_db_config();
         assert!(config.validate().is_ok());
     }
 
     #[test]
-    fn test_db_config_validate_rejects_unsupported_archival_backend() {
+    fn db_config_validation_rejects_unsupported_archival_backend() {
         let mut config = create_valid_db_config();
         config.replicate = vec![StorageConfig {
             name: "ftp-backup".to_string(),
@@ -465,7 +465,7 @@ mod tests {
     }
 
     #[test]
-    fn test_db_config_validate_allows_stream_backend() {
+    fn db_config_validation_allows_stream_backend() {
         let mut config = create_valid_db_config();
         config.replicate = vec![StorageConfig {
             name: "stream-replica".to_string(),
@@ -478,7 +478,7 @@ mod tests {
     }
 
     #[test]
-    fn test_db_config_validate_allows_s3_archival_backend() {
+    fn db_config_validation_allows_s3_archival_backend() {
         let mut config = create_valid_db_config();
         config.replicate = vec![StorageConfig {
             name: "s3-backup".to_string(),
@@ -489,7 +489,7 @@ mod tests {
     }
 
     #[test]
-    fn test_db_config_validate_allows_gcs_archival_backend() {
+    fn db_config_validation_allows_gcs_archival_backend() {
         let mut config = create_valid_db_config();
         config.replicate = vec![StorageConfig {
             name: "gcs-backup".to_string(),
@@ -500,7 +500,7 @@ mod tests {
     }
 
     #[test]
-    fn test_db_config_validate_allows_azblob_archival_backend() {
+    fn db_config_validation_allows_azblob_archival_backend() {
         let mut config = create_valid_db_config();
         config.replicate = vec![StorageConfig {
             name: "azblob-backup".to_string(),
@@ -513,7 +513,7 @@ mod tests {
     }
 
     #[test]
-    fn test_db_config_cache_root_defaults_under_metadata_dir() {
+    fn db_config_cache_root_defaults_under_metadata_directory() {
         let config = create_valid_db_config();
 
         assert_eq!(
@@ -523,7 +523,7 @@ mod tests {
     }
 
     #[test]
-    fn test_db_config_cache_root_prefers_explicit_value() {
+    fn db_config_cache_root_prefers_explicit_value() {
         let mut config = create_valid_db_config();
         config.cache_root = Some("/var/lib/replited/cache".to_string());
 
@@ -534,7 +534,7 @@ mod tests {
     }
 
     #[test]
-    fn test_db_config_validate_rejects_blank_explicit_cache_root() {
+    fn db_config_validation_rejects_blank_explicit_cache_root() {
         let mut config = create_valid_db_config();
         config.cache_root = Some("   ".to_string());
 
@@ -545,7 +545,7 @@ mod tests {
     }
 
     #[test]
-    fn test_db_config_validate_requires_explicit_cache_root_for_relative_db_path() {
+    fn db_config_validation_requires_explicit_cache_root_for_relative_db_path() {
         let mut config = create_valid_db_config();
         config.db = "test.db".to_string();
 
@@ -556,7 +556,7 @@ mod tests {
     }
 
     #[test]
-    fn test_db_config_validate_allows_relative_db_path_with_explicit_cache_root() {
+    fn db_config_validation_allows_relative_db_path_with_explicit_cache_root() {
         let mut config = create_valid_db_config();
         config.db = "test.db".to_string();
         config.cache_root = Some("/tmp/replited-cache".to_string());
@@ -567,7 +567,7 @@ mod tests {
     }
 
     #[test]
-    fn test_db_config_validate_rejects_cache_root_aliasing_fs_root() {
+    fn db_config_validation_rejects_cache_root_that_aliases_fs_root() {
         let mut config = create_valid_db_config();
         config.cache_root = Some("/tmp/replited".to_string());
 
@@ -578,7 +578,7 @@ mod tests {
     }
 
     #[test]
-    fn test_db_config_validate_empty_replicate() {
+    fn db_config_validation_rejects_empty_replicate_targets() {
         let mut config = create_valid_db_config();
         config.replicate = vec![];
 
@@ -587,7 +587,7 @@ mod tests {
     }
 
     #[test]
-    fn test_db_config_validate_min_checkpoint_zero() {
+    fn db_config_validation_rejects_zero_min_checkpoint_frames() {
         let mut config = create_valid_db_config();
         config.min_checkpoint_page_number = 0;
 
@@ -596,7 +596,7 @@ mod tests {
     }
 
     #[test]
-    fn test_db_config_validate_min_greater_than_max() {
+    fn db_config_validation_rejects_min_checkpoint_above_max_checkpoint() {
         let mut config = create_valid_db_config();
         config.min_checkpoint_page_number = 10000;
         config.max_checkpoint_page_number = 1000;
@@ -606,7 +606,7 @@ mod tests {
     }
 
     #[test]
-    fn test_db_config_validate_monitor_interval_zero() {
+    fn db_config_validation_rejects_zero_monitor_interval() {
         let mut config = create_valid_db_config();
         config.monitor_interval_ms = 0;
 
@@ -615,7 +615,7 @@ mod tests {
     }
 
     #[test]
-    fn test_db_config_validate_apply_checkpoint_frame_interval_zero() {
+    fn db_config_validation_rejects_zero_apply_checkpoint_frame_interval() {
         let mut config = create_valid_db_config();
         config.apply_checkpoint_frame_interval = 0;
 
@@ -624,7 +624,7 @@ mod tests {
     }
 
     #[test]
-    fn test_db_config_validate_apply_checkpoint_interval_zero() {
+    fn db_config_validation_rejects_zero_apply_checkpoint_interval() {
         let mut config = create_valid_db_config();
         config.apply_checkpoint_interval_ms = 0;
 
@@ -633,7 +633,7 @@ mod tests {
     }
 
     #[test]
-    fn test_db_config_validate_max_concurrent_snapshots_zero() {
+    fn db_config_validation_rejects_zero_max_concurrent_snapshots() {
         let mut config = create_valid_db_config();
         config.max_concurrent_snapshots = 0;
 
@@ -642,7 +642,7 @@ mod tests {
     }
 
     #[test]
-    fn test_db_config_validate_min_equals_max() {
+    fn db_config_validation_allows_equal_min_and_max_checkpoint_frames() {
         // Edge case: min equals max should be valid
         let mut config = create_valid_db_config();
         config.min_checkpoint_page_number = 5000;
@@ -652,7 +652,7 @@ mod tests {
     }
 
     #[test]
-    fn test_db_config_validate_max_checkpoint_zero_disables_forced_checkpoint() {
+    fn db_config_validation_allows_zero_max_checkpoint_to_disable_forced_checkpoint() {
         let mut config = create_valid_db_config();
         config.max_checkpoint_page_number = 0;
         config.min_checkpoint_page_number = 5000;
@@ -663,7 +663,7 @@ mod tests {
     // ========== Default value function tests ==========
 
     #[test]
-    fn test_default_values() {
+    fn config_defaults_match_expected_runtime_values() {
         assert_eq!(1000, default_min_checkpoint_page_number());
         assert_eq!(10000, default_max_checkpoint_page_number());
         assert_eq!(500000, default_truncate_page_number());
@@ -678,7 +678,7 @@ mod tests {
     // ========== Config validation tests ==========
 
     #[test]
-    fn test_config_validate_empty_database() {
+    fn config_validation_rejects_empty_database_list() {
         let config = Config {
             log: LogConfig::default(),
             database: vec![],
@@ -689,7 +689,7 @@ mod tests {
     }
 
     #[test]
-    fn test_config_validate_with_valid_db() {
+    fn config_validation_accepts_valid_database_entries() {
         let config = Config {
             log: LogConfig::default(),
             database: vec![create_valid_db_config()],
@@ -699,7 +699,7 @@ mod tests {
     }
 
     #[test]
-    fn test_config_validate_propagates_db_error() {
+    fn config_validation_propagates_database_validation_errors() {
         let mut db_config = create_valid_db_config();
         db_config.replicate = vec![]; // Invalid
 
@@ -715,7 +715,7 @@ mod tests {
     // ========== DbConfig Debug tests ==========
 
     #[test]
-    fn test_db_config_debug_format() {
+    fn db_config_debug_format_includes_cache_root() {
         let config = create_valid_db_config();
         let debug_str = format!("{config:?}");
 
@@ -726,7 +726,7 @@ mod tests {
     // ========== StorageConfig Debug tests ==========
 
     #[test]
-    fn test_storage_config_debug_format() {
+    fn storage_config_debug_format_includes_backend_fields() {
         let config = create_valid_storage_config();
         let debug_str = format!("{config:?}");
 

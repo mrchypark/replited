@@ -56,7 +56,7 @@ This example uses the **Child Process Mode** for the Replica.
 In this mode, `replited` acts as the supervisor for the TrailBase process.
 
 ```bash
-replited replica-sidecar --exec "/app/trail run"
+replited --config config/replica.toml replica-sidecar --exec "/app/trail run"
 ```
 
 **Benefits:**

@@ -17,7 +17,6 @@ opendal = { version = "0.50.0", optional = true, features = [
   "layers-async-backtrace",
   "services-azblob",
   "services-fs",
-  "services-ftp",
   "services-gcs",
   "services-s3",
 ] }
@@ -59,6 +58,9 @@ storage = ["dep:opendal"]
 
 [build-dependencies]
 tonic-build = "0.11"
+
+[dev-dependencies]
+proptest = "1.6"
 
 [profile.release]
 lto = true

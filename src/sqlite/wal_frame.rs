@@ -98,7 +98,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_frame() {
+    fn reads_regular_wal_frame_contents() {
         let page_size = 4096u64;
         let frame_bytes = create_frame(
             1, 10, 0x12345678, 0xABCDEF01, 0x11111111, 0x22222222, page_size,
@@ -120,7 +120,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_commit_frame() {
+    fn marks_commit_frame_when_commit_marker_is_present() {
         let page_size = 4096u64;
         // A commit frame has db_size > 0
         let frame_bytes = create_frame(5, 100, 0, 0, 0, 0, page_size);
@@ -133,7 +133,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_non_commit_frame() {
+    fn leaves_commit_flag_unset_for_non_commit_frames() {
         let page_size = 4096u64;
         // A non-commit frame has db_size == 0
         let frame_bytes = create_frame(3, 0, 0, 0, 0, 0, page_size);
@@ -146,7 +146,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_different_page_sizes() {
+    fn reads_frames_across_supported_page_sizes() {
         for page_size in [1024u64, 2048, 4096, 8192, 16384] {
             let frame_bytes = create_frame(1, 0, 0, 0, 0, 0, page_size);
             let mut cursor = Cursor::new(&frame_bytes);
@@ -160,7 +160,7 @@ mod tests {
     }
 
     #[test]
-    fn test_to_bytes_returns_original_data() {
+    fn preserves_original_bytes_when_frame_is_serialized() {
         let page_size = 4096u64;
         let original_bytes = create_frame(
             42, 500, 0xDEADBEEF, 0xCAFEBABE, 0xABCD1234, 0x56789ABC, page_size,
@@ -175,7 +175,7 @@ mod tests {
     }
 
     #[test]
-    fn test_read_truncated_frame_fails() {
+    fn rejects_truncated_wal_frames() {
         let page_size = 4096u64;
         // Create a frame that's too short
         let frame_bytes = vec![0u8; 100]; // Much less than WAL_FRAME_HEADER_SIZE + page_size
@@ -187,7 +187,7 @@ mod tests {
     }
 
     #[test]
-    fn test_frame_page_data_preserved() {
+    fn preserves_page_data_when_frame_is_parsed() {
         let page_size = 4096u64;
         let mut frame_bytes = create_frame(1, 0, 0, 0, 0, 0, page_size);
         // Write specific pattern to page data

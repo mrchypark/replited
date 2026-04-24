@@ -48,9 +48,7 @@ pub fn init_log(log_config: LogConfig) -> Result<()> {
         .try_apply()
     {
         let error_text = error.to_string();
-        if !error_text.contains("already setup")
-            && !error_text.contains("already initialized")
-        {
+        if !error_text.contains("already setup") && !error_text.contains("already initialized") {
             return Err(Error::from_string(error_text));
         }
     }

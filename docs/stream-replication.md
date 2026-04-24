@@ -32,7 +32,7 @@ For archival restore, the truth source is the manifest metadata and object reads
 
 ```toml
 [[database]]
-db = "primary.db"
+db = "/srv/sqlite/primary.db"
 
 # Stream server
 [[database.replicate]]
@@ -46,19 +46,20 @@ addr = "http://0.0.0.0:50051"
 
 ```toml
 [[database]]
-db = "replica.db"  # Local path can differ from Primary
+db = "/srv/sqlite/replica.db"  # Local path can differ from Primary
 
 [[database.replicate]]
 name = "stream-client"
 [database.replicate.params]
 type = "stream"
 addr = "http://PRIMARY_IP:50051"
-remote_db_name = "primary.db" # Primary DB identity (usually Primary `db` value)
+remote_db_name = "/srv/sqlite/primary.db" # Primary DB identity (usually Primary `db` value)
 ```
 
 Notes:
 
 - Primary DB identity is the `db` string from the Primary config. If the replica `db` path differs, set `remote_db_name` explicitly.
+- If you use relative `db` paths, set `cache_root` explicitly. Absolute paths can rely on the default metadata/cache layout.
 - For a full config reference, see `docs/stream-copy-config.md` and `docs/sidecar-config.md`.
 
 ## Initial Restore Flow
