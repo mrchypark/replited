@@ -87,6 +87,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
+          context: git
           images: |
             name=ghcr.io/mrchypark/replited
           flavor: |
