@@ -355,16 +355,26 @@ impl Database {
 
     // copies pending bytes from the real WAL to the shadow WAL.
     fn sync_wal(&mut self, info: &SyncInfo) -> Result<(u64, u64)> {
-        self.acquire_read_lock()?;
+        if let Err(err) = self.release_read_lock() {
+            warn!(
+                "db {} sync_wal release read lock failed before copying WAL: {:?}",
+                self.config.db, err
+            );
+        }
         let copy_result = self.copy_to_shadow_wal(&info.shadow_wal_file);
-        let release_result = self.release_read_lock();
-        let (orig_size, new_size) = match (copy_result, release_result) {
+        let reacquire_result = self.acquire_read_lock();
+        let (orig_size, new_size) = match (copy_result, reacquire_result) {
             (Ok(v), Ok(())) => v,
-            (Ok(_), Err(e)) => return Err(e),
+            (Ok(v), Err(e)) => {
+                warn!(
+                    "db {} sync_wal copied WAL but failed to refresh read lock: {:?}",
+                    self.config.db, e
+                );
+                v
+            }
             (Err(e), Ok(())) => return Err(e),
             (Err(e), Err(_)) => return Err(e),
         };
-        self.acquire_read_lock()?;
         debug!(
             "db {} sync_wal copy_to_shadow_wal: {}, {}",
             self.config.db, orig_size, new_size
@@ -822,7 +832,12 @@ impl Database {
     }
 
     fn refresh_wal_anchor(&mut self) -> Result<()> {
-        self.release_read_lock()?;
+        if let Err(err) = self.release_read_lock() {
+            warn!(
+                "db {} WAL anchor release read lock failed before refresh: {:?}",
+                self.config.db, err
+            );
+        }
 
         let mut write_result = self.write_wal_anchor();
         if let Err(err) = &write_result {
@@ -835,22 +850,7 @@ impl Database {
                 .and_then(|_| self.write_wal_anchor());
         }
 
-        let mut reacquire_result = self.acquire_read_lock();
-        if let Err(err) = &reacquire_result {
-            warn!(
-                "db {} WAL read lock failed after anchor write; reopening connection before retrying: {:?}",
-                self.config.db, err
-            );
-            reacquire_result = self
-                .reopen_connection()
-                .and_then(|_| self.acquire_read_lock());
-        }
-        match (write_result, reacquire_result) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Ok(()), Err(e)) => Err(e),
-            (Err(e), Ok(())) => Err(e),
-            (Err(e), Err(_)) => Err(e),
-        }
+        write_result
     }
 
     fn debug_assert_shadow_wal_matches_live(
@@ -1350,7 +1350,7 @@ root = "{backup_root}"
     }
 
     #[tokio::test]
-    async fn ensure_wal_exists_recreates_missing_wal_and_keeps_read_lock() {
+    async fn ensure_wal_exists_recreates_missing_wal_before_sync_reanchors_read_lock() {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("primary.db");
         let backup_root = dir.path().join("backup");
@@ -1375,9 +1375,11 @@ root = "{backup_root}"
             std::fs::metadata(&db.wal_file).expect("WAL metadata").len() >= super::WAL_HEADER_SIZE,
             "ensure_wal_exists should recreate a WAL header"
         );
+        db.sync().await.expect("sync after WAL recreation");
+
         assert!(
             db.tx_connection.is_some(),
-            "ensure_wal_exists should leave the steady-state read lock in place"
+            "sync should leave the steady-state read lock in place after copying WAL"
         );
     }
 
