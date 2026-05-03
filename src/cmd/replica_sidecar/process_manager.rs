@@ -125,6 +125,10 @@ impl ProcessManager {
         }
     }
 
+    pub(super) fn has_active_blockers(&self) -> bool {
+        self.blockers.load(std::sync::atomic::Ordering::SeqCst) > 0
+    }
+
     #[cfg(test)]
     pub(super) fn blocker_count(&self) -> usize {
         self.blockers.load(std::sync::atomic::Ordering::SeqCst)

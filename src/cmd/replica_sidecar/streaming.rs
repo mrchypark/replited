@@ -509,7 +509,7 @@ async fn refresh_wal_index(
         return Ok(());
     }
 
-    if let Some(pm) = process_manager {
+    if let Some(pm) = process_manager.filter(|pm| !pm.has_active_blockers()) {
         let recovery =
             checkpoint_with_managed_reader_recovery(db_path, pm, expected_frames).await?;
         let res_paused = recovery.paused;
@@ -545,6 +545,36 @@ async fn refresh_wal_index(
         return Ok(());
     }
     if checkpoint_covers_visible_frames(res_passive) {
+        refresh_state.stale_failures = 0;
+        refresh_state.stale_window_start = None;
+        return Ok(());
+    }
+
+    if let Some(pm) = process_manager {
+        let recovery =
+            checkpoint_with_managed_reader_recovery(db_path, pm, expected_frames).await?;
+        let res_paused = recovery.paused;
+        info!(
+            "ReplicaSidecar: WAL checkpoint PASSIVE after reader pause for {db_path}: {res_paused:?}"
+        );
+        if checkpoint_covers_expected_frames(res_paused, expected_frames)
+            || checkpoint_covers_visible_frames(res_paused)
+        {
+            refresh_state.stale_failures = 0;
+            refresh_state.stale_window_start = None;
+            return Ok(());
+        }
+
+        let res_retry = recovery.recovered;
+        info!("ReplicaSidecar: WAL checkpoint PASSIVE retry for {db_path}: {res_retry:?}");
+        if !checkpoint_covers_expected_frames(res_retry, expected_frames)
+            && !checkpoint_covers_visible_frames(res_retry)
+        {
+            return Err(ReplicaStreamError::Stream(
+                StreamReplicationErrorCode::SnapshotBoundaryMismatch,
+                "WAL-index refresh failed after recovery; replica requires restore".to_string(),
+            ));
+        }
         refresh_state.stale_failures = 0;
         refresh_state.stale_window_start = None;
         return Ok(());
@@ -1411,6 +1441,54 @@ mod tests {
             2,
             "managed reader should be restarted even when checkpoint already sees frames"
         );
+    }
+
+    #[tokio::test]
+    async fn refresh_does_not_restart_managed_reader_while_startup_blocker_is_active() {
+        let (temp_dir, db_path) = create_test_wal_db();
+        let starts_path = temp_dir.path().join("managed-reader-starts.log");
+        let conn = Connection::open(&db_path).expect("open sqlite db");
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .expect("set wal mode");
+        conn.execute("INSERT INTO t(v) VALUES ('catch-up visible frame')", [])
+            .expect("insert committed row");
+
+        let (_, expected_frames, _) = super::run_wal_checkpoint_passive(&db_path)
+            .await
+            .expect("checkpoint passive");
+        assert!(
+            expected_frames > 0,
+            "test setup should create visible WAL frames"
+        );
+
+        let cmd = format!("printf start >> '{}'; sleep 60", starts_path.display());
+        let process_manager = ProcessManager::new(cmd);
+        process_manager.start().await;
+        wait_for_start_count(&starts_path, 1).await;
+
+        let blocker = process_manager.block_reader().await;
+        assert_eq!(process_manager.blocker_count(), 1);
+
+        let mut state = WalRefreshState::new();
+        refresh_wal_index(
+            &db_path,
+            expected_frames as u32,
+            &mut state,
+            Some(&process_manager),
+        )
+        .await
+        .expect("startup-blocked reader should not force managed recovery");
+
+        let starts = fs::read_to_string(&starts_path).expect("read starts log");
+        assert_eq!(
+            starts.matches("start").count(),
+            1,
+            "reader should remain blocked during catch-up instead of restarting"
+        );
+
+        blocker.release().await;
+        wait_for_start_count(&starts_path, 2).await;
+        process_manager.stop().await;
     }
 
     #[tokio::test]
