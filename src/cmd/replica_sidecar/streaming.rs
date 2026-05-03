@@ -160,8 +160,8 @@ pub(super) async fn stream_wal_and_apply(
     replica_id: &str,
     session_id: &str,
     start_pos: WalGenerationPos,
-    checkpoint_frame_interval: u32,
-    checkpoint_interval_ms: u64,
+    _checkpoint_frame_interval: u32,
+    _checkpoint_interval_ms: u64,
     process_manager: Option<ProcessManager>,
 ) -> Result<WalGenerationPos, ReplicaStreamError> {
     let wal_path = format!("{db_path}-wal");
@@ -210,7 +210,6 @@ pub(super) async fn stream_wal_and_apply(
     let page_size = load_db_page_size(db_path).await?;
     let frame_size = WAL_FRAME_HEADER_SIZE + page_size;
     let mut frames_since_refresh: u32 = 0;
-    let mut last_refresh = Instant::now();
     let mut refresh_state = WalRefreshState::new();
     let mut suppress_ack = ack_floor.is_some();
     loop {
@@ -265,6 +264,18 @@ pub(super) async fn stream_wal_and_apply(
                 }
 
                 if chunk_start.index != current_wal_index {
+                    if frames_since_refresh > 0 && !suppress_ack {
+                        let expected_frames = expected_frames_from_wal_file(db_path, page_size)?;
+                        refresh_wal_index(
+                            db_path,
+                            expected_frames,
+                            &mut refresh_state,
+                            process_manager.as_ref(),
+                        )
+                        .await?;
+                        frames_since_refresh = 0;
+                    }
+
                     info!(
                         "ReplicaSidecar: WAL index advanced for {} ({} -> {}). Resetting local WAL.",
                         db_path, current_wal_index, chunk_start.index
@@ -304,21 +315,6 @@ pub(super) async fn stream_wal_and_apply(
                     }
                 }
 
-                let should_refresh = frames_since_refresh >= checkpoint_frame_interval
-                    || last_refresh.elapsed() >= Duration::from_millis(checkpoint_interval_ms);
-                if should_refresh && !suppress_ack {
-                    let expected_frames = expected_frames_from_wal_file(db_path, page_size)?;
-                    refresh_wal_index(
-                        db_path,
-                        expected_frames,
-                        &mut refresh_state,
-                        process_manager.as_ref(),
-                    )
-                    .await?;
-                    last_refresh = Instant::now();
-                    frames_since_refresh = 0;
-                }
-
                 // Best-effort ACK. Transport errors should not kill the replica.
                 // Explicit protocol errors must still propagate to trigger NeedsRestore.
                 if !suppress_ack {
@@ -337,17 +333,6 @@ pub(super) async fn stream_wal_and_apply(
                 ));
             }
         }
-    }
-
-    if frames_since_refresh > 0 && !suppress_ack {
-        let expected_frames = expected_frames_from_wal_file(db_path, page_size)?;
-        refresh_wal_index(
-            db_path,
-            expected_frames,
-            &mut refresh_state,
-            process_manager.as_ref(),
-        )
-        .await?;
     }
 
     Ok(current_pos)

@@ -187,30 +187,39 @@ mod tests {
     async fn stop_terminates_descendant_processes_spawned_by_shell_command() {
         let dir = tempdir().expect("tempdir");
         let pid_file = dir.path().join("child.pid");
-        let cmd = format!("sleep 60 & echo $! > {}; wait", pid_file.display());
+        let cmd = format!(
+            "sleep 60 & child=$!; printf '%s\\n' \"$child\" > '{}'; wait \"$child\"",
+            pid_file.display()
+        );
         let pm = ProcessManager::new(cmd);
 
         pm.start().await;
 
         let deadline = Instant::now() + Duration::from_secs(2);
-        while !pid_file.exists() && Instant::now() < deadline {
+        let mut child_pid = String::new();
+        while Instant::now() < deadline {
+            if let Ok(pid) = fs::read_to_string(&pid_file) {
+                let pid = pid.trim();
+                if !pid.is_empty() && process_is_alive(pid) {
+                    child_pid = pid.to_string();
+                    break;
+                }
+            }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        let child_pid = fs::read_to_string(&pid_file).expect("child pid file");
-        let child_pid = child_pid.trim();
         assert!(
-            process_is_alive(child_pid),
+            !child_pid.is_empty(),
             "test child should be running before stop"
         );
 
         pm.stop().await;
 
         let deadline = Instant::now() + Duration::from_secs(2);
-        while process_is_alive(child_pid) && Instant::now() < deadline {
+        while process_is_alive(&child_pid) && Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert!(
-            !process_is_alive(child_pid),
+            !process_is_alive(&child_pid),
             "stop should terminate shell descendants, pid={child_pid}"
         );
     }
