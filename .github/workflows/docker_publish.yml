@@ -64,6 +64,14 @@ jobs:
           test -s artifacts/replited-linux-amd64
           test -s artifacts/replited-linux-arm64
 
+          file artifacts/replited-linux-amd64 artifacts/replited-linux-arm64
+          for artifact in artifacts/replited-linux-amd64 artifacts/replited-linux-arm64; do
+            if ! file "${artifact}" | grep -Eq 'statically linked|static-pie linked'; then
+              echo "${artifact} must be static so the Docker image binary can be reused in Alpine app containers" >&2
+              exit 1
+            fi
+          done
+
           cp artifacts/replited-linux-amd64 docker-context/replited-amd64
           cp artifacts/replited-linux-arm64 docker-context/replited-arm64
           chmod +x docker-context/replited-*

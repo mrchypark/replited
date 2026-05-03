@@ -18,10 +18,10 @@ jobs:
       matrix:
         include:
           # Linux
-          - target: x86_64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-musl
             os: ubuntu-24.04
             name: linux-amd64
-          - target: aarch64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-musl
             os: ubuntu-24.04
             name: linux-arm64
           # macOS
@@ -50,22 +50,28 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+          sudo apt-get install -y protobuf-compiler file
+
+      - name: Install musl tools (Linux AMD64)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
 
       - name: Install protoc (macOS)
         if: runner.os == 'macOS'
         run: brew install protobuf
 
-      - name: Install cross (Linux ARM64)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+      - name: Install cross (Linux ARM64 musl)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
         run: cargo install cross --git https://github.com/cross-rs/cross
 
-      - name: Build with cross (Linux ARM64)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
+      - name: Build with cross (Linux ARM64 musl)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
         run: cross build --release --target ${{ matrix.target }}
 
       - name: Build with cargo (other targets)
-        if: matrix.target != 'aarch64-unknown-linux-gnu'
+        if: matrix.target != 'aarch64-unknown-linux-musl'
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Prepare artifact
@@ -73,6 +79,15 @@ jobs:
           mkdir -p dist
           cp target/${{ matrix.target }}/release/replited dist/replited-${{ matrix.name }}
           chmod +x dist/replited-${{ matrix.name }}
+
+      - name: Verify Linux artifact is static
+        if: runner.os == 'Linux'
+        run: |
+          file dist/replited-${{ matrix.name }}
+          if ! file dist/replited-${{ matrix.name }} | grep -Eq 'statically linked|static-pie linked'; then
+            echo "Linux release artifact must be static so it can run in Alpine app containers" >&2
+            exit 1
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
