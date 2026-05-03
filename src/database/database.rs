@@ -356,9 +356,15 @@ impl Database {
     // copies pending bytes from the real WAL to the shadow WAL.
     fn sync_wal(&mut self, info: &SyncInfo) -> Result<(u64, u64)> {
         self.acquire_read_lock()?;
-        let result = self.copy_to_shadow_wal(&info.shadow_wal_file);
-        self.release_read_lock()?;
-        let (orig_size, new_size) = result?;
+        let copy_result = self.copy_to_shadow_wal(&info.shadow_wal_file);
+        let release_result = self.release_read_lock();
+        let (orig_size, new_size) = match (copy_result, release_result) {
+            (Ok(v), Ok(())) => v,
+            (Ok(_), Err(e)) => return Err(e),
+            (Err(e), Ok(())) => return Err(e),
+            (Err(e), Err(_)) => return Err(e),
+        };
+        self.acquire_read_lock()?;
         debug!(
             "db {} sync_wal copy_to_shadow_wal: {}, {}",
             self.config.db, orig_size, new_size
@@ -1234,6 +1240,46 @@ root = "{backup_root}"
             }
             other => panic!("expected DbChanged notification, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn sync_keeps_read_lock_after_archiving_wal() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("primary.db");
+        let backup_root = dir.path().join("backup");
+
+        let config = replica_notification_fixture(
+            db_path.to_string_lossy().as_ref(),
+            backup_root.to_string_lossy().as_ref(),
+        );
+
+        let (mut db, _rx) = Database::try_create(config).await.expect("create db");
+        db.connection
+            .execute(
+                "CREATE TABLE IF NOT EXISTS sync_keeps_read_lock (id INTEGER PRIMARY KEY, value TEXT NOT NULL)",
+                (),
+            )
+            .expect("create test table");
+
+        {
+            let external = rusqlite::Connection::open(&db.config.db).expect("external open");
+            external
+                .pragma_update(None, "journal_mode", "WAL")
+                .expect("external WAL mode");
+            external
+                .execute(
+                    "INSERT INTO sync_keeps_read_lock (value) VALUES ('after-sync')",
+                    (),
+                )
+                .expect("external write");
+        }
+
+        db.sync().await.expect("sync external writer WAL");
+
+        assert!(
+            db.tx_connection.is_some(),
+            "sync should restore the steady-state read lock after copying WAL"
+        );
     }
 
     #[tokio::test]
