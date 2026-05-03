@@ -38,7 +38,6 @@ reqwest = { version = "0.12", default-features = false, features = [
   "rustls-tls",
   "rustls-tls-native-roots",
 ] }
-reqwest-hickory-resolver = "0.1"
 rusqlite = { version = "0.38.0", features = ["bundled"] }
 serde = { version = "1.0.164", features = ["derive", "rc"] }
 serde_json = "1.0"
