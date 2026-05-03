@@ -168,12 +168,13 @@ pub(super) async fn stream_wal_and_apply(
     let mut effective_start_pos = start_pos.clone();
     let mut ack_floor: Option<WalGenerationPos> = None;
     if effective_start_pos.offset != 0 {
-        let wal_needs_header = match fs::metadata(&wal_path) {
-            Ok(meta) => meta.len() < WAL_HEADER_SIZE,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+        let wal_len = match fs::metadata(&wal_path) {
+            Ok(meta) => Some(meta.len()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
             Err(err) => return Err(ReplicaStreamError::Io(err.to_string())),
         };
-        if wal_needs_header {
+        let needs_rewind = local_wal_needs_rewind(wal_len, effective_start_pos.offset);
+        if needs_rewind {
             if seed_wal_header_from_shadow(db_path, &effective_start_pos)? {
                 info!(
                     "ReplicaSidecar: seeded WAL header for {} from shadow wal at {}:{}:{}",
@@ -184,7 +185,7 @@ pub(super) async fn stream_wal_and_apply(
                 );
             } else {
                 info!(
-                    "ReplicaSidecar: WAL header missing for {} at offset {}; rewinding stream to 0 (expected on cold start or after WAL cleanup)",
+                    "ReplicaSidecar: local WAL missing or shorter than resume offset for {} at offset {}; rewinding stream to 0 (expected on cold start or after WAL cleanup)",
                     db_path, effective_start_pos.offset
                 );
             }
@@ -414,6 +415,16 @@ fn expected_frames_from_wal_file(db_path: &str, page_size: u64) -> Result<u32, R
         return Ok(0);
     }
     Ok(((wal_size - WAL_HEADER_SIZE) / frame_size) as u32)
+}
+
+fn local_wal_needs_rewind(wal_len: Option<u64>, resume_offset: u64) -> bool {
+    if resume_offset == 0 {
+        return false;
+    }
+    match wal_len {
+        Some(len) => len < resume_offset,
+        None => true,
+    }
 }
 
 struct WalRefreshState {
@@ -931,7 +942,7 @@ mod tests {
     use crate::base::Generation;
     use crate::cmd::replica_sidecar::process_manager::ProcessManager;
     use crate::database::WalGenerationPos;
-    use crate::sqlite::WAL_FRAME_HEADER_SIZE;
+    use crate::sqlite::{WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE};
     use crate::sync::StreamReplicationErrorCode;
     use crate::sync::replication::SnapshotMeta;
     use rusqlite::Connection;
@@ -1122,6 +1133,17 @@ mod tests {
             !fs::exists(&wal_path).expect("stat wal"),
             "expected local WAL to be reset after invalid lsn"
         );
+    }
+
+    #[test]
+    fn local_wal_needs_rewind_when_resume_offset_is_beyond_local_file_length() {
+        assert!(super::local_wal_needs_rewind(None, 259_592));
+        assert!(super::local_wal_needs_rewind(
+            Some(WAL_HEADER_SIZE),
+            259_592
+        ));
+        assert!(!super::local_wal_needs_rewind(Some(259_592), 259_592));
+        assert!(!super::local_wal_needs_rewind(Some(0), 0));
     }
 
     #[tokio::test]

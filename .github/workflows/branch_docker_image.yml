@@ -33,7 +33,6 @@ jobs:
           images: ghcr.io/mrchypark/replited
           tags: |
             type=raw,value=replica-fix-${{ github.sha }}
-            type=raw,value=replica-fix-${{ github.sha_short }}
 
       - name: Build and push linux/amd64 image
         uses: docker/build-push-action@v6
