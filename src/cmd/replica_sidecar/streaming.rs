@@ -483,6 +483,12 @@ async fn refresh_wal_index(
         return Ok(());
     }
 
+    if res_passive.1 > 0 {
+        refresh_state.stale_failures = 0;
+        refresh_state.stale_window_start = None;
+        return Ok(());
+    }
+
     update_stale_window(refresh_state);
     if should_log(&mut refresh_state.last_stale_log, STALE_LOG_INTERVAL) {
         warn!(
@@ -925,10 +931,12 @@ mod tests {
     use crate::base::Generation;
     use crate::cmd::replica_sidecar::process_manager::ProcessManager;
     use crate::database::WalGenerationPos;
+    use crate::sqlite::WAL_FRAME_HEADER_SIZE;
     use crate::sync::StreamReplicationErrorCode;
     use crate::sync::replication::SnapshotMeta;
     use rusqlite::Connection;
     use std::fs;
+    use std::io::Write;
     use tempfile::TempDir;
 
     fn base_meta() -> SnapshotMeta {
@@ -1133,6 +1141,60 @@ mod tests {
                 .is_ok()
         );
         assert_eq!(state.stale_failures, 2);
+    }
+
+    #[tokio::test]
+    async fn refresh_tolerates_committed_prefix_when_wal_file_has_extra_tail_frames() {
+        let (temp_dir, db_path) = create_test_wal_db();
+        let conn = Connection::open(&db_path).expect("open sqlite db");
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .expect("set wal mode");
+        conn.execute("INSERT INTO t(v) VALUES ('committed')", [])
+            .expect("insert committed row");
+
+        let page_size_i64: i64 = conn
+            .pragma_query_value(None, "page_size", |row| row.get(0))
+            .expect("read page_size");
+        let page_size = u64::try_from(page_size_i64).expect("valid page size");
+        let frame_size = WAL_FRAME_HEADER_SIZE + page_size;
+        let (_, observed_frames, _) = super::run_wal_checkpoint_passive(&db_path)
+            .await
+            .expect("checkpoint passive");
+        assert!(
+            observed_frames > 0,
+            "test setup should create visible WAL frames"
+        );
+
+        let wal_path = format!("{db_path}-wal");
+        let mut wal = fs::OpenOptions::new()
+            .append(true)
+            .open(&wal_path)
+            .expect("open wal");
+        wal.write_all(&vec![0; frame_size as usize])
+            .expect("append tail frame");
+        wal.sync_all().expect("sync wal");
+
+        let expected_frames = super::expected_frames_from_wal_file(&db_path, page_size)
+            .expect("expected frame count");
+        assert!(
+            expected_frames > observed_frames as u32,
+            "test setup should make file-derived frames exceed SQLite-visible frames"
+        );
+
+        let mut state = WalRefreshState::new();
+        let process_manager = ProcessManager::new(String::new());
+        refresh_wal_index(
+            &db_path,
+            expected_frames,
+            &mut state,
+            Some(&process_manager),
+        )
+        .await
+        .expect("extra WAL tail frames should not require restore");
+        assert_eq!(state.stale_failures, 0);
+
+        drop(conn);
+        drop(temp_dir);
     }
 
     #[tokio::test]

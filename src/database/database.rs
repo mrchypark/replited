@@ -290,13 +290,20 @@ impl Database {
         // notify the database has been changed
         if changed {
             let generation_pos = self.wal_generation_position()?;
-            for notifier in &self.sync_notifiers {
-                let Some(notifier) = notifier else {
+            for notifier_slot in &mut self.sync_notifiers {
+                let Some(notifier) = notifier_slot else {
                     continue;
                 };
-                notifier
+                if let Err(err) = notifier
                     .send(ReplicateCommand::DbChanged(generation_pos.clone()))
-                    .await?;
+                    .await
+                {
+                    warn!(
+                        "db {} replicate notifier closed; disabling notifier: {}",
+                        self.config.db, err
+                    );
+                    *notifier_slot = None;
+                }
             }
         }
 
@@ -1215,5 +1222,36 @@ root = "{backup_root}"
         db.sync()
             .await
             .expect("follow-up sync should keep working after WAL recovery");
+    }
+
+    #[tokio::test]
+    async fn sync_keeps_working_when_a_non_stream_replicate_worker_has_stopped() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("primary.db");
+        let backup_root = dir.path().join("backup");
+
+        let config = replica_notification_fixture(
+            db_path.to_string_lossy().as_ref(),
+            backup_root.to_string_lossy().as_ref(),
+        );
+
+        let (mut db, _rx) = Database::try_create(config).await.expect("create db");
+        db.connection
+            .execute(
+                "CREATE TABLE IF NOT EXISTS closed_notifier (id INTEGER PRIMARY KEY, value TEXT NOT NULL)",
+                (),
+            )
+            .expect("create test table");
+        db.connection
+            .execute("INSERT INTO closed_notifier (value) VALUES ('first')", ())
+            .expect("seed row");
+
+        let (closed_tx, closed_rx) = tokio::sync::mpsc::channel(1);
+        drop(closed_rx);
+        db.sync_notifiers = vec![Some(closed_tx)];
+
+        db.sync()
+            .await
+            .expect("closed replicate notifier should not fail database sync");
     }
 }

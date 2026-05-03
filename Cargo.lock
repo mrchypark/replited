@@ -2441,6 +2441,7 @@ dependencies = [
  "chrono",
  "clap",
  "jiff",
+ "libc",
  "log",
  "logforth",
  "lz4",

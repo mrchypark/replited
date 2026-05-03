@@ -37,6 +37,10 @@ impl ProcessManager {
 
         let mut command = tokio::process::Command::new("sh");
         command.arg("-c").arg(&self.cmd);
+        #[cfg(unix)]
+        {
+            command.process_group(0);
+        }
 
         // Inherit stdout/stderr allowing logs to show up in replited output.
         command.stdout(Stdio::inherit());
@@ -57,7 +61,20 @@ impl ProcessManager {
         let mut child_lock = self.child.lock().await;
         if let Some(mut child) = child_lock.take() {
             info!("ProcessManager: Stopping child process...");
-            // TODO: Graceful shutdown if needed.
+            #[cfg(unix)]
+            if let Some(pid) = child.id() {
+                let pgid = -(pid as libc::pid_t);
+                // The exec command is shell-owned, so kill the whole process group to avoid
+                // leaving the managed reader bound to ports or holding SQLite files open.
+                unsafe {
+                    libc::kill(pgid, libc::SIGTERM);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                unsafe {
+                    libc::kill(pgid, libc::SIGKILL);
+                }
+            }
+
             let _ = child.kill().await;
             let _ = child.wait().await;
             info!("ProcessManager: Child process stopped.");
@@ -142,5 +159,59 @@ impl Drop for ReaderBlocker {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    use tempfile::tempdir;
+
+    use super::ProcessManager;
+
+    fn process_is_alive(pid: &str) -> bool {
+        Command::new("kill")
+            .arg("-0")
+            .arg(pid)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    #[tokio::test]
+    async fn stop_terminates_descendant_processes_spawned_by_shell_command() {
+        let dir = tempdir().expect("tempdir");
+        let pid_file = dir.path().join("child.pid");
+        let cmd = format!("sleep 60 & echo $! > {}; wait", pid_file.display());
+        let pm = ProcessManager::new(cmd);
+
+        pm.start().await;
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !pid_file.exists() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let child_pid = fs::read_to_string(&pid_file).expect("child pid file");
+        let child_pid = child_pid.trim();
+        assert!(
+            process_is_alive(child_pid),
+            "test child should be running before stop"
+        );
+
+        pm.stop().await;
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while process_is_alive(child_pid) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            !process_is_alive(child_pid),
+            "stop should terminate shell descendants, pid={child_pid}"
+        );
     }
 }
