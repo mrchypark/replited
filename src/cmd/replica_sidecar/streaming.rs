@@ -479,23 +479,36 @@ async fn refresh_wal_index(
         return Ok(());
     }
 
-    if checkpoint_needs_reader_quiesce(res_passive, expected_frames) {
-        if let Some(pm) = process_manager {
-            if should_log(&mut refresh_state.last_recovery_log, RECOVERY_LOG_INTERVAL) {
-                warn!(
-                    "ReplicaSidecar: WAL checkpoint incomplete for {db_path}: {res_passive:?}. Pausing managed reader."
-                );
-            }
-            let res_retry = checkpoint_with_managed_reader_paused(db_path, pm, false).await?;
-            info!(
-                "ReplicaSidecar: WAL checkpoint PASSIVE after reader pause for {db_path}: {res_retry:?}"
+    if let Some(pm) = process_manager {
+        if should_log(&mut refresh_state.last_recovery_log, RECOVERY_LOG_INTERVAL) {
+            warn!(
+                "ReplicaSidecar: WAL checkpoint incomplete for {db_path}: {res_passive:?}. Pausing managed reader."
             );
-            if checkpoint_covers_expected_frames(res_retry, expected_frames) {
-                refresh_state.stale_failures = 0;
-                refresh_state.stale_window_start = None;
-                return Ok(());
-            }
         }
+        let res_retry = checkpoint_with_managed_reader_paused(db_path, pm, false).await?;
+        info!(
+            "ReplicaSidecar: WAL checkpoint PASSIVE after reader pause for {db_path}: {res_retry:?}"
+        );
+        if checkpoint_covers_expected_frames(res_retry, expected_frames) {
+            refresh_state.stale_failures = 0;
+            refresh_state.stale_window_start = None;
+            return Ok(());
+        }
+
+        if should_log(&mut refresh_state.last_recovery_log, RECOVERY_LOG_INTERVAL) {
+            warn!("ReplicaSidecar: WAL-index still stale for {db_path}. Triggering SHM recovery.");
+        }
+        let res_retry = checkpoint_with_managed_reader_paused(db_path, pm, true).await?;
+        info!("ReplicaSidecar: WAL checkpoint PASSIVE retry for {db_path}: {res_retry:?}");
+        if !checkpoint_covers_expected_frames(res_retry, expected_frames) {
+            return Err(ReplicaStreamError::Stream(
+                StreamReplicationErrorCode::SnapshotBoundaryMismatch,
+                "WAL-index refresh failed after recovery; replica requires restore".to_string(),
+            ));
+        }
+        refresh_state.stale_failures = 0;
+        refresh_state.stale_window_start = None;
+        return Ok(());
     }
 
     update_stale_window(refresh_state);
@@ -520,23 +533,6 @@ async fn refresh_wal_index(
         }
     }
 
-    if let Some(pm) = process_manager {
-        if should_log(&mut refresh_state.last_recovery_log, RECOVERY_LOG_INTERVAL) {
-            warn!("ReplicaSidecar: WAL-index still stale for {db_path}. Triggering SHM recovery.");
-        }
-        let res_retry = checkpoint_with_managed_reader_paused(db_path, pm, true).await?;
-        info!("ReplicaSidecar: WAL checkpoint PASSIVE retry for {db_path}: {res_retry:?}");
-        if !checkpoint_covers_expected_frames(res_retry, expected_frames) {
-            return Err(ReplicaStreamError::Stream(
-                StreamReplicationErrorCode::SnapshotBoundaryMismatch,
-                "WAL-index refresh failed after recovery; replica requires restore".to_string(),
-            ));
-        }
-        refresh_state.stale_failures = 0;
-        refresh_state.stale_window_start = None;
-        return Ok(());
-    }
-
     refresh_state.stale_failures = refresh_state.stale_failures.saturating_add(1);
     if refresh_state.stale_failures < STALE_THRESHOLD {
         return Ok(());
@@ -554,6 +550,7 @@ fn checkpoint_covers_expected_frames(result: (i32, i32, i32), expected_frames: u
     result.0 == 0 && (result.1 as u32) >= expected_frames && (result.2 as u32) >= expected_frames
 }
 
+#[cfg(test)]
 fn checkpoint_needs_reader_quiesce(result: (i32, i32, i32), expected_frames: u32) -> bool {
     result.0 != 0
         || ((result.1 as u32) >= expected_frames && (result.2 as u32) < expected_frames)
