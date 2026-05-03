@@ -485,7 +485,9 @@ async fn refresh_wal_index(
                 "ReplicaSidecar: WAL checkpoint incomplete for {db_path}: {res_passive:?}. Pausing managed reader."
             );
         }
-        let res_retry = checkpoint_with_managed_reader_paused(db_path, pm, false).await?;
+        let recovery =
+            checkpoint_with_managed_reader_recovery(db_path, pm, expected_frames).await?;
+        let res_retry = recovery.paused;
         info!(
             "ReplicaSidecar: WAL checkpoint PASSIVE after reader pause for {db_path}: {res_retry:?}"
         );
@@ -495,10 +497,7 @@ async fn refresh_wal_index(
             return Ok(());
         }
 
-        if should_log(&mut refresh_state.last_recovery_log, RECOVERY_LOG_INTERVAL) {
-            warn!("ReplicaSidecar: WAL-index still stale for {db_path}. Triggering SHM recovery.");
-        }
-        let res_retry = checkpoint_with_managed_reader_paused(db_path, pm, true).await?;
+        let res_retry = recovery.recovered;
         info!("ReplicaSidecar: WAL checkpoint PASSIVE retry for {db_path}: {res_retry:?}");
         if !checkpoint_covers_expected_frames(res_retry, expected_frames) {
             return Err(ReplicaStreamError::Stream(
@@ -591,23 +590,35 @@ fn invalidate_shm_header(db_path: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-async fn checkpoint_with_managed_reader_paused(
+struct ManagedCheckpointRecovery {
+    paused: (i32, i32, i32),
+    recovered: (i32, i32, i32),
+}
+
+async fn checkpoint_with_managed_reader_recovery(
     db_path: &str,
     process_manager: &ProcessManager,
-    remove_shm: bool,
-) -> Result<(i32, i32, i32), ReplicaStreamError> {
+    expected_frames: u32,
+) -> Result<ManagedCheckpointRecovery, ReplicaStreamError> {
     process_manager.add_blocker().await;
 
     let result = async {
-        if remove_shm {
-            let shm_path = format!("{db_path}-shm");
-            match fs::remove_file(&shm_path) {
-                Ok(()) => Ok(()),
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(err) => Err(ReplicaStreamError::Io(err.to_string())),
-            }?;
+        let paused = run_wal_checkpoint_passive(db_path).await?;
+        if checkpoint_covers_expected_frames(paused, expected_frames) {
+            return Ok(ManagedCheckpointRecovery {
+                paused,
+                recovered: paused,
+            });
         }
-        run_wal_checkpoint_passive(db_path).await
+
+        let shm_path = format!("{db_path}-shm");
+        match fs::remove_file(&shm_path) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(ReplicaStreamError::Io(err.to_string())),
+        }?;
+        let recovered = run_wal_checkpoint_passive(db_path).await?;
+        Ok(ManagedCheckpointRecovery { paused, recovered })
     };
 
     let checkpoint_result = result.await;

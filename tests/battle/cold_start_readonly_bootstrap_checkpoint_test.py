@@ -49,6 +49,7 @@ class ScenarioResult:
     errors: list[str]
     primary_digest: str | None = None
     replica_digest: str | None = None
+    diagnostics: list[str] | None = None
 
 
 def stop_process(proc: Proc | None) -> None:
@@ -280,10 +281,51 @@ def scan_log_errors(log_paths: list[Path]) -> list[str]:
     return errors
 
 
+DIAGNOSTIC_MARKERS = [
+    "WAL checkpoint",
+    "WAL index advanced",
+    "WAL-index",
+    "Stale WAL-index",
+    "ProcessManager",
+    "InvalidLsn",
+    "ack regression",
+    "disk I/O error",
+    "SnapshotBoundaryMismatch",
+    "LineageMismatch",
+    "WAL Stuck",
+    "ReplicaSidecar error",
+]
+
+
+def diagnostic_log_excerpt(log_path: Path, max_lines: int = 80) -> str | None:
+    if not log_path.exists():
+        return None
+    lines = log_path.read_text(errors="ignore").splitlines()
+    matches: list[str] = []
+    for lineno, line in enumerate(lines, start=1):
+        if any(marker in line for marker in DIAGNOSTIC_MARKERS):
+            matches.append(f"{log_path}:{lineno}: {line}")
+    if len(matches) > max_lines:
+        matches = matches[-max_lines:]
+    if not matches:
+        tail = lines[-min(40, len(lines)) :]
+        matches = [f"{log_path}:tail: {line}" for line in tail]
+    return "\n".join(matches)
+
+
+def collect_diagnostics(log_paths: list[Path]) -> list[str]:
+    excerpts: list[str] = []
+    for log_path in log_paths:
+        excerpt = diagnostic_log_excerpt(log_path)
+        if excerpt:
+            excerpts.append(excerpt)
+    return excerpts
+
+
 def run_scenario() -> ScenarioResult:
     env = TestEnv("cold_start_readonly_bootstrap_checkpoint")
     env.setup()
-    result = ScenarioResult(success=False, errors=[])
+    result = ScenarioResult(success=False, errors=[], diagnostics=[])
     port = get_free_port()
 
     primary: Proc | None = None
@@ -329,17 +371,16 @@ def run_scenario() -> ScenarioResult:
             result.errors.append(f"Replica integrity_check failed: {replica_integrity}")
 
         time.sleep(2)
-        result.errors.extend(
-            scan_log_errors(
-                [
-                    env.root / "primary.log",
-                    replica.log_path,
-                    replica_dir / "logs" / "replited.log",
-                    replica_dir / "reader.error",
-                ]
-            )
-        )
+        log_paths = [
+            env.root / "primary.log",
+            replica.log_path,
+            replica_dir / "logs" / "replited.log",
+            replica_dir / "reader.error",
+        ]
+        result.errors.extend(scan_log_errors(log_paths))
         result.success = not result.errors
+        if not result.success:
+            result.diagnostics = collect_diagnostics(log_paths)
         return result
     finally:
         stop_process(replica)
@@ -357,6 +398,10 @@ def print_result(result: ScenarioResult) -> bool:
         print("Errors:")
         for error in result.errors:
             print(f"  - {error}")
+    if result.diagnostics:
+        print("Diagnostics:")
+        for excerpt in result.diagnostics:
+            print(excerpt)
     print("=" * 72)
     return result.success
 
