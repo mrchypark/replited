@@ -800,6 +800,59 @@ impl Database {
         Ok(())
     }
 
+    fn reopen_connection(&mut self) -> Result<()> {
+        let connection = Connection::open(&self.config.db)?;
+        Database::init_params(&self.config.db, &connection)?;
+        Database::create_internal_tables(&connection)?;
+        self.connection = connection;
+        Ok(())
+    }
+
+    fn write_wal_anchor(&mut self) -> Result<()> {
+        let _ = self
+            .connection
+            .pragma_update_and_check(None, "journal_mode", "WAL", |_| Ok(()));
+        let tx = self.connection.transaction()?;
+        tx.execute(
+            "INSERT INTO _replited_seq (id, seq) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET seq = seq + 1;",
+            (),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn refresh_wal_anchor(&mut self) -> Result<()> {
+        self.release_read_lock()?;
+
+        let mut write_result = self.write_wal_anchor();
+        if let Err(err) = &write_result {
+            warn!(
+                "db {} WAL anchor write failed; reopening connection before retrying: {:?}",
+                self.config.db, err
+            );
+            write_result = self
+                .reopen_connection()
+                .and_then(|_| self.write_wal_anchor());
+        }
+
+        let mut reacquire_result = self.acquire_read_lock();
+        if let Err(err) = &reacquire_result {
+            warn!(
+                "db {} WAL read lock failed after anchor write; reopening connection before retrying: {:?}",
+                self.config.db, err
+            );
+            reacquire_result = self
+                .reopen_connection()
+                .and_then(|_| self.acquire_read_lock());
+        }
+        match (write_result, reacquire_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Ok(()), Err(e)) => Err(e),
+            (Err(e), Ok(())) => Err(e),
+            (Err(e), Err(_)) => Err(e),
+        }
+    }
+
     fn debug_assert_shadow_wal_matches_live(
         &self,
         _shadow_wal: &str,
@@ -839,18 +892,32 @@ impl Database {
                 }
 
                 if stat.len() >= WAL_HEADER_SIZE {
-                    return Ok(true);
+                    match WALHeader::read(&self.wal_file) {
+                        Ok(header) if header.page_size == self.page_size => return Ok(true),
+                        Ok(header) => warn!(
+                            "db {} WAL header page size {} does not match database page size {}; refreshing WAL anchor",
+                            self.config.db, header.page_size, self.page_size
+                        ),
+                        Err(err) => warn!(
+                            "db {} WAL header is invalid; refreshing WAL anchor: {:?}",
+                            self.config.db, err
+                        ),
+                    }
                 }
             }
 
-            // Ensure WAL mode and force a write to create the WAL header.
-            let _ =
-                self.connection
-                    .pragma_update_and_check(None, "journal_mode", "WAL", |_| Ok(()));
-            self.connection.execute(
-                "INSERT INTO _replited_seq (id, seq) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET seq = seq + 1;",
-                (),
-            )?;
+            // The current read transaction may be anchored before future writer frames.
+            // Refresh it around a forced write so the next sync protects the latest WAL end.
+            if let Err(err) = self.refresh_wal_anchor() {
+                if self.has_generation_recovery_context() {
+                    warn!(
+                        "db {} WAL anchor refresh failed; waiting for next writer before syncing: {:?}",
+                        self.config.db, err
+                    );
+                    return Ok(false);
+                }
+                return Err(err);
+            }
             sleep(Duration::from_millis(50)).await;
         }
 
@@ -1279,6 +1346,38 @@ root = "{backup_root}"
         assert!(
             db.tx_connection.is_some(),
             "sync should restore the steady-state read lock after copying WAL"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_wal_exists_recreates_missing_wal_and_keeps_read_lock() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("primary.db");
+        let backup_root = dir.path().join("backup");
+
+        let config = replica_notification_fixture(
+            db_path.to_string_lossy().as_ref(),
+            backup_root.to_string_lossy().as_ref(),
+        );
+
+        let (mut db, _rx) = Database::try_create(config).await.expect("create db");
+        db.snapshot().await.expect("create generation");
+
+        db.release_read_lock().expect("release read lock");
+        db.connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("checkpoint WAL");
+        db.acquire_read_lock().expect("reacquire read lock");
+
+        assert!(db.ensure_wal_exists().await.expect("ensure WAL exists"));
+
+        assert!(
+            std::fs::metadata(&db.wal_file).expect("WAL metadata").len() >= super::WAL_HEADER_SIZE,
+            "ensure_wal_exists should recreate a WAL header"
+        );
+        assert!(
+            db.tx_connection.is_some(),
+            "ensure_wal_exists should leave the steady-state read lock in place"
         );
     }
 
