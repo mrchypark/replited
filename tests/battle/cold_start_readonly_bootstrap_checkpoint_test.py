@@ -198,6 +198,7 @@ def initialize_primary(db_path: Path) -> None:
     cursor = conn.cursor()
     cursor.execute("PRAGMA journal_mode=WAL")
     cursor.execute("PRAGMA busy_timeout=5000")
+    cursor.execute("PRAGMA wal_autocheckpoint=100000")
     cursor.execute(
         f"""
         CREATE TABLE IF NOT EXISTS {TABLE_NAME} (
@@ -216,6 +217,7 @@ def write_rows(db_path: Path, start: int, count: int, payload_size: int) -> None
     cursor = conn.cursor()
     cursor.execute("PRAGMA journal_mode=WAL")
     cursor.execute("PRAGMA busy_timeout=5000")
+    cursor.execute("PRAGMA wal_autocheckpoint=100000")
     for sequence in range(start, start + count):
         cursor.execute(
             f"INSERT OR REPLACE INTO {TABLE_NAME} (sequence, payload) VALUES (?, ?)",
