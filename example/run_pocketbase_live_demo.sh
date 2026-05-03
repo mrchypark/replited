@@ -23,6 +23,7 @@ ADMIN_EMAIL="${POCKETBASE_ADMIN_EMAIL:-test@example.com}"
 ADMIN_PASS="${POCKETBASE_ADMIN_PASS:-password123456}"
 POCKETBASE_VERSION="${POCKETBASE_VERSION:-0.36.9}"
 POCKETBASE_BIN="${POCKETBASE_BIN:-$BIN_DIR/pocketbase}"
+DEFAULT_POCKETBASE_BIN="$BIN_DIR/pocketbase"
 REPLITED_BIN="${REPLITED_BIN:-$ROOT_DIR/target/release/replited}"
 DEMO_HOLD="${DEMO_HOLD:-1}"
 
@@ -62,7 +63,15 @@ detect_asset_name() {
 
 ensure_pocketbase() {
   if [[ -x "$POCKETBASE_BIN" ]]; then
-    return
+    local actual_version
+    actual_version="$("$POCKETBASE_BIN" --version 2>/dev/null || true)"
+    if [[ "$actual_version" == *"pocketbase version $POCKETBASE_VERSION"* ]]; then
+      return
+    fi
+    if [[ "$POCKETBASE_BIN" != "$DEFAULT_POCKETBASE_BIN" ]]; then
+      echo "PocketBase binary version mismatch: expected $POCKETBASE_VERSION, got: ${actual_version:-unknown}" >&2
+      exit 1
+    fi
   fi
 
   require_cmd curl
