@@ -469,20 +469,33 @@ async fn refresh_wal_index(
     if should_log(&mut refresh_state.last_refresh_log, REFRESH_LOG_INTERVAL) {
         info!("ReplicaSidecar: WAL checkpoint PASSIVE for {db_path}: {res_passive:?}");
     }
-    if expected_frames == 0 || res_passive.0 != 0 {
+    if expected_frames == 0 {
         return Ok(());
     }
 
-    if (res_passive.1 as u32) >= expected_frames {
+    if checkpoint_covers_expected_frames(res_passive, expected_frames) {
         refresh_state.stale_failures = 0;
         refresh_state.stale_window_start = None;
         return Ok(());
     }
 
-    if res_passive.1 > 0 {
-        refresh_state.stale_failures = 0;
-        refresh_state.stale_window_start = None;
-        return Ok(());
+    if checkpoint_needs_reader_quiesce(res_passive, expected_frames) {
+        if let Some(pm) = process_manager {
+            if should_log(&mut refresh_state.last_recovery_log, RECOVERY_LOG_INTERVAL) {
+                warn!(
+                    "ReplicaSidecar: WAL checkpoint incomplete for {db_path}: {res_passive:?}. Pausing managed reader."
+                );
+            }
+            let res_retry = checkpoint_with_managed_reader_paused(db_path, pm, false).await?;
+            info!(
+                "ReplicaSidecar: WAL checkpoint PASSIVE after reader pause for {db_path}: {res_retry:?}"
+            );
+            if checkpoint_covers_expected_frames(res_retry, expected_frames) {
+                refresh_state.stale_failures = 0;
+                refresh_state.stale_window_start = None;
+                return Ok(());
+            }
+        }
     }
 
     update_stale_window(refresh_state);
@@ -500,21 +513,20 @@ async fn refresh_wal_index(
                 "ReplicaSidecar: WAL checkpoint PASSIVE after SHM refresh for {db_path}: {res_retry:?}"
             );
         }
-        if (res_retry.1 as u32) >= expected_frames {
+        if checkpoint_covers_expected_frames(res_retry, expected_frames) {
             refresh_state.stale_failures = 0;
             refresh_state.stale_window_start = None;
             return Ok(());
         }
     }
 
-    if process_manager.is_some() {
+    if let Some(pm) = process_manager {
         if should_log(&mut refresh_state.last_recovery_log, RECOVERY_LOG_INTERVAL) {
             warn!("ReplicaSidecar: WAL-index still stale for {db_path}. Triggering SHM recovery.");
         }
-        recover_stale_shm(db_path, process_manager).await?;
-        let res_retry = run_wal_checkpoint_passive(db_path).await?;
+        let res_retry = checkpoint_with_managed_reader_paused(db_path, pm, true).await?;
         info!("ReplicaSidecar: WAL checkpoint PASSIVE retry for {db_path}: {res_retry:?}");
-        if (res_retry.1 as u32) < expected_frames {
+        if !checkpoint_covers_expected_frames(res_retry, expected_frames) {
             return Err(ReplicaStreamError::Stream(
                 StreamReplicationErrorCode::SnapshotBoundaryMismatch,
                 "WAL-index refresh failed after recovery; replica requires restore".to_string(),
@@ -536,6 +548,16 @@ async fn refresh_wal_index(
         StreamReplicationErrorCode::SnapshotBoundaryMismatch,
         "WAL-index refresh failed after SHM refresh; replica requires restore".to_string(),
     ))
+}
+
+fn checkpoint_covers_expected_frames(result: (i32, i32, i32), expected_frames: u32) -> bool {
+    result.0 == 0 && (result.1 as u32) >= expected_frames && (result.2 as u32) >= expected_frames
+}
+
+fn checkpoint_needs_reader_quiesce(result: (i32, i32, i32), expected_frames: u32) -> bool {
+    result.0 != 0
+        || ((result.1 as u32) >= expected_frames && (result.2 as u32) < expected_frames)
+        || (result.1 > 0 && result.2 < result.1)
 }
 
 async fn run_wal_checkpoint_passive(db_path: &str) -> Result<(i32, i32, i32), ReplicaStreamError> {
@@ -572,31 +594,29 @@ fn invalidate_shm_header(db_path: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-async fn recover_stale_shm(
+async fn checkpoint_with_managed_reader_paused(
     db_path: &str,
-    process_manager: Option<&ProcessManager>,
-) -> Result<(), ReplicaStreamError> {
-    if let Some(pm) = process_manager {
-        pm.add_blocker().await;
-    } else {
-        return Err(ReplicaStreamError::Stream(
-            StreamReplicationErrorCode::SnapshotBoundaryMismatch,
-            "WAL-index recovery needs managed reader shutdown; run with --exec".to_string(),
-        ));
-    }
+    process_manager: &ProcessManager,
+    remove_shm: bool,
+) -> Result<(i32, i32, i32), ReplicaStreamError> {
+    process_manager.add_blocker().await;
 
-    let shm_path = format!("{db_path}-shm");
-    let remove_result = match fs::remove_file(&shm_path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(ReplicaStreamError::Io(err.to_string())),
+    let result = async {
+        if remove_shm {
+            let shm_path = format!("{db_path}-shm");
+            match fs::remove_file(&shm_path) {
+                Ok(()) => Ok(()),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(err) => Err(ReplicaStreamError::Io(err.to_string())),
+            }?;
+        }
+        run_wal_checkpoint_passive(db_path).await
     };
 
-    if let Some(pm) = process_manager {
-        pm.remove_blocker().await;
-    }
+    let checkpoint_result = result.await;
+    process_manager.remove_blocker().await;
 
-    remove_result
+    checkpoint_result
 }
 
 fn restore_snapshot_from_compressed(db_path: &str, compressed_path: &Path) -> Result<()> {
@@ -1089,6 +1109,36 @@ mod tests {
         assert!(!super::lsn_reached(&replay_chunk, &floor));
     }
 
+    #[test]
+    fn checkpoint_result_is_not_safe_when_reader_blocks_visible_frames() {
+        let expected_frames = 250;
+        let reader_blocked_result = (0, 250, 4);
+
+        assert!(!super::checkpoint_covers_expected_frames(
+            reader_blocked_result,
+            expected_frames
+        ));
+        assert!(super::checkpoint_needs_reader_quiesce(
+            reader_blocked_result,
+            expected_frames
+        ));
+    }
+
+    #[test]
+    fn checkpoint_result_is_not_safe_when_file_has_uncheckpointed_tail_frames() {
+        let expected_frames_from_file_len = 250;
+        let valid_prefix_result = (0, 4, 4);
+
+        assert!(!super::checkpoint_covers_expected_frames(
+            valid_prefix_result,
+            expected_frames_from_file_len
+        ));
+        assert!(!super::checkpoint_needs_reader_quiesce(
+            valid_prefix_result,
+            expected_frames_from_file_len
+        ));
+    }
+
     #[tokio::test]
     async fn apply_wal_bytes_resets_local_wal_and_returns_invalid_lsn_when_offset_beyond_eof() {
         let (_temp_dir, db_path) = create_test_wal_db();
@@ -1151,7 +1201,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_tolerates_committed_prefix_when_wal_file_has_extra_tail_frames() {
+    async fn refresh_requests_restore_when_wal_file_has_uncheckpointed_tail_frames() {
         let (temp_dir, db_path) = create_test_wal_db();
         let conn = Connection::open(&db_path).expect("open sqlite db");
         conn.pragma_update(None, "journal_mode", "WAL")
@@ -1190,15 +1240,21 @@ mod tests {
 
         let mut state = WalRefreshState::new();
         let process_manager = ProcessManager::new(String::new());
-        refresh_wal_index(
+        let err = refresh_wal_index(
             &db_path,
             expected_frames,
             &mut state,
             Some(&process_manager),
         )
         .await
-        .expect("extra WAL tail frames should not require restore");
-        assert_eq!(state.stale_failures, 0);
+        .expect_err("uncheckpointed WAL tail frames should require restore before reset");
+        match err {
+            ReplicaStreamError::Stream(code, message) => {
+                assert_eq!(code, StreamReplicationErrorCode::SnapshotBoundaryMismatch);
+                assert!(message.contains("requires restore"));
+            }
+            other => panic!("expected stream error, got {other:?}"),
+        }
 
         drop(conn);
         drop(temp_dir);

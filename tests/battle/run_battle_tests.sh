@@ -73,6 +73,13 @@ SIDECAR_RECOVER_RESULT=$?
 
 echo ""
 echo "=========================================="
+echo "=== 8. Sidecar Cold-Start Readonly Bootstrap Checkpoint Scenario ==="
+echo "=========================================="
+python3 cold_start_readonly_bootstrap_checkpoint_test.py
+SIDECAR_COLD_START_RESULT=$?
+
+echo ""
+echo "=========================================="
 echo "BATTLE TEST SUMMARY"
 echo "=========================================="
 echo "Concurrent Write: $([ $CONCURRENT_RESULT -eq 0 ] && echo 'PASS ✓' || echo 'FAIL ✗')"
@@ -82,10 +89,11 @@ echo "Endurance:        $([ $ENDURANCE_RESULT -eq 0 ] && echo 'PASS ✓' || echo
 echo "Sidecar Restore:  $([ $SIDECAR_RESTORE_RESULT -eq 0 ] && echo 'PASS ✓' || echo 'FAIL ✗')"
 echo "Sidecar Retry:    $([ $SIDECAR_RETRY_RESULT -eq 0 ] && echo 'PASS ✓' || echo 'FAIL ✗')"
 echo "Sidecar Recover:  $([ $SIDECAR_RECOVER_RESULT -eq 0 ] && echo 'PASS ✓' || echo 'FAIL ✗')"
+echo "Sidecar ColdStart:$([ $SIDECAR_COLD_START_RESULT -eq 0 ] && echo 'PASS ✓' || echo 'FAIL ✗')"
 echo "=========================================="
 
 # Exit with failure if any test failed
-if [ $CONCURRENT_RESULT -ne 0 ] || [ $MULTI_RESULT -ne 0 ] || [ $CHAOS_RESULT -ne 0 ] || [ $ENDURANCE_RESULT -ne 0 ] || [ $SIDECAR_RESTORE_RESULT -ne 0 ] || [ $SIDECAR_RETRY_RESULT -ne 0 ] || [ $SIDECAR_RECOVER_RESULT -ne 0 ]; then
+if [ $CONCURRENT_RESULT -ne 0 ] || [ $MULTI_RESULT -ne 0 ] || [ $CHAOS_RESULT -ne 0 ] || [ $ENDURANCE_RESULT -ne 0 ] || [ $SIDECAR_RESTORE_RESULT -ne 0 ] || [ $SIDECAR_RETRY_RESULT -ne 0 ] || [ $SIDECAR_RECOVER_RESULT -ne 0 ] || [ $SIDECAR_COLD_START_RESULT -ne 0 ]; then
     echo "OVERALL: FAIL ✗"
     exit 1
 else
