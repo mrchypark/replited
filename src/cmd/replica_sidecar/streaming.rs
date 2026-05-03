@@ -509,15 +509,31 @@ async fn refresh_wal_index(
         return Ok(());
     }
 
+    if checkpoint_covers_expected_frames(res_passive, expected_frames) {
+        refresh_state.stale_failures = 0;
+        refresh_state.stale_window_start = None;
+        return Ok(());
+    }
+    if checkpoint_covers_visible_frames(res_passive) {
+        refresh_state.stale_failures = 0;
+        refresh_state.stale_window_start = None;
+        return Ok(());
+    }
+
     if let Some(pm) = process_manager {
+        if should_log(&mut refresh_state.last_recovery_log, RECOVERY_LOG_INTERVAL) {
+            warn!(
+                "ReplicaSidecar: WAL checkpoint incomplete for {db_path}: {res_passive:?}. Pausing managed reader."
+            );
+        }
         let recovery =
             checkpoint_with_managed_reader_recovery(db_path, pm, expected_frames).await?;
-        let res_paused = recovery.paused;
+        let res_retry = recovery.paused;
         info!(
-            "ReplicaSidecar: WAL checkpoint PASSIVE with managed reader paused for {db_path}: {res_paused:?}"
+            "ReplicaSidecar: WAL checkpoint PASSIVE after reader pause for {db_path}: {res_retry:?}"
         );
-        if checkpoint_covers_expected_frames(res_paused, expected_frames)
-            || checkpoint_covers_visible_frames(res_paused)
+        if checkpoint_covers_expected_frames(res_retry, expected_frames)
+            || checkpoint_covers_visible_frames(res_retry)
         {
             refresh_state.stale_failures = 0;
             refresh_state.stale_window_start = None;
@@ -534,17 +550,6 @@ async fn refresh_wal_index(
                 "WAL-index refresh failed after recovery; replica requires restore".to_string(),
             ));
         }
-        refresh_state.stale_failures = 0;
-        refresh_state.stale_window_start = None;
-        return Ok(());
-    }
-
-    if checkpoint_covers_expected_frames(res_passive, expected_frames) {
-        refresh_state.stale_failures = 0;
-        refresh_state.stale_window_start = None;
-        return Ok(());
-    }
-    if checkpoint_covers_visible_frames(res_passive) {
         refresh_state.stale_failures = 0;
         refresh_state.stale_window_start = None;
         return Ok(());
@@ -1024,8 +1029,6 @@ mod tests {
     use rusqlite::Connection;
     use std::fs;
     use std::io::Write;
-    use std::path::Path;
-    use std::time::{Duration, Instant};
     use tempfile::TempDir;
 
     fn base_meta() -> SnapshotMeta {
@@ -1068,23 +1071,6 @@ mod tests {
             .expect("failed to insert seed row");
         drop(conn);
         (temp_dir, db_path.to_string_lossy().to_string())
-    }
-
-    async fn wait_for_start_count(path: &Path, min_count: usize) {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while Instant::now() < deadline {
-            let count = fs::read_to_string(path)
-                .map(|content| content.matches("start").count())
-                .unwrap_or_default();
-            if count >= min_count {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        panic!(
-            "timed out waiting for {} to record {min_count} starts",
-            path.display()
-        );
     }
 
     #[test]
@@ -1366,51 +1352,6 @@ mod tests {
 
         drop(conn);
         drop(temp_dir);
-    }
-
-    #[tokio::test]
-    async fn refresh_restarts_managed_reader_after_checkpointed_frames_are_visible() {
-        let (temp_dir, db_path) = create_test_wal_db();
-        let starts_path = temp_dir.path().join("managed-reader-starts.log");
-        let conn = Connection::open(&db_path).expect("open sqlite db");
-        conn.pragma_update(None, "journal_mode", "WAL")
-            .expect("set wal mode");
-        conn.execute("INSERT INTO t(v) VALUES ('visible to checkpoint')", [])
-            .expect("insert committed row");
-
-        let (_, expected_frames, _) = super::run_wal_checkpoint_passive(&db_path)
-            .await
-            .expect("checkpoint passive");
-        assert!(
-            expected_frames > 0,
-            "test setup should create visible WAL frames"
-        );
-
-        let cmd = format!("printf start >> '{}'; sleep 60", starts_path.display());
-        let process_manager = ProcessManager::new(cmd);
-        process_manager.start().await;
-
-        wait_for_start_count(&starts_path, 1).await;
-
-        let mut state = WalRefreshState::new();
-        refresh_wal_index(
-            &db_path,
-            expected_frames as u32,
-            &mut state,
-            Some(&process_manager),
-        )
-        .await
-        .expect("managed refresh should restart the reader after checkpoint");
-
-        wait_for_start_count(&starts_path, 2).await;
-        process_manager.stop().await;
-
-        let starts = fs::read_to_string(&starts_path).expect("read starts log");
-        assert_eq!(
-            starts.matches("start").count(),
-            2,
-            "managed reader should be restarted even when checkpoint already sees frames"
-        );
     }
 
     #[tokio::test]
