@@ -212,19 +212,36 @@ def initialize_primary(db_path: Path) -> None:
 
 
 def write_rows(db_path: Path, start: int, count: int, payload_size: int) -> None:
-    payload = "x" * payload_size
+    conn = open_writer_connection(db_path)
+    try:
+        write_rows_on_connection(conn, start=start, count=count, payload_size=payload_size)
+    finally:
+        conn.close()
+
+
+def open_writer_connection(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path), timeout=5.0)
     cursor = conn.cursor()
     cursor.execute("PRAGMA journal_mode=WAL")
     cursor.execute("PRAGMA busy_timeout=5000")
     cursor.execute("PRAGMA wal_autocheckpoint=100000")
+    return conn
+
+
+def write_rows_on_connection(
+    conn: sqlite3.Connection,
+    start: int,
+    count: int,
+    payload_size: int,
+) -> None:
+    payload = "x" * payload_size
+    cursor = conn.cursor()
     for sequence in range(start, start + count):
         cursor.execute(
             f"INSERT OR REPLACE INTO {TABLE_NAME} (sequence, payload) VALUES (?, ?)",
             (sequence, f"{sequence}:{payload}"),
         )
     conn.commit()
-    conn.close()
 
 
 def row_count(db_path: Path) -> int:
@@ -333,6 +350,7 @@ def run_scenario() -> ScenarioResult:
     primary: Proc | None = None
     replica: Proc | None = None
     replica_dir: Path | None = None
+    writer_conn: sqlite3.Connection | None = None
     try:
         initialize_primary(env.primary_db)
         write_rows(env.primary_db, start=0, count=20, payload_size=256)
@@ -358,7 +376,8 @@ def run_scenario() -> ScenarioResult:
         # Force a WAL stream that exceeds the server chunk size while staying in
         # a single WAL index. Old sidecar logic checkpointed after the first
         # chunk, removed the local WAL, and failed the next non-zero offset chunk.
-        write_rows(env.primary_db, start=20, count=220, payload_size=4096)
+        writer_conn = open_writer_connection(env.primary_db)
+        write_rows_on_connection(writer_conn, start=20, count=220, payload_size=4096)
         final_synced, replica_digest = wait_for_digest_sync(env.primary_db, replica_db, timeout=240)
         result.primary_digest = compute_db_digest(str(env.primary_db))
         result.replica_digest = replica_digest
@@ -385,6 +404,8 @@ def run_scenario() -> ScenarioResult:
             result.diagnostics = collect_diagnostics(log_paths)
         return result
     finally:
+        if writer_conn is not None:
+            writer_conn.close()
         stop_process(replica)
         stop_process(primary)
 

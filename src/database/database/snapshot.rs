@@ -53,7 +53,12 @@ impl Database {
         let result: Result<(Vec<u8>, WalGenerationPos)> = async {
             // Ensure WAL exists before trying to derive a generation position.
             // This is required for brand new databases that have not yet produced a WAL header.
-            self.ensure_wal_exists().await?;
+            if !self.ensure_wal_exists().await? {
+                return Err(Error::SqliteWalError(format!(
+                    "wal {} header not found",
+                    self.wal_file
+                )));
+            }
 
             // Snapshotting requires a generation + an initialized shadow WAL file because
             // checkpointing and position derivation are anchored to the shadow WAL inventory.
@@ -150,7 +155,12 @@ impl Database {
         &mut self,
         index: usize,
     ) -> Result<()> {
-        self.ensure_wal_exists().await?;
+        if !self.ensure_wal_exists().await? {
+            return Err(Error::SqliteWalError(format!(
+                "wal {} header not found",
+                self.wal_file
+            )));
+        }
         self.create_generation().await?;
         self.handle_db_snapshot_command(index).await
     }

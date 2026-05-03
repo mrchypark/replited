@@ -136,21 +136,6 @@ struct SyncInfo {
 }
 
 impl Database {
-    fn reopen_main_connection(&mut self) -> Result<()> {
-        // Drop the old DB handle before reopening so SQLite can rebuild WAL state
-        // without another live connection still referencing deleted WAL files.
-        let placeholder = Connection::open_in_memory()?;
-        let stale = std::mem::replace(&mut self.connection, placeholder);
-        drop(stale);
-
-        let conn = Connection::open(&self.config.db)?;
-        conn.busy_timeout(Duration::from_secs(5))?;
-        Self::init_params(&self.config.db, &conn)?;
-        Self::create_internal_tables(&conn)?;
-        self.connection = conn;
-        Ok(())
-    }
-
     fn has_generation_recovery_context(&self) -> bool {
         let generation = match self.current_generation() {
             Ok(generation) if !generation.is_empty() => generation,
@@ -161,33 +146,6 @@ impl Database {
             Err(_) => return false,
         };
         fs::exists(&shadow_wal_file).unwrap_or(false)
-    }
-
-    async fn force_wal_header_creation(&mut self) -> Result<bool> {
-        let had_read_lock = self.tx_connection.is_some();
-        let _ = self.release_read_lock();
-        self.reopen_main_connection()?;
-        let _ = fs::remove_file(&self.wal_file);
-        let _ = fs::remove_file(format!("{}-shm", self.config.db));
-        self.reopen_main_connection()?;
-        self.connection.execute(
-            "INSERT INTO _replited_seq (id, seq) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET seq = seq + 1;",
-            (),
-        )?;
-        sleep(Duration::from_millis(50)).await;
-
-        if !fs::exists(&self.wal_file)? {
-            if had_read_lock {
-                self.acquire_read_lock()?;
-            }
-            return Ok(false);
-        }
-
-        let has_header = fs::metadata(&self.wal_file)?.len() >= WAL_HEADER_SIZE;
-        if had_read_lock {
-            self.acquire_read_lock()?;
-        }
-        Ok(has_header)
     }
 
     // acquire_read_lock begins a read transaction on the database to prevent checkpointing.
@@ -240,7 +198,9 @@ impl Database {
         debug!("sync database: {}", self.config.db);
 
         // make sure wal file has at least one frame in it
-        self.ensure_wal_exists().await?;
+        if !self.ensure_wal_exists().await? {
+            return Ok(());
+        }
 
         // Verify our last sync matches the current state of the WAL.
         // This ensures that we have an existing generation & that the last sync
@@ -861,7 +821,7 @@ impl Database {
     }
 
     // make sure wal file has at least one frame in it
-    async fn ensure_wal_exists(&mut self) -> Result<()> {
+    async fn ensure_wal_exists(&mut self) -> Result<bool> {
         for _ in 0..5 {
             if fs::exists(&self.wal_file)? {
                 let stat = fs::metadata(&self.wal_file)?;
@@ -873,7 +833,7 @@ impl Database {
                 }
 
                 if stat.len() >= WAL_HEADER_SIZE {
-                    return Ok(());
+                    return Ok(true);
                 }
             }
 
@@ -890,13 +850,10 @@ impl Database {
 
         if self.has_generation_recovery_context() {
             warn!(
-                "db {} WAL header still missing after retries; deferring to generation recovery path",
+                "db {} WAL header still missing after retries; waiting for next writer before syncing",
                 self.config.db
             );
-            if self.force_wal_header_creation().await? {
-                return Ok(());
-            }
-            return Ok(());
+            return Ok(false);
         }
 
         Err(Error::SqliteWalError(format!(
