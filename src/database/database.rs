@@ -1081,6 +1081,7 @@ mod tests {
     use crate::config::DbConfig;
 
     use super::{Database, DbCommand};
+    use crate::sync::ReplicateCommand;
 
     fn replica_notification_fixture(db_path: &str, backup_root: &str) -> DbConfig {
         let toml_str = format!(
@@ -1179,6 +1180,60 @@ root = "{backup_root}"
         db.sync()
             .await
             .expect("follow-up sync should keep working after WAL recovery");
+    }
+
+    #[tokio::test]
+    async fn sync_notifies_closed_writer_updates_after_snapshot() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("primary.db");
+        let backup_root = dir.path().join("backup");
+
+        let config = replica_notification_fixture(
+            db_path.to_string_lossy().as_ref(),
+            backup_root.to_string_lossy().as_ref(),
+        );
+
+        let (mut db, _rx) = Database::try_create(config).await.expect("create db");
+        db.connection
+            .execute(
+                "CREATE TABLE IF NOT EXISTS closed_writer_after_snapshot (id INTEGER PRIMARY KEY, value TEXT NOT NULL)",
+                (),
+            )
+            .expect("create test table");
+        db.snapshot().await.expect("snapshot before external write");
+
+        let (sync_tx, mut sync_rx) = tokio::sync::mpsc::channel(1);
+        db.sync_notifiers = vec![Some(sync_tx)];
+
+        {
+            let external = rusqlite::Connection::open(&db.config.db).expect("external open");
+            external
+                .pragma_update(None, "journal_mode", "WAL")
+                .expect("external WAL mode");
+            external
+                .execute(
+                    "INSERT INTO closed_writer_after_snapshot (value) VALUES ('after-snapshot')",
+                    (),
+                )
+                .expect("external write");
+        }
+
+        db.sync().await.expect("sync after closed external writer");
+
+        let cmd = tokio::time::timeout(Duration::from_millis(500), sync_rx.recv())
+            .await
+            .expect("timed out waiting for sync notification")
+            .expect("sync notifier closed");
+
+        match cmd {
+            ReplicateCommand::DbChanged(pos) => {
+                assert!(
+                    pos.offset > super::WAL_HEADER_SIZE,
+                    "expected sync position beyond WAL header, got {pos:?}"
+                );
+            }
+            other => panic!("expected DbChanged notification, got {other:?}"),
+        }
     }
 
     #[tokio::test]

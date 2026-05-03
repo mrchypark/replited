@@ -48,8 +48,6 @@ impl Database {
     }
 
     pub(super) async fn snapshot(&mut self) -> Result<(Vec<u8>, WalGenerationPos)> {
-        // Always release the read lock on return, even on intermediate failures, so we don't
-        // accidentally block future checkpoints.
         let result: Result<(Vec<u8>, WalGenerationPos)> = async {
             // Ensure WAL exists before trying to derive a generation position.
             // This is required for brand new databases that have not yet produced a WAL header.
@@ -123,12 +121,15 @@ impl Database {
         }
         .await;
 
-        let release_result = self.release_read_lock();
-        match (result, release_result) {
-            (Ok(v), Ok(())) => Ok(v),
-            (Ok(_), Err(e)) => Err(e),
-            (Err(e), Ok(())) => Err(e),
-            (Err(e), Err(_)) => Err(e),
+        match result {
+            Ok(v) => {
+                self.acquire_read_lock()?;
+                Ok(v)
+            }
+            Err(e) => {
+                let _ = self.release_read_lock();
+                Err(e)
+            }
         }
     }
 
@@ -229,6 +230,22 @@ addr = "http://127.0.0.1:50051"
         assert!(
             db.tx_connection.is_none(),
             "snapshot leaked read lock (tx_connection still set); err={err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_keeps_read_lock_after_success() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("primary.db");
+
+        let config = stream_only_db_config(db_path.to_string_lossy().as_ref());
+        let (mut db, _rx) = Database::try_create(config).await.expect("create db");
+
+        db.snapshot().await.expect("snapshot");
+
+        assert!(
+            db.tx_connection.is_some(),
+            "successful snapshot should restore the steady-state read lock"
         );
     }
 

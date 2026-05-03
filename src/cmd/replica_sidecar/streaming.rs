@@ -160,8 +160,8 @@ pub(super) async fn stream_wal_and_apply(
     replica_id: &str,
     session_id: &str,
     start_pos: WalGenerationPos,
-    _checkpoint_frame_interval: u32,
-    _checkpoint_interval_ms: u64,
+    checkpoint_frame_interval: u32,
+    checkpoint_interval_ms: u64,
     process_manager: Option<ProcessManager>,
 ) -> Result<WalGenerationPos, ReplicaStreamError> {
     let wal_path = format!("{db_path}-wal");
@@ -175,9 +175,9 @@ pub(super) async fn stream_wal_and_apply(
         };
         let needs_rewind = local_wal_needs_rewind(wal_len, effective_start_pos.offset);
         if needs_rewind {
-            if seed_wal_header_from_shadow(db_path, &effective_start_pos)? {
+            if seed_wal_prefix_from_shadow(db_path, &effective_start_pos)? {
                 info!(
-                    "ReplicaSidecar: seeded WAL header for {} from shadow wal at {}:{}:{}",
+                    "ReplicaSidecar: seeded WAL prefix for {} from shadow wal at {}:{}:{}",
                     db_path,
                     effective_start_pos.generation.as_str(),
                     effective_start_pos.index,
@@ -210,6 +210,8 @@ pub(super) async fn stream_wal_and_apply(
     let page_size = load_db_page_size(db_path).await?;
     let frame_size = WAL_FRAME_HEADER_SIZE + page_size;
     let mut frames_since_refresh: u32 = 0;
+    let checkpoint_interval = Duration::from_millis(checkpoint_interval_ms);
+    let mut last_checkpoint_refresh = Instant::now();
     let mut refresh_state = WalRefreshState::new();
     let mut suppress_ack = ack_floor.is_some();
     loop {
@@ -274,6 +276,7 @@ pub(super) async fn stream_wal_and_apply(
                         )
                         .await?;
                         frames_since_refresh = 0;
+                        last_checkpoint_refresh = Instant::now();
                     }
 
                     info!(
@@ -315,6 +318,24 @@ pub(super) async fn stream_wal_and_apply(
                     }
                 }
 
+                let checkpoint_frame_due = checkpoint_frame_interval > 0
+                    && frames_since_refresh >= checkpoint_frame_interval;
+                let checkpoint_time_due = checkpoint_interval_ms > 0
+                    && frames_since_refresh > 0
+                    && last_checkpoint_refresh.elapsed() >= checkpoint_interval;
+                if !suppress_ack && (checkpoint_frame_due || checkpoint_time_due) {
+                    let expected_frames = expected_frames_from_wal_file(db_path, page_size)?;
+                    refresh_wal_index(
+                        db_path,
+                        expected_frames,
+                        &mut refresh_state,
+                        process_manager.as_ref(),
+                    )
+                    .await?;
+                    frames_since_refresh = 0;
+                    last_checkpoint_refresh = Instant::now();
+                }
+
                 // Best-effort ACK. Transport errors should not kill the replica.
                 // Explicit protocol errors must still propagate to trigger NeedsRestore.
                 if !suppress_ack {
@@ -333,6 +354,17 @@ pub(super) async fn stream_wal_and_apply(
                 ));
             }
         }
+    }
+
+    if frames_since_refresh > 0 && !suppress_ack {
+        let expected_frames = expected_frames_from_wal_file(db_path, page_size)?;
+        refresh_wal_index(
+            db_path,
+            expected_frames,
+            &mut refresh_state,
+            process_manager.as_ref(),
+        )
+        .await?;
     }
 
     Ok(current_pos)
@@ -448,6 +480,10 @@ fn should_log(last: &mut Instant, interval: Duration) -> bool {
     }
 }
 
+fn checkpoint_covers_visible_frames(result: (i32, i32, i32)) -> bool {
+    result.0 == 0 && result.1 > 0 && result.1 == result.2
+}
+
 fn update_stale_window(state: &mut WalRefreshState) {
     let now = Instant::now();
     match state.stale_window_start {
@@ -478,6 +514,11 @@ async fn refresh_wal_index(
         refresh_state.stale_window_start = None;
         return Ok(());
     }
+    if checkpoint_covers_visible_frames(res_passive) {
+        refresh_state.stale_failures = 0;
+        refresh_state.stale_window_start = None;
+        return Ok(());
+    }
 
     if let Some(pm) = process_manager {
         if should_log(&mut refresh_state.last_recovery_log, RECOVERY_LOG_INTERVAL) {
@@ -491,7 +532,9 @@ async fn refresh_wal_index(
         info!(
             "ReplicaSidecar: WAL checkpoint PASSIVE after reader pause for {db_path}: {res_retry:?}"
         );
-        if checkpoint_covers_expected_frames(res_retry, expected_frames) {
+        if checkpoint_covers_expected_frames(res_retry, expected_frames)
+            || checkpoint_covers_visible_frames(res_retry)
+        {
             refresh_state.stale_failures = 0;
             refresh_state.stale_window_start = None;
             return Ok(());
@@ -499,7 +542,9 @@ async fn refresh_wal_index(
 
         let res_retry = recovery.recovered;
         info!("ReplicaSidecar: WAL checkpoint PASSIVE retry for {db_path}: {res_retry:?}");
-        if !checkpoint_covers_expected_frames(res_retry, expected_frames) {
+        if !checkpoint_covers_expected_frames(res_retry, expected_frames)
+            && !checkpoint_covers_visible_frames(res_retry)
+        {
             return Err(ReplicaStreamError::Stream(
                 StreamReplicationErrorCode::SnapshotBoundaryMismatch,
                 "WAL-index refresh failed after recovery; replica requires restore".to_string(),
@@ -526,6 +571,11 @@ async fn refresh_wal_index(
             );
         }
         if checkpoint_covers_expected_frames(res_retry, expected_frames) {
+            refresh_state.stale_failures = 0;
+            refresh_state.stale_window_start = None;
+            return Ok(());
+        }
+        if checkpoint_covers_visible_frames(res_retry) {
             refresh_state.stale_failures = 0;
             refresh_state.stale_window_start = None;
             return Ok(());
@@ -684,6 +734,24 @@ async fn apply_wal_bytes(
 ) -> Result<(), ReplicaStreamError> {
     if start_pos.offset == 0 {
         reset_local_wal(db_path, process_manager).await?;
+    } else {
+        let wal_path = format!("{db_path}-wal");
+        let wal_len = match fs::metadata(&wal_path) {
+            Ok(meta) => Some(meta.len()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => return Err(ReplicaStreamError::Io(err.to_string())),
+        };
+        if local_wal_needs_rewind(wal_len, start_pos.offset)
+            && seed_wal_prefix_from_shadow(db_path, start_pos)?
+        {
+            info!(
+                "ReplicaSidecar: seeded WAL prefix for {} from shadow wal at {}:{}:{}",
+                db_path,
+                start_pos.generation.as_str(),
+                start_pos.index,
+                start_pos.offset
+            );
+        }
     }
 
     let wal_path = format!("{db_path}-wal");
@@ -873,7 +941,7 @@ fn floor_is_shadow_wal_eof(db_path: &str, floor: &WalGenerationPos) -> bool {
     metadata.len() == floor.offset
 }
 
-fn seed_wal_header_from_shadow(
+fn seed_wal_prefix_from_shadow(
     db_path: &str,
     pos: &WalGenerationPos,
 ) -> Result<bool, ReplicaStreamError> {
@@ -888,15 +956,15 @@ fn seed_wal_header_from_shadow(
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(err) => return Err(ReplicaStreamError::Io(err.to_string())),
     };
-    if shadow_meta.len() < WAL_HEADER_SIZE {
+    if shadow_meta.len() < pos.offset || pos.offset < WAL_HEADER_SIZE {
         return Ok(false);
     }
 
     let mut shadow_file =
         fs::File::open(&shadow_path).map_err(|e| ReplicaStreamError::Io(e.to_string()))?;
-    let mut header = vec![0u8; WAL_HEADER_SIZE as usize];
+    let mut prefix = vec![0u8; pos.offset as usize];
     shadow_file
-        .read_exact(&mut header)
+        .read_exact(&mut prefix)
         .map_err(|e| ReplicaStreamError::Io(e.to_string()))?;
 
     let wal_path = format!("{db_path}-wal");
@@ -907,7 +975,7 @@ fn seed_wal_header_from_shadow(
         .open(&wal_path)
         .map_err(|e| ReplicaStreamError::Io(e.to_string()))?;
     wal_file
-        .write_all(&header)
+        .write_all(&prefix)
         .map_err(|e| ReplicaStreamError::Io(e.to_string()))?;
     wal_file
         .sync_all()
@@ -950,7 +1018,7 @@ fn allow_shadow_wal_boundary_advance(
 mod tests {
     use super::{
         ReplicaStreamError, WalRefreshState, apply_wal_bytes, can_accept_stream_advance_past_floor,
-        refresh_wal_index, validate_snapshot_meta,
+        refresh_wal_index, store_shadow_wal_bytes, validate_snapshot_meta,
     };
     use crate::base::Generation;
     use crate::cmd::replica_sidecar::process_manager::ProcessManager;
@@ -1141,6 +1209,7 @@ mod tests {
             valid_prefix_result,
             expected_frames_from_file_len
         ));
+        assert!(super::checkpoint_covers_visible_frames(valid_prefix_result));
         assert!(!super::checkpoint_needs_reader_quiesce(
             valid_prefix_result,
             expected_frames_from_file_len
@@ -1178,6 +1247,38 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn apply_wal_bytes_seeds_shadow_prefix_when_resume_offset_is_beyond_local_wal() {
+        let (_temp_dir, db_path) = create_test_wal_db();
+        let wal_path = format!("{db_path}-wal");
+        let generation = Generation::new();
+        let prefix = vec![7u8; WAL_HEADER_SIZE as usize];
+        let start = WalGenerationPos {
+            generation,
+            index: 3,
+            offset: WAL_HEADER_SIZE,
+        };
+
+        store_shadow_wal_bytes(
+            &db_path,
+            &WalGenerationPos {
+                offset: 0,
+                ..start.clone()
+            },
+            &prefix,
+        )
+        .expect("seed shadow wal");
+        fs::write(&wal_path, b"short").expect("seed truncated local wal");
+
+        apply_wal_bytes(&db_path, &start, b"data", None)
+            .await
+            .expect("apply should seed shadow prefix before appending");
+
+        let wal = fs::read(&wal_path).expect("read local wal");
+        assert_eq!(&wal[..WAL_HEADER_SIZE as usize], prefix.as_slice());
+        assert_eq!(&wal[WAL_HEADER_SIZE as usize..], b"data");
+    }
+
     #[test]
     fn local_wal_needs_rewind_when_resume_offset_is_beyond_local_file_length() {
         assert!(super::local_wal_needs_rewind(None, 259_592));
@@ -1190,26 +1291,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tolerates_initial_stale_refreshes_without_managed_recovery() {
+    async fn tolerates_initial_stale_refresh_without_managed_recovery() {
         let (_temp_dir, db_path) = create_test_wal_db();
         let mut state = WalRefreshState::new();
 
-        assert!(
-            refresh_wal_index(&db_path, 1, &mut state, None)
-                .await
-                .is_ok()
-        );
+        refresh_wal_index(&db_path, 1, &mut state, None)
+            .await
+            .expect("first stale refresh should not reset the replica immediately");
         assert_eq!(state.stale_failures, 1);
-        assert!(
-            refresh_wal_index(&db_path, 1, &mut state, None)
-                .await
-                .is_ok()
-        );
-        assert_eq!(state.stale_failures, 2);
     }
 
     #[tokio::test]
-    async fn refresh_requests_restore_when_wal_file_has_uncheckpointed_tail_frames() {
+    async fn refresh_accepts_checkpointed_visible_frames_with_unindexed_tail() {
         let (temp_dir, db_path) = create_test_wal_db();
         let conn = Connection::open(&db_path).expect("open sqlite db");
         conn.pragma_update(None, "journal_mode", "WAL")
@@ -1248,21 +1341,14 @@ mod tests {
 
         let mut state = WalRefreshState::new();
         let process_manager = ProcessManager::new(String::new());
-        let err = refresh_wal_index(
+        refresh_wal_index(
             &db_path,
             expected_frames,
             &mut state,
             Some(&process_manager),
         )
         .await
-        .expect_err("uncheckpointed WAL tail frames should require restore before reset");
-        match err {
-            ReplicaStreamError::Stream(code, message) => {
-                assert_eq!(code, StreamReplicationErrorCode::SnapshotBoundaryMismatch);
-                assert!(message.contains("requires restore"));
-            }
-            other => panic!("expected stream error, got {other:?}"),
-        }
+        .expect("checkpointed visible frames should be safe even with an unindexed tail");
 
         drop(conn);
         drop(temp_dir);
@@ -1274,11 +1360,9 @@ mod tests {
         let mut state = WalRefreshState::new();
 
         for _ in 0..(super::STALE_THRESHOLD - 1) {
-            assert!(
-                refresh_wal_index(&db_path, 1, &mut state, None)
-                    .await
-                    .is_ok()
-            );
+            refresh_wal_index(&db_path, 1, &mut state, None)
+                .await
+                .expect("stale refresh should be tolerated below the threshold");
         }
 
         let err = refresh_wal_index(&db_path, 1, &mut state, None)
