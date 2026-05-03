@@ -55,6 +55,9 @@ jobs:
 
       - name: Download Linux release assets
         run: |
+          sudo apt-get update
+          sudo apt-get install -y file binutils
+
           mkdir -p artifacts docker-context
           gh release download "${{ steps.release.outputs.tag }}" \
             --repo "${GITHUB_REPOSITORY}" \
@@ -66,8 +69,13 @@ jobs:
 
           file artifacts/replited-linux-amd64 artifacts/replited-linux-arm64
           for artifact in artifacts/replited-linux-amd64 artifacts/replited-linux-arm64; do
+            readelf -l "${artifact}"
             if ! file "${artifact}" | grep -Eq 'statically linked|static-pie linked'; then
               echo "${artifact} must be static so the Docker image binary can be reused in Alpine app containers" >&2
+              exit 1
+            fi
+            if readelf -l "${artifact}" | grep -q 'INTERP'; then
+              echo "${artifact} must not have an ELF interpreter" >&2
               exit 1
             fi
           done
@@ -80,6 +88,17 @@ jobs:
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
+
+      - name: Smoke test Linux artifacts in Alpine and Debian
+        run: |
+          for arch in amd64 arm64; do
+            for image in alpine:3.20 debian:bookworm-slim; do
+              docker run --rm --platform "linux/${arch}" \
+                -v "$PWD/artifacts:/artifacts:ro" \
+                "${image}" \
+                "/artifacts/replited-linux-${arch}" --version
+            done
+          done
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -115,5 +134,3 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            TARGETARCH

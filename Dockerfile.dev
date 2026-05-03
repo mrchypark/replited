@@ -11,4 +11,5 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates sqlite3 curl && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/replited /usr/local/bin/replited
 RUN chmod +x /usr/local/bin/replited
+RUN /usr/local/bin/replited --version
 ENTRYPOINT ["/usr/local/bin/replited"]
