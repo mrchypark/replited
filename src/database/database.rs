@@ -103,6 +103,7 @@ pub struct Database {
     last_retention_log: Option<Instant>,
     last_retention_floor: Option<u64>,
     last_retention_tail: Option<u64>,
+    last_checkpointed_snapshot_mod_time: Option<SystemTime>,
 }
 
 // position info of wal for a generation
@@ -199,6 +200,23 @@ impl Database {
 
         // make sure wal file has at least one frame in it
         if !self.ensure_wal_exists().await? {
+            if self.has_generation_recovery_context() {
+                let db_mod_time = fs::metadata(&self.config.db)
+                    .ok()
+                    .and_then(|metadata| metadata.modified().ok());
+                if db_mod_time.is_some() && self.last_checkpointed_snapshot_mod_time == db_mod_time
+                {
+                    return Ok(());
+                }
+
+                let generation_pos = self.create_checkpointed_generation()?;
+                self.last_checkpointed_snapshot_mod_time = db_mod_time;
+                info!(
+                    "db {} created checkpointed generation snapshot request at {:?}",
+                    self.config.db, generation_pos
+                );
+                self.notify_db_changed(generation_pos).await;
+            }
             return Ok(());
         }
 
@@ -250,21 +268,7 @@ impl Database {
         // notify the database has been changed
         if changed {
             let generation_pos = self.wal_generation_position()?;
-            for notifier_slot in &mut self.sync_notifiers {
-                let Some(notifier) = notifier_slot else {
-                    continue;
-                };
-                if let Err(err) = notifier
-                    .send(ReplicateCommand::DbChanged(generation_pos.clone()))
-                    .await
-                {
-                    warn!(
-                        "db {} replicate notifier closed; disabling notifier: {}",
-                        self.config.db, err
-                    );
-                    *notifier_slot = None;
-                }
-            }
+            self.notify_db_changed(generation_pos).await;
         }
 
         debug!("sync db {} ok", self.config.db);
@@ -351,6 +355,67 @@ impl Database {
         self.clean()?;
 
         Ok(generation)
+    }
+
+    fn create_checkpointed_generation(&mut self) -> Result<WalGenerationPos> {
+        let generation = Generation::new();
+
+        let generation_file = generation_file_path(&self.meta_dir);
+        let generation_file_path = Path::new(&generation_file);
+        let dest_dir = generation_file_path
+            .parent()
+            .unwrap_or_else(|| Path::new(&self.meta_dir));
+        fs::create_dir_all(dest_dir)?;
+
+        let temp_file = NamedTempFile::new_in(dest_dir)?;
+        fs::write(temp_file.path(), generation.as_str())?;
+
+        let dir = generation_dir(&self.meta_dir, generation.as_str());
+        fs::create_dir_all(&dir)?;
+
+        let shadow_wal = self.shadow_wal_file(generation.as_str(), 0);
+        let db_file_metadata = fs::metadata(&self.config.db)?;
+        if let Some(dir) = parent_dir(&shadow_wal) {
+            fs::create_dir_all(&dir)?;
+        }
+        let mut shadow_wal_file = fs::File::create(&shadow_wal)?;
+        let mut permissions = shadow_wal_file.metadata()?.permissions();
+        permissions.set_mode(db_file_metadata.mode());
+        shadow_wal_file.set_permissions(permissions)?;
+        std::os::unix::fs::chown(
+            &shadow_wal,
+            Some(db_file_metadata.uid()),
+            Some(db_file_metadata.gid()),
+        )?;
+        shadow_wal_file.write_all(&vec![0; WAL_HEADER_SIZE as usize])?;
+        shadow_wal_file.flush()?;
+
+        fs::rename(temp_file.path(), &generation_file)?;
+        self.clean()?;
+
+        Ok(WalGenerationPos {
+            generation,
+            index: 0,
+            offset: WAL_HEADER_SIZE,
+        })
+    }
+
+    async fn notify_db_changed(&mut self, generation_pos: WalGenerationPos) {
+        for notifier_slot in &mut self.sync_notifiers {
+            let Some(notifier) = notifier_slot else {
+                continue;
+            };
+            if let Err(err) = notifier
+                .send(ReplicateCommand::DbChanged(generation_pos.clone()))
+                .await
+            {
+                warn!(
+                    "db {} replicate notifier closed; disabling notifier: {}",
+                    self.config.db, err
+                );
+                *notifier_slot = None;
+            }
+        }
     }
 
     // copies pending bytes from the real WAL to the shadow WAL.

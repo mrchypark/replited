@@ -29,6 +29,7 @@ pub async fn snapshot_for_stream(config: DbConfig) -> Result<SnapshotStreamData>
         last_retention_log: None,
         last_retention_floor: None,
         last_retention_tail: None,
+        last_checkpointed_snapshot_mod_time: None,
     };
 
     let (compressed_data, position) = database.snapshot().await?;
@@ -52,10 +53,19 @@ impl Database {
             // Ensure WAL exists before trying to derive a generation position.
             // This is required for brand new databases that have not yet produced a WAL header.
             if !self.ensure_wal_exists().await? {
-                return Err(Error::SqliteWalError(format!(
-                    "wal {} header not found",
-                    self.wal_file
-                )));
+                let pos = self.wal_generation_position()?;
+                if pos.offset == 0 {
+                    return Err(Error::SqliteWalError(format!(
+                        "wal {} header not found",
+                        self.wal_file
+                    )));
+                }
+                let compressed_data = compress_file(&self.config.db)?;
+                info!(
+                    "db {} checkpointed snapshot created without live WAL, pos: {:?}",
+                    self.config.db, pos
+                );
+                return Ok((compressed_data.to_owned(), pos));
             }
 
             // Snapshotting requires a generation + an initialized shadow WAL file because
@@ -123,7 +133,12 @@ impl Database {
 
         match result {
             Ok(v) => {
-                self.acquire_read_lock()?;
+                if let Err(err) = self.acquire_read_lock() {
+                    warn!(
+                        "db {} snapshot completed but read lock reacquire failed: {:?}",
+                        self.config.db, err
+                    );
+                }
                 Ok(v)
             }
             Err(e) => {
