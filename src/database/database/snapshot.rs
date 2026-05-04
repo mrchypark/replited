@@ -53,8 +53,6 @@ impl Database {
             .duration_since(std::time::UNIX_EPOCH)?
             .as_nanos();
         let snapshot_path = Path::new(&self.meta_dir).join(format!("snapshot_{timestamp}.db"));
-        let snapshot_path_str = snapshot_path.to_string_lossy();
-        let escaped_path = snapshot_path_str.replace('\'', "''");
         match std::fs::remove_file(&snapshot_path) {
             Ok(()) => {}
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
@@ -63,12 +61,54 @@ impl Database {
 
         let result = (|| -> Result<Vec<u8>> {
             self.connection
-                .execute_batch(&format!("VACUUM main INTO '{escaped_path}'"))?;
+                .backup(rusqlite::MAIN_DB, &snapshot_path, None)?;
+            let snapshot_path_str = snapshot_path.to_string_lossy();
             compress_file(&snapshot_path_str)
         })();
 
         let _ = std::fs::remove_file(&snapshot_path);
         result
+    }
+
+    fn restart_wal_after_materialized_snapshot(
+        &mut self,
+        generation: &str,
+        current_index: u64,
+    ) -> Result<bool> {
+        let wal_header_before_restart = WALHeader::read(&self.wal_file)?;
+
+        self.release_read_lock()?;
+        let checkpoint_result = self
+            .connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
+        let marker_result = if checkpoint_result.is_ok() {
+            self.connection
+                .execute(
+                    "INSERT INTO _replited_seq (id, seq) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET seq = seq + 1;",
+                    (),
+                )
+                .map(|_| ())
+        } else {
+            Ok(())
+        };
+        let reacquire_result = self.acquire_read_lock();
+        checkpoint_result?;
+        marker_result?;
+        reacquire_result?;
+
+        let wal_header_after_restart = WALHeader::read(&self.wal_file)?;
+        if wal_header_before_restart == wal_header_after_restart {
+            return Ok(false);
+        }
+
+        let next_shadow_wal_file = self.shadow_wal_file(generation, current_index + 1);
+        debug!(
+            "db {} snapshot restarted WAL, seeding shadow WAL index {}",
+            self.config.db,
+            current_index + 1
+        );
+        self.init_shadow_wal_file(&next_shadow_wal_file)?;
+        Ok(true)
     }
 
     pub(super) async fn snapshot(&mut self) -> Result<(Vec<u8>, WalGenerationPos)> {
@@ -112,49 +152,31 @@ impl Database {
                 return Err(Error::NoGenerationError("no generation"));
             }
 
-            let wal_header_before_checkpoint = WALHeader::read(&self.wal_file)?;
-
-            // Flush those exact frames into the DB file while writers are still blocked. The
-            // returned boundary still points at the copied WAL prefix so replicas can rebuild a
-            // complete WAL stream from the raw DB snapshot.
+            // Flush those exact frames into the DB file while writers are still blocked.
             self.exec_checkpoint(CheckpointMode::Passive.as_str())?;
 
             info!("db {} snapshot created, pos: {:?}", self.config.db, pos);
 
             let compressed_data = self.compress_materialized_snapshot()?;
 
-            // Mirror do_checkpoint(): force a post-snapshot WAL write so SQLite either keeps
-            // using the current header or visibly restarts the WAL right away. That lets us
-            // advance the shadow WAL immediately instead of deferring a spurious generation
-            // rollover to the next background sync.
-            snapshot_write_lock.execute(
-                "INSERT INTO _replited_seq (id, seq) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET seq = seq + 1;",
-                (),
-            )?;
             snapshot_write_lock.execute_batch("COMMIT;")?;
 
-            let wal_header_after_snapshot = WALHeader::read(&self.wal_file)?;
             let current_index = parse_wal_path(&shadow_wal_file)?;
-            let stream_start_pos = if wal_header_before_checkpoint != wal_header_after_snapshot {
-                let next_shadow_wal_file = self.shadow_wal_file(&generation, current_index + 1);
+            let restarted =
+                self.restart_wal_after_materialized_snapshot(&generation, current_index)?;
+
+            let (stream_index, _stream_shadow_size) = self.current_shadow_index(&generation)?;
+            if !restarted {
                 debug!(
-                    "db {} snapshot rotated WAL header, seeding next shadow WAL index {}",
-                    self.config.db,
-                    current_index + 1
-                );
-                self.init_shadow_wal_file(&next_shadow_wal_file)?;
-                WalGenerationPos {
-                    generation: pos.generation.clone(),
-                    index: current_index + 1,
-                    offset: WAL_HEADER_SIZE,
-                }
-            } else {
-                debug!(
-                    "db {} snapshot kept WAL header, appending post-snapshot frames to current shadow WAL index {}",
+                    "db {} snapshot did not restart WAL during truncate checkpoint; publishing current shadow WAL index {} from offset zero",
                     self.config.db, current_index
                 );
-                self.copy_to_shadow_wal(&shadow_wal_file)?;
-                pos
+            }
+
+            let stream_start_pos = WalGenerationPos {
+                generation: pos.generation.clone(),
+                index: stream_index,
+                offset: 0,
             };
 
             Ok((compressed_data.to_owned(), stream_start_pos))
@@ -214,7 +236,6 @@ impl Database {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Read;
     use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
 
@@ -380,9 +401,9 @@ addr = "http://127.0.0.1:50051"
             restored_count, 1,
             "snapshot DB should contain the pre-snapshot row"
         );
-        assert!(
-            snapshot_pos.offset > shadow_size_before,
-            "snapshot position must advance to cover WAL frames copied into the snapshot DB; shadow_before={shadow_size_before} snapshot_pos={snapshot_pos:?}"
+        assert_eq!(
+            snapshot_pos.offset, 0,
+            "materialized snapshot should publish a WAL-free resume boundary; shadow_before={shadow_size_before} snapshot_pos={snapshot_pos:?}"
         );
     }
 
@@ -468,15 +489,10 @@ addr = "http://127.0.0.1:50051"
             decompressed_data(compressed_data).expect("decompress snapshot"),
         )
         .expect("write restored db");
-        let generation = db.current_generation().expect("current generation");
-        let shadow_wal = db.shadow_wal_file(&generation, snapshot_pos.index);
-        let mut shadow_file = fs::File::open(&shadow_wal).expect("open shadow WAL");
-        let mut wal_prefix = vec![0u8; snapshot_pos.offset as usize];
-        shadow_file
-            .read_exact(&mut wal_prefix)
-            .expect("read replay WAL prefix");
-        std::fs::write(restored_path.with_extension("db-wal"), wal_prefix)
-            .expect("write restored WAL prefix");
+        assert_eq!(
+            snapshot_pos.offset, 0,
+            "blocked-reader snapshots should be self-contained and not require WAL prefix replay"
+        );
         let restored_conn = Connection::open(&restored_path).expect("open restored db");
         let quick_check: String = restored_conn
             .pragma_query_value(None, "quick_check", |row| row.get(0))
@@ -598,7 +614,7 @@ addr = "http://127.0.0.1:50051"
     }
 
     #[tokio::test]
-    async fn snapshot_keeps_same_shadow_wal_index_when_header_does_not_restart() {
+    async fn snapshot_starts_next_shadow_wal_index_after_checkpoint_restart() {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("primary.db");
 
@@ -617,20 +633,35 @@ addr = "http://127.0.0.1:50051"
                 (),
             )
             .expect("seed row");
+        if db
+            .current_generation()
+            .expect("current generation")
+            .is_empty()
+        {
+            db.create_generation().await.expect("create generation");
+        }
+        let generation = db.current_generation().expect("current generation");
+        let (index_before_snapshot, _size_before_snapshot) = db
+            .current_shadow_index(&generation)
+            .expect("current shadow index before snapshot");
 
         let (_compressed_data, snapshot_pos) = db.snapshot().await.expect("snapshot");
-        let generation = db.current_generation().expect("current generation");
         let (tail_index, _tail_size) = db
             .current_shadow_index(&generation)
             .expect("current shadow index");
 
         assert_eq!(
             tail_index, snapshot_pos.index,
-            "snapshot should continue the same shadow WAL when SQLite keeps the WAL header"
+            "snapshot should publish the post-checkpoint shadow WAL as the replication resume index"
         );
-        assert!(
-            snapshot_pos.offset > WAL_HEADER_SIZE,
-            "same-index snapshot boundary should point after already materialized frames"
+        assert_eq!(
+            tail_index,
+            index_before_snapshot + 1,
+            "materialized snapshots must move future WAL packs to a fresh aligned index when checkpoint restart succeeds"
+        );
+        assert_eq!(
+            snapshot_pos.offset, 0,
+            "future WAL packs should start from offset zero in the new shadow WAL"
         );
     }
 }

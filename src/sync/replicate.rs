@@ -422,10 +422,6 @@ impl Replicate {
                 self.state
             )));
         }
-        if pos.offset == 0 {
-            return Ok(());
-        }
-
         self.client
             .publish_manifest_snapshot(&pos, compressed_data)
             .await?;
