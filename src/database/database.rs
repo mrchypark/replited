@@ -103,6 +103,7 @@ pub struct Database {
     last_retention_log: Option<Instant>,
     last_retention_floor: Option<u64>,
     last_retention_tail: Option<u64>,
+    last_checkpointed_snapshot_mod_time: Option<SystemTime>,
 }
 
 // position info of wal for a generation
@@ -136,21 +137,6 @@ struct SyncInfo {
 }
 
 impl Database {
-    fn reopen_main_connection(&mut self) -> Result<()> {
-        // Drop the old DB handle before reopening so SQLite can rebuild WAL state
-        // without another live connection still referencing deleted WAL files.
-        let placeholder = Connection::open_in_memory()?;
-        let stale = std::mem::replace(&mut self.connection, placeholder);
-        drop(stale);
-
-        let conn = Connection::open(&self.config.db)?;
-        conn.busy_timeout(Duration::from_secs(5))?;
-        Self::init_params(&self.config.db, &conn)?;
-        Self::create_internal_tables(&conn)?;
-        self.connection = conn;
-        Ok(())
-    }
-
     fn has_generation_recovery_context(&self) -> bool {
         let generation = match self.current_generation() {
             Ok(generation) if !generation.is_empty() => generation,
@@ -161,33 +147,6 @@ impl Database {
             Err(_) => return false,
         };
         fs::exists(&shadow_wal_file).unwrap_or(false)
-    }
-
-    async fn force_wal_header_creation(&mut self) -> Result<bool> {
-        let had_read_lock = self.tx_connection.is_some();
-        let _ = self.release_read_lock();
-        self.reopen_main_connection()?;
-        let _ = fs::remove_file(&self.wal_file);
-        let _ = fs::remove_file(format!("{}-shm", self.config.db));
-        self.reopen_main_connection()?;
-        self.connection.execute(
-            "INSERT INTO _replited_seq (id, seq) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET seq = seq + 1;",
-            (),
-        )?;
-        sleep(Duration::from_millis(50)).await;
-
-        if !fs::exists(&self.wal_file)? {
-            if had_read_lock {
-                self.acquire_read_lock()?;
-            }
-            return Ok(false);
-        }
-
-        let has_header = fs::metadata(&self.wal_file)?.len() >= WAL_HEADER_SIZE;
-        if had_read_lock {
-            self.acquire_read_lock()?;
-        }
-        Ok(has_header)
     }
 
     // acquire_read_lock begins a read transaction on the database to prevent checkpointing.
@@ -240,7 +199,26 @@ impl Database {
         debug!("sync database: {}", self.config.db);
 
         // make sure wal file has at least one frame in it
-        self.ensure_wal_exists().await?;
+        if !self.ensure_wal_exists().await? {
+            if self.has_generation_recovery_context() {
+                let db_mod_time = fs::metadata(&self.config.db)
+                    .ok()
+                    .and_then(|metadata| metadata.modified().ok());
+                if db_mod_time.is_some() && self.last_checkpointed_snapshot_mod_time == db_mod_time
+                {
+                    return Ok(());
+                }
+
+                let generation_pos = self.create_checkpointed_generation()?;
+                self.last_checkpointed_snapshot_mod_time = db_mod_time;
+                info!(
+                    "db {} created checkpointed generation snapshot request at {:?}",
+                    self.config.db, generation_pos
+                );
+                self.notify_db_changed(generation_pos).await;
+            }
+            return Ok(());
+        }
 
         // Verify our last sync matches the current state of the WAL.
         // This ensures that we have an existing generation & that the last sync
@@ -290,14 +268,7 @@ impl Database {
         // notify the database has been changed
         if changed {
             let generation_pos = self.wal_generation_position()?;
-            for notifier in &self.sync_notifiers {
-                let Some(notifier) = notifier else {
-                    continue;
-                };
-                notifier
-                    .send(ReplicateCommand::DbChanged(generation_pos.clone()))
-                    .await?;
-            }
+            self.notify_db_changed(generation_pos).await;
         }
 
         debug!("sync db {} ok", self.config.db);
@@ -386,12 +357,89 @@ impl Database {
         Ok(generation)
     }
 
+    fn create_checkpointed_generation(&mut self) -> Result<WalGenerationPos> {
+        let generation = Generation::new();
+
+        let generation_file = generation_file_path(&self.meta_dir);
+        let generation_file_path = Path::new(&generation_file);
+        let dest_dir = generation_file_path
+            .parent()
+            .unwrap_or_else(|| Path::new(&self.meta_dir));
+        fs::create_dir_all(dest_dir)?;
+
+        let temp_file = NamedTempFile::new_in(dest_dir)?;
+        fs::write(temp_file.path(), generation.as_str())?;
+
+        let dir = generation_dir(&self.meta_dir, generation.as_str());
+        fs::create_dir_all(&dir)?;
+
+        let shadow_wal = self.shadow_wal_file(generation.as_str(), 0);
+        let db_file_metadata = fs::metadata(&self.config.db)?;
+        if let Some(dir) = parent_dir(&shadow_wal) {
+            fs::create_dir_all(&dir)?;
+        }
+        let mut shadow_wal_file = fs::File::create(&shadow_wal)?;
+        let mut permissions = shadow_wal_file.metadata()?.permissions();
+        permissions.set_mode(db_file_metadata.mode());
+        shadow_wal_file.set_permissions(permissions)?;
+        std::os::unix::fs::chown(
+            &shadow_wal,
+            Some(db_file_metadata.uid()),
+            Some(db_file_metadata.gid()),
+        )?;
+        shadow_wal_file.write_all(&vec![0; WAL_HEADER_SIZE as usize])?;
+        shadow_wal_file.flush()?;
+
+        fs::rename(temp_file.path(), &generation_file)?;
+        self.clean()?;
+
+        Ok(WalGenerationPos {
+            generation,
+            index: 0,
+            offset: WAL_HEADER_SIZE,
+        })
+    }
+
+    async fn notify_db_changed(&mut self, generation_pos: WalGenerationPos) {
+        for notifier_slot in &mut self.sync_notifiers {
+            let Some(notifier) = notifier_slot else {
+                continue;
+            };
+            if let Err(err) = notifier
+                .send(ReplicateCommand::DbChanged(generation_pos.clone()))
+                .await
+            {
+                warn!(
+                    "db {} replicate notifier closed; disabling notifier: {}",
+                    self.config.db, err
+                );
+                *notifier_slot = None;
+            }
+        }
+    }
+
     // copies pending bytes from the real WAL to the shadow WAL.
     fn sync_wal(&mut self, info: &SyncInfo) -> Result<(u64, u64)> {
-        self.acquire_read_lock()?;
-        let result = self.copy_to_shadow_wal(&info.shadow_wal_file);
-        self.release_read_lock()?;
-        let (orig_size, new_size) = result?;
+        if let Err(err) = self.release_read_lock() {
+            warn!(
+                "db {} sync_wal release read lock failed before copying WAL: {:?}",
+                self.config.db, err
+            );
+        }
+        let copy_result = self.copy_to_shadow_wal(&info.shadow_wal_file);
+        let reacquire_result = self.acquire_read_lock();
+        let (orig_size, new_size) = match (copy_result, reacquire_result) {
+            (Ok(v), Ok(())) => v,
+            (Ok(v), Err(e)) => {
+                warn!(
+                    "db {} sync_wal copied WAL but failed to refresh read lock: {:?}",
+                    self.config.db, e
+                );
+                v
+            }
+            (Err(e), Ok(())) => return Err(e),
+            (Err(e), Err(_)) => return Err(e),
+        };
         debug!(
             "db {} sync_wal copy_to_shadow_wal: {}, {}",
             self.config.db, orig_size, new_size
@@ -827,6 +875,49 @@ impl Database {
         Ok(())
     }
 
+    fn reopen_connection(&mut self) -> Result<()> {
+        let connection = Connection::open(&self.config.db)?;
+        Database::init_params(&self.config.db, &connection)?;
+        Database::create_internal_tables(&connection)?;
+        self.connection = connection;
+        Ok(())
+    }
+
+    fn write_wal_anchor(&mut self) -> Result<()> {
+        let _ = self
+            .connection
+            .pragma_update_and_check(None, "journal_mode", "WAL", |_| Ok(()));
+        let tx = self.connection.transaction()?;
+        tx.execute(
+            "INSERT INTO _replited_seq (id, seq) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET seq = seq + 1;",
+            (),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn refresh_wal_anchor(&mut self) -> Result<()> {
+        if let Err(err) = self.release_read_lock() {
+            warn!(
+                "db {} WAL anchor release read lock failed before refresh: {:?}",
+                self.config.db, err
+            );
+        }
+
+        let mut write_result = self.write_wal_anchor();
+        if let Err(err) = &write_result {
+            warn!(
+                "db {} WAL anchor write failed; reopening connection before retrying: {:?}",
+                self.config.db, err
+            );
+            write_result = self
+                .reopen_connection()
+                .and_then(|_| self.write_wal_anchor());
+        }
+
+        write_result
+    }
+
     fn debug_assert_shadow_wal_matches_live(
         &self,
         _shadow_wal: &str,
@@ -854,7 +945,7 @@ impl Database {
     }
 
     // make sure wal file has at least one frame in it
-    async fn ensure_wal_exists(&mut self) -> Result<()> {
+    async fn ensure_wal_exists(&mut self) -> Result<bool> {
         for _ in 0..5 {
             if fs::exists(&self.wal_file)? {
                 let stat = fs::metadata(&self.wal_file)?;
@@ -866,30 +957,41 @@ impl Database {
                 }
 
                 if stat.len() >= WAL_HEADER_SIZE {
-                    return Ok(());
+                    match WALHeader::read(&self.wal_file) {
+                        Ok(header) if header.page_size == self.page_size => return Ok(true),
+                        Ok(header) => warn!(
+                            "db {} WAL header page size {} does not match database page size {}; refreshing WAL anchor",
+                            self.config.db, header.page_size, self.page_size
+                        ),
+                        Err(err) => warn!(
+                            "db {} WAL header is invalid; refreshing WAL anchor: {:?}",
+                            self.config.db, err
+                        ),
+                    }
                 }
             }
 
-            // Ensure WAL mode and force a write to create the WAL header.
-            let _ =
-                self.connection
-                    .pragma_update_and_check(None, "journal_mode", "WAL", |_| Ok(()));
-            self.connection.execute(
-                "INSERT INTO _replited_seq (id, seq) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET seq = seq + 1;",
-                (),
-            )?;
+            // The current read transaction may be anchored before future writer frames.
+            // Refresh it around a forced write so the next sync protects the latest WAL end.
+            if let Err(err) = self.refresh_wal_anchor() {
+                if self.has_generation_recovery_context() {
+                    warn!(
+                        "db {} WAL anchor refresh failed; waiting for next writer before syncing: {:?}",
+                        self.config.db, err
+                    );
+                    return Ok(false);
+                }
+                return Err(err);
+            }
             sleep(Duration::from_millis(50)).await;
         }
 
         if self.has_generation_recovery_context() {
             warn!(
-                "db {} WAL header still missing after retries; deferring to generation recovery path",
+                "db {} WAL header still missing after retries; waiting for next writer before syncing",
                 self.config.db
             );
-            if self.force_wal_header_creation().await? {
-                return Ok(());
-            }
-            return Ok(());
+            return Ok(false);
         }
 
         Err(Error::SqliteWalError(format!(
@@ -1117,6 +1219,7 @@ mod tests {
     use crate::config::DbConfig;
 
     use super::{Database, DbCommand};
+    use crate::sync::ReplicateCommand;
 
     fn replica_notification_fixture(db_path: &str, backup_root: &str) -> DbConfig {
         let toml_str = format!(
@@ -1215,5 +1318,164 @@ root = "{backup_root}"
         db.sync()
             .await
             .expect("follow-up sync should keep working after WAL recovery");
+    }
+
+    #[tokio::test]
+    async fn sync_notifies_closed_writer_updates_after_snapshot() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("primary.db");
+        let backup_root = dir.path().join("backup");
+
+        let config = replica_notification_fixture(
+            db_path.to_string_lossy().as_ref(),
+            backup_root.to_string_lossy().as_ref(),
+        );
+
+        let (mut db, _rx) = Database::try_create(config).await.expect("create db");
+        db.connection
+            .execute(
+                "CREATE TABLE IF NOT EXISTS closed_writer_after_snapshot (id INTEGER PRIMARY KEY, value TEXT NOT NULL)",
+                (),
+            )
+            .expect("create test table");
+        db.snapshot().await.expect("snapshot before external write");
+
+        let (sync_tx, mut sync_rx) = tokio::sync::mpsc::channel(1);
+        db.sync_notifiers = vec![Some(sync_tx)];
+
+        {
+            let external = rusqlite::Connection::open(&db.config.db).expect("external open");
+            external
+                .pragma_update(None, "journal_mode", "WAL")
+                .expect("external WAL mode");
+            external
+                .execute(
+                    "INSERT INTO closed_writer_after_snapshot (value) VALUES ('after-snapshot')",
+                    (),
+                )
+                .expect("external write");
+        }
+
+        db.sync().await.expect("sync after closed external writer");
+
+        let cmd = tokio::time::timeout(Duration::from_millis(500), sync_rx.recv())
+            .await
+            .expect("timed out waiting for sync notification")
+            .expect("sync notifier closed");
+
+        match cmd {
+            ReplicateCommand::DbChanged(pos) => {
+                assert!(
+                    pos.offset > super::WAL_HEADER_SIZE,
+                    "expected sync position beyond WAL header, got {pos:?}"
+                );
+            }
+            other => panic!("expected DbChanged notification, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn sync_keeps_read_lock_after_archiving_wal() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("primary.db");
+        let backup_root = dir.path().join("backup");
+
+        let config = replica_notification_fixture(
+            db_path.to_string_lossy().as_ref(),
+            backup_root.to_string_lossy().as_ref(),
+        );
+
+        let (mut db, _rx) = Database::try_create(config).await.expect("create db");
+        db.connection
+            .execute(
+                "CREATE TABLE IF NOT EXISTS sync_keeps_read_lock (id INTEGER PRIMARY KEY, value TEXT NOT NULL)",
+                (),
+            )
+            .expect("create test table");
+
+        {
+            let external = rusqlite::Connection::open(&db.config.db).expect("external open");
+            external
+                .pragma_update(None, "journal_mode", "WAL")
+                .expect("external WAL mode");
+            external
+                .execute(
+                    "INSERT INTO sync_keeps_read_lock (value) VALUES ('after-sync')",
+                    (),
+                )
+                .expect("external write");
+        }
+
+        db.sync().await.expect("sync external writer WAL");
+
+        assert!(
+            db.tx_connection.is_some(),
+            "sync should restore the steady-state read lock after copying WAL"
+        );
+    }
+
+    #[tokio::test]
+    async fn ensure_wal_exists_recreates_missing_wal_before_sync_reanchors_read_lock() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("primary.db");
+        let backup_root = dir.path().join("backup");
+
+        let config = replica_notification_fixture(
+            db_path.to_string_lossy().as_ref(),
+            backup_root.to_string_lossy().as_ref(),
+        );
+
+        let (mut db, _rx) = Database::try_create(config).await.expect("create db");
+        db.snapshot().await.expect("create generation");
+
+        db.release_read_lock().expect("release read lock");
+        db.connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("checkpoint WAL");
+        db.acquire_read_lock().expect("reacquire read lock");
+
+        assert!(db.ensure_wal_exists().await.expect("ensure WAL exists"));
+
+        assert!(
+            std::fs::metadata(&db.wal_file).expect("WAL metadata").len() >= super::WAL_HEADER_SIZE,
+            "ensure_wal_exists should recreate a WAL header"
+        );
+        db.sync().await.expect("sync after WAL recreation");
+
+        assert!(
+            db.tx_connection.is_some(),
+            "sync should leave the steady-state read lock in place after copying WAL"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_keeps_working_when_a_non_stream_replicate_worker_has_stopped() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("primary.db");
+        let backup_root = dir.path().join("backup");
+
+        let config = replica_notification_fixture(
+            db_path.to_string_lossy().as_ref(),
+            backup_root.to_string_lossy().as_ref(),
+        );
+
+        let (mut db, _rx) = Database::try_create(config).await.expect("create db");
+        db.connection
+            .execute(
+                "CREATE TABLE IF NOT EXISTS closed_notifier (id INTEGER PRIMARY KEY, value TEXT NOT NULL)",
+                (),
+            )
+            .expect("create test table");
+        db.connection
+            .execute("INSERT INTO closed_notifier (value) VALUES ('first')", ())
+            .expect("seed row");
+
+        let (closed_tx, closed_rx) = tokio::sync::mpsc::channel(1);
+        drop(closed_rx);
+        db.sync_notifiers = vec![Some(closed_tx)];
+
+        db.sync()
+            .await
+            .expect("closed replicate notifier should not fail database sync");
     }
 }

@@ -1,4 +1,5 @@
 use std::fs;
+use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
@@ -13,10 +14,14 @@ use crate::sync::{ReplicaRecoveryAction, StreamReplicationErrorCode};
 use rusqlite::Error as RusqliteError;
 
 mod local_state;
+mod managed_reader;
 mod process_manager;
+#[allow(dead_code)]
+mod reader_proxy;
 mod streaming;
 
 use local_state::{load_or_create_replica_id, persist_last_applied_lsn, read_last_applied_lsn};
+use managed_reader::ManagedChildTemplate;
 use process_manager::{ProcessManager, ReaderBlocker};
 use streaming::{ack_lsn_or_warn, stream_snapshot_and_restore, stream_wal_and_apply};
 
@@ -76,7 +81,18 @@ struct WalCycleContext<'a> {
 pub struct ReplicaSidecar {
     config: Config,
     force_restore: bool,
-    exec: Option<String>,
+    exec_mode: ReaderExecMode,
+}
+
+#[derive(Clone)]
+enum ReaderExecMode {
+    None,
+    LegacyChild(String),
+    ManagedProxy {
+        proxy_addr: String,
+        child_template: ManagedChildTemplate,
+        generation_root: String,
+    },
 }
 
 impl ReplicaSidecar {
@@ -84,27 +100,53 @@ impl ReplicaSidecar {
         config_path: &str,
         force_restore: bool,
         exec: Option<String>,
+        exec_managed_proxy: Option<String>,
+        exec_child_template: Option<String>,
+        exec_generation_root: Option<String>,
     ) -> Result<Self> {
         let config = Config::load(config_path)?;
         crate::log::init_log(config.log.clone())?;
+        let exec_mode = build_reader_exec_mode(
+            exec.as_ref(),
+            exec_managed_proxy.as_ref(),
+            exec_child_template.as_ref(),
+            exec_generation_root.as_ref(),
+        )?;
         Ok(Self {
             config,
             force_restore,
-            exec,
+            exec_mode,
         })
     }
 
     pub async fn run(&mut self) -> Result<()> {
         let mut handles = vec![];
 
-        let process_manager = self.exec.clone().map(ProcessManager::new);
+        if matches!(self.exec_mode, ReaderExecMode::ManagedProxy { .. })
+            && self.config.database.len() != 1
+        {
+            return Err(Error::InvalidArg(
+                "--exec-managed-proxy currently supports exactly one database entry".to_string(),
+            ));
+        }
 
         for db_config in &self.config.database {
             let db_config = db_config.clone();
             let force_restore = self.force_restore;
-            let pm = process_manager.clone();
+            let exec_mode = self.exec_mode.clone();
 
             let handle = tokio::spawn(async move {
+                let pm = match build_process_manager_for_db(&exec_mode, &db_config.db).await {
+                    Ok(pm) => pm,
+                    Err(e) => {
+                        log::error!(
+                            "ReplicaSidecar process manager error for db {}: {}",
+                            db_config.db,
+                            e
+                        );
+                        return;
+                    }
+                };
                 if let Err(e) = Self::run_single_db(db_config.clone(), force_restore, pm).await {
                     log::error!("ReplicaSidecar error for db {}: {}", db_config.db, e);
                 }
@@ -218,6 +260,73 @@ impl ReplicaSidecar {
 
         result
     }
+}
+
+async fn build_process_manager_for_db(
+    exec_mode: &ReaderExecMode,
+    db_path: &str,
+) -> Result<Option<ProcessManager>> {
+    match exec_mode {
+        ReaderExecMode::None => Ok(None),
+        ReaderExecMode::LegacyChild(cmd) => Ok(Some(ProcessManager::new(cmd.clone()))),
+        ReaderExecMode::ManagedProxy {
+            proxy_addr,
+            child_template,
+            generation_root,
+        } => {
+            let proxy_addr = proxy_addr.parse::<SocketAddr>().map_err(|err| {
+                Error::InvalidArg(format!("invalid --exec-managed-proxy address: {err}"))
+            })?;
+            let manager = ProcessManager::new_managed_proxy(
+                proxy_addr,
+                child_template.clone(),
+                generation_root.clone(),
+                db_path,
+            )
+            .await
+            .map_err(Error::from_std_error)?;
+            Ok(Some(manager))
+        }
+    }
+}
+
+fn build_reader_exec_mode(
+    exec: Option<&String>,
+    proxy_addr: Option<&String>,
+    child_template: Option<&String>,
+    generation_root: Option<&String>,
+) -> Result<ReaderExecMode> {
+    if exec.is_some() && proxy_addr.is_some() {
+        return Err(Error::InvalidArg(
+            "--exec cannot be used with --exec-managed-proxy".to_string(),
+        ));
+    }
+    if let Some(exec) = exec {
+        return Ok(ReaderExecMode::LegacyChild(exec.clone()));
+    }
+    if proxy_addr.is_none() {
+        return Ok(ReaderExecMode::None);
+    }
+
+    let template = child_template.ok_or_else(|| {
+        Error::InvalidArg("--exec-child-template is required with --exec-managed-proxy".to_string())
+    })?;
+    let child_template = ManagedChildTemplate::parse(template).map_err(Error::InvalidArg)?;
+    let root = generation_root.ok_or_else(|| {
+        Error::InvalidArg(
+            "--exec-generation-root is required with --exec-managed-proxy".to_string(),
+        )
+    })?;
+    if root.trim().is_empty() {
+        return Err(Error::InvalidArg(
+            "--exec-generation-root cannot be empty".to_string(),
+        ));
+    }
+    Ok(ReaderExecMode::ManagedProxy {
+        proxy_addr: proxy_addr.expect("checked proxy addr").clone(),
+        child_template,
+        generation_root: root.clone(),
+    })
 }
 
 fn initial_replica_state(

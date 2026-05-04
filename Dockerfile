@@ -9,5 +9,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY docker-context/replited-${TARGETARCH} /usr/local/bin/replited
 
 RUN chmod +x /usr/local/bin/replited
+RUN /usr/local/bin/replited --version
 
 ENTRYPOINT ["/usr/local/bin/replited"]

@@ -172,6 +172,7 @@ impl Database {
             last_retention_log: None,
             last_retention_floor: None,
             last_retention_tail: None,
+            last_checkpointed_snapshot_mod_time: None,
         };
 
         info!("Acquiring read lock");

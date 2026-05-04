@@ -1,6 +1,4 @@
 use std::env;
-use std::sync::Arc;
-use std::sync::LazyLock;
 use std::time::Duration;
 
 use log::warn;
@@ -8,7 +6,6 @@ use opendal::Builder;
 use opendal::Operator;
 use opendal::raw::HttpClient;
 use opendal::services;
-use reqwest_hickory_resolver::HickoryResolver;
 
 use crate::config::StorageAzblobConfig;
 use crate::config::StorageFsConfig;
@@ -16,10 +13,6 @@ use crate::config::StorageGcsConfig;
 use crate::config::StorageParams;
 use crate::config::StorageS3Config;
 use crate::error::Result;
-
-/// The global dns resolver for opendal.
-static GLOBAL_HICKORY_RESOLVER: LazyLock<Arc<HickoryResolver>> =
-    LazyLock::new(|| Arc::new(HickoryResolver::default()));
 
 pub fn init_operator(cfg: &StorageParams) -> Result<Operator> {
     let op = match cfg {
@@ -101,9 +94,6 @@ fn new_storage_http_client() -> Result<HttpClient> {
 
     // Disable http2 for better performance.
     builder = builder.http1_only();
-
-    // Set dns resolver.
-    builder = builder.dns_resolver(GLOBAL_HICKORY_RESOLVER.clone());
 
     // Pool max idle per host controls connection pool size.
     // Default to no limit, set to `0` for disable it.

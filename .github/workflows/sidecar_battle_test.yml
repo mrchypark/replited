@@ -17,11 +17,11 @@ jobs:
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup
 
-      - name: 'Run sidecar battle scenarios (non-blocking)'
-        continue-on-error: true
+      - name: 'Run sidecar battle scenarios'
         shell: bash
         run: |
           cargo build --release
           python3 tests/battle/sidecar_restore_retry_recover_test.py --scenario restore
           python3 tests/battle/sidecar_restore_retry_recover_test.py --scenario retry
           python3 tests/battle/sidecar_restore_retry_recover_test.py --scenario recover
+          python3 tests/battle/cold_start_readonly_bootstrap_checkpoint_test.py
