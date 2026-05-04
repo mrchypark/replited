@@ -14,6 +14,8 @@ use rusqlite::Error as RusqliteError;
 
 mod local_state;
 mod process_manager;
+#[allow(dead_code)]
+mod reader_proxy;
 mod streaming;
 
 use local_state::{load_or_create_replica_id, persist_last_applied_lsn, read_last_applied_lsn};
