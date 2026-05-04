@@ -836,8 +836,8 @@ async fn apply_wal_chunk_and_refresh(
     suppress_ack: &mut bool,
     process_manager: Option<&ProcessManager>,
 ) -> Result<(), ReplicaStreamError> {
-    let managed_reader = process_manager.is_some() && chunk_start.offset == 0;
-    if let Some(pm) = process_manager.filter(|_| chunk_start.offset == 0) {
+    let managed_reader = process_manager.is_some();
+    if let Some(pm) = process_manager {
         let jitter = managed_reader_restart_jitter();
         if !jitter.is_zero() {
             info!(
@@ -889,7 +889,7 @@ async fn apply_wal_chunk_and_refresh(
     }
     .await;
 
-    if let Some(pm) = process_manager.filter(|_| chunk_start.offset == 0) {
+    if let Some(pm) = process_manager {
         if result.is_ok() {
             let refresh_result = async {
                 if checkpoint_due {
@@ -1766,7 +1766,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_wal_chunk_keeps_managed_reader_running_after_non_checkpoint_tail_chunk() {
+    async fn apply_wal_chunk_restarts_managed_reader_after_non_checkpoint_tail_chunk() {
         let (temp_dir, db_path) = create_test_wal_db();
         let wal_path = format!("{db_path}-wal");
         fs::write(&wal_path, vec![0u8; WAL_HEADER_SIZE as usize]).expect("seed WAL prefix");
@@ -1821,8 +1821,8 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let marker = fs::read_to_string(&marker_path).expect("reader start marker");
         assert_eq!(
-            marker, "started",
-            "ordinary tail chunks should not restart a managed reader; live readers can observe appended WAL without full process churn"
+            marker, "startedstarted",
+            "managed reader must restart after ordinary tail chunks so a live child reopens the updated DB/WAL set"
         );
         assert_eq!(process_manager.blocker_count(), 0);
         assert!(
