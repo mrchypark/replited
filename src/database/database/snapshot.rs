@@ -48,25 +48,6 @@ impl Database {
         Ok(conn)
     }
 
-    fn compress_vacuumed_snapshot(&self) -> Result<Vec<u8>> {
-        let parent = parent_dir(&self.config.db).unwrap_or_else(|| ".".to_string());
-        let snapshot_file = NamedTempFile::new_in(parent)?;
-        let snapshot_path = snapshot_file.path().to_path_buf();
-        fs::remove_file(&snapshot_path)?;
-
-        let snapshot_path_str = snapshot_path.to_string_lossy().to_string();
-        let escaped_path = snapshot_path_str.replace('\'', "''");
-        let snapshot_conn = Connection::open(&self.config.db)?;
-        snapshot_conn.busy_timeout(Duration::from_secs(5))?;
-        snapshot_conn
-            .execute_batch(&format!("VACUUM main INTO '{escaped_path}'"))?;
-
-        let compressed_data = compress_file(&snapshot_path_str)?;
-        fs::remove_file(&snapshot_path)?;
-        drop(snapshot_file);
-        Ok(compressed_data)
-    }
-
     pub(super) async fn snapshot(&mut self) -> Result<(Vec<u8>, WalGenerationPos)> {
         let result: Result<(Vec<u8>, WalGenerationPos)> = async {
             // Ensure WAL exists before trying to derive a generation position.
@@ -110,9 +91,14 @@ impl Database {
 
             let wal_header_before_checkpoint = WALHeader::read(&self.wal_file)?;
 
-            let compressed_data = self.compress_vacuumed_snapshot()?;
+            // Flush those exact frames into the DB file while writers are still blocked. The
+            // returned boundary still points at the copied WAL prefix so replicas can rebuild a
+            // complete WAL stream from the raw DB snapshot.
+            self.exec_checkpoint(CheckpointMode::Passive.as_str())?;
 
             info!("db {} snapshot created, pos: {:?}", self.config.db, pos);
+
+            let compressed_data = compress_file(&self.config.db)?;
 
             // Mirror do_checkpoint(): force a post-snapshot WAL write so SQLite either keeps
             // using the current header or visibly restarts the WAL right away. That lets us
@@ -199,6 +185,7 @@ impl Database {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read;
     use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
 
@@ -438,10 +425,10 @@ addr = "http://127.0.0.1:50051"
             )
             .expect("write row that checkpoint cannot flush while reader is active");
 
-        let (compressed_data, _snapshot_pos) = db
+        let (compressed_data, snapshot_pos) = db
             .snapshot()
             .await
-            .expect("snapshot should produce a standalone DB view");
+            .expect("snapshot should produce a DB plus WAL boundary");
         reader
             .execute_batch("ROLLBACK;")
             .expect("release external reader");
@@ -452,6 +439,16 @@ addr = "http://127.0.0.1:50051"
             decompressed_data(compressed_data).expect("decompress snapshot"),
         )
         .expect("write restored db");
+        let generation = db.current_generation().expect("current generation");
+        let shadow_wal = db
+            .shadow_wal_file(&generation, snapshot_pos.index);
+        let mut shadow_file = fs::File::open(&shadow_wal).expect("open shadow WAL");
+        let mut wal_prefix = vec![0u8; snapshot_pos.offset as usize];
+        shadow_file
+            .read_exact(&mut wal_prefix)
+            .expect("read replay WAL prefix");
+        std::fs::write(restored_path.with_extension("db-wal"), wal_prefix)
+            .expect("write restored WAL prefix");
         let restored_conn = Connection::open(&restored_path).expect("open restored db");
         let quick_check: String = restored_conn
             .pragma_query_value(None, "quick_check", |row| row.get(0))
