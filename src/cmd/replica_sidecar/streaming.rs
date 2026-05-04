@@ -343,20 +343,7 @@ pub(super) async fn stream_wal_and_apply(
                         suppress_ack,
                     )
                 {
-                    if frames_since_refresh > 0 {
-                        let expected_frames = expected_frames_from_wal_file(db_path, page_size)?;
-                        refresh_wal_index(
-                            db_path,
-                            expected_frames,
-                            &mut refresh_state,
-                            process_manager.as_ref(),
-                        )
-                        .await?;
-                        frames_since_refresh = 0;
-                        last_checkpoint_refresh = Instant::now();
-                    }
                     if let Some(blocker) = catchup_reader_blocker.take() {
-                        materialize_standalone_db(db_path).await?;
                         blocker.release().await;
                         current_pos = chunk_next;
                         tokio::time::sleep(managed_reader_startup_grace()).await;
@@ -400,7 +387,6 @@ pub(super) async fn stream_wal_and_apply(
         }
     }
     if let Some(blocker) = catchup_reader_blocker.take() {
-        materialize_standalone_db(db_path).await?;
         blocker.release().await;
         tokio::time::sleep(managed_reader_startup_grace()).await;
     }
@@ -881,7 +867,6 @@ async fn apply_wal_chunk_and_refresh(
                     let expected_frames = expected_frames_from_wal_file(db_path, page_size)?;
                     refresh_wal_index(db_path, expected_frames, refresh_state, None).await?;
                 }
-                materialize_standalone_db(db_path).await?;
                 *frames_since_refresh = 0;
                 *last_checkpoint_refresh = Instant::now();
                 Ok(())
@@ -1698,7 +1683,7 @@ mod tests {
         let last_applied_lsn_path = meta_dir.join("last_applied_lsn");
         let marker_path = temp_dir.path().join("reader-started-after-durable");
         let cmd = format!(
-            "if [ ! -e '{}' ] && [ -s '{}' ] && [ -s '{}' ]; then printf durable > '{}'; else printf early > '{}'; fi; sleep 60",
+            "if [ -s '{}' ] && [ -s '{}' ] && [ -s '{}' ]; then printf durable > '{}'; else printf early > '{}'; fi; sleep 60",
             wal_path,
             shadow_path.display(),
             last_applied_lsn_path.display(),
@@ -1737,7 +1722,7 @@ mod tests {
         let marker = fs::read_to_string(&marker_path).expect("reader start marker");
         assert_eq!(
             marker, "durable",
-            "managed reader must start only after WAL is materialized and shadow WAL and last_applied_lsn are durable"
+            "managed reader must start only after live WAL, shadow WAL, and last_applied_lsn are durable"
         );
         let replica = Connection::open(&db_path).expect("open materialized replica");
         let visible: i64 = replica
@@ -1808,12 +1793,12 @@ mod tests {
         let marker = fs::read_to_string(&marker_path).expect("reader start marker");
         assert_eq!(
             marker, "startedstarted",
-            "managed reader must restart after ordinary tail chunks so a live child observes a materialized DB instead of stale external WAL frames"
+            "managed reader must restart after ordinary tail chunks so a live child reopens the updated DB/WAL set"
         );
         assert_eq!(process_manager.blocker_count(), 0);
         assert!(
-            !std::path::Path::new(&wal_path).exists(),
-            "materialized DB should not leave externally appended WAL frames for the restarted reader"
+            std::path::Path::new(&wal_path).exists(),
+            "managed reader restart should preserve the WAL file needed for same-generation tail chunks"
         );
         process_manager.stop().await;
     }

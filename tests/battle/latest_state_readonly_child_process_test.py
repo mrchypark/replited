@@ -20,6 +20,7 @@ real containers.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import shutil
 import signal
@@ -38,7 +39,9 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from test_utils import TestEnv, get_free_port, wait_for_port
 
 ROOT = Path(__file__).resolve().parents[2]
-REPLITED_BIN = ROOT / "target" / "release" / "replited"
+REPLITED_BIN = Path(
+    os.environ.get("REPLITED_BIN", str(ROOT / "target" / "release" / "replited"))
+)
 LATEST_STATE_IMAGE = os.environ.get(
     "LATEST_STATE_IMAGE",
     "asia-northeast3-docker.pkg.dev/patch2-the-new-era/conalog/latest-state:20260503-1e6471d",
@@ -363,6 +366,7 @@ remote_db_name = "{(primary_dir / "data.db").absolute()}"
 
 def insert_primary_device_state(db_path: Path, device_id: str) -> None:
     timestamp = datetime.now(timezone.utc).isoformat()
+    record_id = "r" + hashlib.sha1(device_id.encode("utf-8")).hexdigest()[:14]
     conn = sqlite3.connect(str(db_path), timeout=10.0)
     try:
         cursor = conn.cursor()
@@ -383,7 +387,7 @@ def insert_primary_device_state(db_path: Path, device_id: str) -> None:
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                "r" + device_id.replace("-", "")[:14],
+                record_id,
                 "codex",
                 timestamp,
                 json.dumps({"source": "latest-state-live-regression"}),
@@ -415,6 +419,31 @@ def wait_for_replica_db_record(replica_db: Path, device_id: str, timeout: int = 
             pass
         time.sleep(0.5)
     return False
+
+
+def wait_for_replica_db_records(
+    replica_db: Path,
+    device_ids: list[str],
+    timeout: int = 180,
+) -> list[str]:
+    missing = set(device_ids)
+    deadline = time.time() + timeout
+    while time.time() < deadline and missing:
+        try:
+            conn = sqlite3.connect(str(replica_db), timeout=2.0)
+            placeholders = ",".join("?" for _ in missing)
+            rows = conn.execute(
+                f"SELECT device_id FROM device_states WHERE device_id IN ({placeholders})",
+                tuple(missing),
+            ).fetchall()
+            conn.close()
+            for (device_id,) in rows:
+                missing.discard(device_id)
+        except Exception:
+            pass
+        if missing:
+            time.sleep(0.5)
+    return sorted(missing)
 
 
 def wait_for_primary_data_ready(primary_db: Path, timeout: int = 60) -> bool:
@@ -450,6 +479,25 @@ def wait_for_replica_api_record(replica_url: str, device_id: str, timeout: int =
             pass
         time.sleep(1.0)
     return False
+
+
+def wait_for_replica_api_records(
+    replica_url: str,
+    device_ids: list[str],
+    timeout: int = 180,
+) -> list[str]:
+    missing = set(device_ids)
+    deadline = time.time() + timeout
+    while time.time() < deadline and missing:
+        observed = []
+        for device_id in list(missing):
+            if wait_for_replica_api_record(replica_url, device_id, timeout=1):
+                observed.append(device_id)
+        for device_id in observed:
+            missing.remove(device_id)
+        if missing:
+            time.sleep(1.0)
+    return sorted(missing)
 
 
 def copy_ready_auxiliary_db(primary_dir: Path, replica_dir: Path, timeout: int = 30) -> bool:
@@ -575,6 +623,13 @@ def run_scenario() -> int:
             errors.append("primary replited stream port closed before replica start")
             return fail(errors, [primary_app.log_path, primary_replited.log_path])
 
+        pre_replica_device_ids = [
+            f"codex-live-before-replica-{int(time.time())}-{index}"
+            for index in range(3)
+        ]
+        for device_id in pre_replica_device_ids:
+            insert_primary_device_state(primary_dir / "data.db", device_id)
+
         replica_config = write_replica_config(env, stream_port, primary_dir, replica_dir)
         exec_cmd = latest_state_replica_exec_cmd(
             name=replica_name,
@@ -605,12 +660,53 @@ def run_scenario() -> int:
             errors.append("latest-state read-only replica did not become healthy")
             return fail(errors, [primary_app.log_path, primary_replited.log_path, replica_sidecar.log_path])
 
-        device_id = f"codex-live-{int(time.time())}"
-        insert_primary_device_state(primary_dir / "data.db", device_id)
-        if not wait_for_replica_db_record(replica_dir / "data.db", device_id, timeout=180):
-            errors.append("replica SQLite files did not receive the primary write")
-        if not wait_for_replica_api_record(replica_url, device_id, timeout=180):
-            errors.append("read-only latest-state API did not observe the replicated write")
+        missing_pre_replica_db = wait_for_replica_db_records(
+            replica_dir / "data.db",
+            pre_replica_device_ids,
+            timeout=180,
+        )
+        if missing_pre_replica_db:
+            errors.append(
+                "replica SQLite files did not receive pre-replica writes: "
+                + ", ".join(missing_pre_replica_db)
+            )
+        missing_pre_replica = wait_for_replica_api_records(
+            replica_url,
+            pre_replica_device_ids,
+            timeout=180,
+        )
+        if missing_pre_replica:
+            errors.append(
+                "read-only latest-state API did not observe pre-replica writes: "
+                + ", ".join(missing_pre_replica)
+            )
+
+        post_health_device_ids = [
+            f"codex-live-after-health-{int(time.time())}-{index}"
+            for index in range(3)
+        ]
+        for device_id in post_health_device_ids:
+            insert_primary_device_state(primary_dir / "data.db", device_id)
+        missing_post_health_db = wait_for_replica_db_records(
+            replica_dir / "data.db",
+            post_health_device_ids,
+            timeout=180,
+        )
+        if missing_post_health_db:
+            errors.append(
+                "replica SQLite files did not receive post-health writes: "
+                + ", ".join(missing_post_health_db)
+            )
+        missing_post_health = wait_for_replica_api_records(
+            replica_url,
+            post_health_device_ids,
+            timeout=180,
+        )
+        if missing_post_health:
+            errors.append(
+                "read-only latest-state API did not observe post-health writes: "
+                + ", ".join(missing_post_health)
+            )
 
         log_paths = [primary_app.log_path, primary_replited.log_path, replica_sidecar.log_path]
         errors.extend(scan_logs(log_paths))
