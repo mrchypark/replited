@@ -25,6 +25,16 @@ use crate::sync::stream_protocol::{
 use super::local_state::{ensure_meta_dir, persist_last_applied_lsn};
 use super::{ProcessManager, ReplicaStreamError};
 
+#[cfg(not(test))]
+fn managed_reader_startup_grace() -> Duration {
+    Duration::from_secs(5)
+}
+
+#[cfg(test)]
+fn managed_reader_startup_grace() -> Duration {
+    Duration::ZERO
+}
+
 pub(super) async fn stream_snapshot_and_restore(
     client: &StreamClient,
     db_path: &str,
@@ -106,6 +116,10 @@ pub(super) async fn stream_snapshot_and_restore(
     compressed_file
         .sync_all()
         .map_err(|e| ReplicaStreamError::Io(e.to_string()))?;
+    info!(
+        "ReplicaSidecar: received snapshot for {} compressed_bytes={}",
+        db_path, total_bytes
+    );
 
     let meta = meta
         .ok_or_else(|| ReplicaStreamError::InvalidResponse("snapshot meta missing".to_string()))?;
@@ -127,6 +141,13 @@ pub(super) async fn stream_snapshot_and_restore(
     .await
     .map_err(|e| ReplicaStreamError::Transport(e.to_string()))?
     .map_err(|e| ReplicaStreamError::Io(e.to_string()))?;
+    let restored_size = fs::metadata(db_path)
+        .map_err(|e| ReplicaStreamError::Io(e.to_string()))?
+        .len();
+    info!(
+        "ReplicaSidecar: restored snapshot for {} db_size={} boundary={:?}",
+        db_path, restored_size, boundary_lsn
+    );
 
     let _ = fs::remove_file(&compressed_path);
     Ok(boundary_lsn)
@@ -188,11 +209,19 @@ pub(super) async fn stream_wal_and_apply(
                     "ReplicaSidecar: local WAL missing or shorter than resume offset for {} at offset {}; rewinding stream to 0 (expected on cold start or after WAL cleanup)",
                     db_path, effective_start_pos.offset
                 );
+                effective_start_pos.offset = 0;
+                ack_floor = Some(start_pos);
             }
-            effective_start_pos.offset = 0;
-            ack_floor = Some(start_pos);
         }
     }
+    let mut catchup_reader_blocker = if ack_floor.is_some() {
+        match process_manager.as_ref() {
+            Some(pm) => Some(pm.block_reader().await),
+            None => None,
+        }
+    } else {
+        None
+    };
     let request = StreamWalRequest {
         db_identity: db_identity.to_string(),
         replica_id: replica_id.to_string(),
@@ -208,9 +237,7 @@ pub(super) async fn stream_wal_and_apply(
     let mut current_pos = effective_start_pos;
     let mut current_wal_index = current_pos.index;
     let page_size = load_db_page_size(db_path).await?;
-    let frame_size = WAL_FRAME_HEADER_SIZE + page_size;
     let mut frames_since_refresh: u32 = 0;
-    let checkpoint_interval = Duration::from_millis(checkpoint_interval_ms);
     let mut last_checkpoint_refresh = Instant::now();
     let mut refresh_state = WalRefreshState::new();
     let mut suppress_ack = ack_floor.is_some();
@@ -283,57 +310,58 @@ pub(super) async fn stream_wal_and_apply(
                         "ReplicaSidecar: WAL index advanced for {} ({} -> {}). Resetting local WAL.",
                         db_path, current_wal_index, chunk_start.index
                     );
-                    reset_local_wal(db_path, process_manager.as_ref()).await?;
                     current_wal_index = chunk_start.index;
                 }
 
-                apply_wal_bytes(
+                let chunk_process_manager = if catchup_reader_blocker.is_some() {
+                    None
+                } else {
+                    process_manager.as_ref()
+                };
+                apply_wal_chunk_and_refresh(
                     db_path,
                     &chunk_start,
+                    &chunk_next,
                     &chunk.wal_bytes,
-                    process_manager.as_ref(),
+                    page_size,
+                    &mut frames_since_refresh,
+                    checkpoint_frame_interval,
+                    checkpoint_interval_ms,
+                    &mut last_checkpoint_refresh,
+                    &mut refresh_state,
+                    ack_floor.as_ref(),
+                    &mut suppress_ack,
+                    chunk_process_manager,
                 )
                 .await?;
-                store_shadow_wal_bytes(db_path, &chunk_start, &chunk.wal_bytes)
-                    .map_err(|e| ReplicaStreamError::Io(e.to_string()))?;
-                persist_last_applied_lsn(db_path, &chunk_next)
-                    .map_err(|e| ReplicaStreamError::Io(e.to_string()))?;
 
-                let mut bytes_delta = chunk_next.offset.saturating_sub(chunk_start.offset);
-                if chunk_start.offset == 0 {
-                    bytes_delta = bytes_delta.saturating_sub(WAL_HEADER_SIZE);
-                }
-                let frames_in_chunk = if frame_size > 0 {
-                    (bytes_delta / frame_size) as u32
-                } else {
-                    0
-                };
-                frames_since_refresh = frames_since_refresh.saturating_add(frames_in_chunk);
-
-                if suppress_ack {
-                    if let Some(floor) = &ack_floor {
-                        if lsn_reached(&chunk_next, floor) {
-                            suppress_ack = false;
-                        }
-                    }
-                }
-
-                let checkpoint_frame_due = checkpoint_frame_interval > 0
-                    && frames_since_refresh >= checkpoint_frame_interval;
-                let checkpoint_time_due = checkpoint_interval_ms > 0
-                    && frames_since_refresh > 0
-                    && last_checkpoint_refresh.elapsed() >= checkpoint_interval;
-                if !suppress_ack && (checkpoint_frame_due || checkpoint_time_due) {
-                    let expected_frames = expected_frames_from_wal_file(db_path, page_size)?;
-                    refresh_wal_index(
-                        db_path,
-                        expected_frames,
-                        &mut refresh_state,
-                        process_manager.as_ref(),
+                if catchup_reader_blocker.is_some()
+                    && catchup_reader_release_ready(
+                        ack_floor.as_ref(),
+                        &chunk_start,
+                        &chunk_next,
+                        suppress_ack,
                     )
-                    .await?;
-                    frames_since_refresh = 0;
-                    last_checkpoint_refresh = Instant::now();
+                {
+                    if frames_since_refresh > 0 {
+                        let expected_frames = expected_frames_from_wal_file(db_path, page_size)?;
+                        refresh_wal_index(
+                            db_path,
+                            expected_frames,
+                            &mut refresh_state,
+                            process_manager.as_ref(),
+                        )
+                        .await?;
+                        frames_since_refresh = 0;
+                        last_checkpoint_refresh = Instant::now();
+                    }
+                    if let Some(blocker) = catchup_reader_blocker.take() {
+                        materialize_standalone_db(db_path).await?;
+                        blocker.release().await;
+                        current_pos = chunk_next;
+                        tokio::time::sleep(managed_reader_startup_grace()).await;
+                        return Ok(current_pos);
+                    }
                 }
 
                 // Best-effort ACK. Transport errors should not kill the replica.
@@ -358,13 +386,23 @@ pub(super) async fn stream_wal_and_apply(
 
     if frames_since_refresh > 0 && !suppress_ack {
         let expected_frames = expected_frames_from_wal_file(db_path, page_size)?;
-        refresh_wal_index(
-            db_path,
-            expected_frames,
-            &mut refresh_state,
-            process_manager.as_ref(),
-        )
-        .await?;
+        if let Some(pm) = process_manager.as_ref() {
+            pm.add_blocker().await;
+            let refresh_result = async {
+                refresh_wal_index(db_path, expected_frames, &mut refresh_state, None).await?;
+                materialize_standalone_db(db_path).await
+            }
+            .await;
+            pm.remove_blocker().await;
+            refresh_result?;
+        } else {
+            refresh_wal_index(db_path, expected_frames, &mut refresh_state, None).await?;
+        }
+    }
+    if let Some(blocker) = catchup_reader_blocker.take() {
+        materialize_standalone_db(db_path).await?;
+        blocker.release().await;
+        tokio::time::sleep(managed_reader_startup_grace()).await;
     }
 
     Ok(current_pos)
@@ -698,23 +736,41 @@ fn restore_snapshot_from_compressed(db_path: &str, compressed_path: &Path) -> Re
     Ok(())
 }
 
-async fn reset_local_wal(
-    db_path: &str,
-    process_manager: Option<&ProcessManager>,
-) -> Result<(), ReplicaStreamError> {
-    if let Some(pm) = process_manager {
-        pm.add_blocker().await;
-    }
-
+pub(super) async fn materialize_standalone_db(db_path: &str) -> Result<(), ReplicaStreamError> {
     let db_path_owned = db_path.to_string();
-    let managed_reader = process_manager.is_some();
+    tokio::task::spawn_blocking(move || materialize_standalone_db_sync(&db_path_owned))
+        .await
+        .map_err(|e| ReplicaStreamError::Transport(e.to_string()))?
+}
+
+fn materialize_standalone_db_sync(db_path: &str) -> Result<(), ReplicaStreamError> {
+    let temp_db_path = format!("{db_path}.standalone.tmp");
+    match fs::remove_file(&temp_db_path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(ReplicaStreamError::Io(err.to_string())),
+    }?;
+
+    let conn = Connection::open(db_path).map_err(|e| ReplicaStreamError::Io(e.to_string()))?;
+    conn.busy_timeout(Duration::from_secs(5))
+        .map_err(|e| ReplicaStreamError::Io(e.to_string()))?;
+    let escaped_path = temp_db_path.replace('\'', "''");
+    conn.execute_batch(&format!("VACUUM main INTO '{escaped_path}'"))
+        .map_err(|e| ReplicaStreamError::Io(e.to_string()))?;
+    drop(conn);
+
+    fs::rename(&temp_db_path, db_path).map_err(|e| ReplicaStreamError::Io(e.to_string()))?;
+    let _ = fs::remove_file(format!("{db_path}-wal"));
+    let _ = fs::remove_file(format!("{db_path}-shm"));
+    info!("ReplicaSidecar: materialized standalone DB for {db_path}");
+    Ok(())
+}
+
+async fn reset_local_wal(db_path: &str, managed_reader: bool) -> Result<(), ReplicaStreamError> {
+    let db_path_owned = db_path.to_string();
     let invalidate_warn_result =
         tokio::task::spawn_blocking(move || reset_local_wal_sync(&db_path_owned, managed_reader))
             .await;
-
-    if let Some(pm) = process_manager {
-        pm.remove_blocker().await;
-    }
 
     let invalidate_warn =
         invalidate_warn_result.map_err(|e| ReplicaStreamError::Transport(e.to_string()))??;
@@ -726,14 +782,131 @@ async fn reset_local_wal(
     Ok(())
 }
 
+#[cfg(test)]
 async fn apply_wal_bytes(
     db_path: &str,
     start_pos: &WalGenerationPos,
     wal_bytes: &[u8],
     process_manager: Option<&ProcessManager>,
 ) -> Result<(), ReplicaStreamError> {
+    if let Some(pm) = process_manager {
+        pm.add_blocker().await;
+    }
+
+    let result = apply_wal_bytes_with_reader_blocked(
+        db_path,
+        start_pos,
+        wal_bytes,
+        process_manager.is_some(),
+    )
+    .await;
+
+    if let Some(pm) = process_manager {
+        pm.remove_blocker().await;
+    }
+
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn apply_wal_chunk_and_refresh(
+    db_path: &str,
+    chunk_start: &WalGenerationPos,
+    chunk_next: &WalGenerationPos,
+    wal_bytes: &[u8],
+    page_size: u64,
+    frames_since_refresh: &mut u32,
+    checkpoint_frame_interval: u32,
+    checkpoint_interval_ms: u64,
+    last_checkpoint_refresh: &mut Instant,
+    refresh_state: &mut WalRefreshState,
+    ack_floor: Option<&WalGenerationPos>,
+    suppress_ack: &mut bool,
+    process_manager: Option<&ProcessManager>,
+) -> Result<(), ReplicaStreamError> {
+    let managed_reader = process_manager.is_some();
+    if let Some(pm) = process_manager {
+        pm.add_blocker().await;
+    }
+
+    let mut checkpoint_due = false;
+    let result = async {
+        apply_wal_bytes_with_reader_blocked(
+            db_path,
+            chunk_start,
+            wal_bytes,
+            managed_reader,
+        )
+        .await?;
+        store_shadow_wal_bytes(db_path, chunk_start, wal_bytes)
+            .map_err(|e| ReplicaStreamError::Io(e.to_string()))?;
+        persist_last_applied_lsn(db_path, chunk_next)
+            .map_err(|e| ReplicaStreamError::Io(e.to_string()))?;
+
+        let mut bytes_delta = chunk_next.offset.saturating_sub(chunk_start.offset);
+        if chunk_start.offset == 0 {
+            bytes_delta = bytes_delta.saturating_sub(WAL_HEADER_SIZE);
+        }
+        let frame_size = WAL_FRAME_HEADER_SIZE + page_size;
+        let frames_in_chunk = if frame_size > 0 {
+            (bytes_delta / frame_size) as u32
+        } else {
+            0
+        };
+        *frames_since_refresh = frames_since_refresh.saturating_add(frames_in_chunk);
+
+        if *suppress_ack {
+            if let Some(floor) = ack_floor {
+                if lsn_reached(chunk_next, floor) {
+                    *suppress_ack = false;
+                }
+            }
+        }
+
+        let checkpoint_frame_due =
+            checkpoint_frame_interval > 0 && *frames_since_refresh >= checkpoint_frame_interval;
+        let checkpoint_time_due = checkpoint_interval_ms > 0
+            && *frames_since_refresh > 0
+            && last_checkpoint_refresh.elapsed() >= Duration::from_millis(checkpoint_interval_ms);
+        checkpoint_due = !*suppress_ack && (checkpoint_frame_due || checkpoint_time_due);
+
+        Ok(())
+    }
+    .await;
+
+    if let Some(pm) = process_manager {
+        if result.is_ok() {
+            let refresh_result = async {
+                if checkpoint_due {
+                    let expected_frames = expected_frames_from_wal_file(db_path, page_size)?;
+                    refresh_wal_index(db_path, expected_frames, refresh_state, None).await?;
+                }
+                materialize_standalone_db(db_path).await?;
+                *frames_since_refresh = 0;
+                *last_checkpoint_refresh = Instant::now();
+                Ok(())
+            }
+            .await;
+            pm.remove_blocker().await;
+            if let Err(err) = refresh_result {
+                return Err(err);
+            }
+        } else {
+            pm.remove_blocker().await;
+        }
+    }
+
+    result
+}
+
+async fn apply_wal_bytes_with_reader_blocked(
+    db_path: &str,
+    start_pos: &WalGenerationPos,
+    wal_bytes: &[u8],
+    managed_reader: bool,
+) -> Result<(), ReplicaStreamError> {
     if start_pos.offset == 0 {
-        reset_local_wal(db_path, process_manager).await?;
+        reset_local_wal(db_path, managed_reader).await?;
     } else {
         let wal_path = format!("{db_path}-wal");
         let wal_len = match fs::metadata(&wal_path) {
@@ -767,7 +940,7 @@ async fn apply_wal_bytes(
         Err(ReplicaStreamError::Stream(StreamReplicationErrorCode::InvalidLsn, message)) => {
             // Local WAL state got truncated/reset underneath us (common when rebuilding SHM/WAL
             // state). Reset the local WAL so the next retry can safely rewind and re-stream.
-            reset_local_wal(db_path, process_manager).await?;
+            reset_local_wal(db_path, managed_reader).await?;
             Err(ReplicaStreamError::Stream(
                 StreamReplicationErrorCode::InvalidLsn,
                 message,
@@ -909,6 +1082,27 @@ fn lsn_reached(current: &WalGenerationPos, floor: &WalGenerationPos) -> bool {
     current.index == floor.index && current.offset >= floor.offset
 }
 
+fn catchup_reader_release_ready(
+    floor: Option<&WalGenerationPos>,
+    chunk_start: &WalGenerationPos,
+    chunk_next: &WalGenerationPos,
+    suppress_ack: bool,
+) -> bool {
+    if suppress_ack {
+        return false;
+    }
+
+    let Some(floor) = floor else {
+        return true;
+    };
+
+    if lsn_matches(chunk_next, floor) {
+        return false;
+    }
+
+    lsn_reached(chunk_next, floor) && chunk_start.generation == floor.generation
+}
+
 fn can_accept_stream_advance_past_floor(
     db_path: &str,
     floor: &WalGenerationPos,
@@ -1017,8 +1211,9 @@ fn allow_shadow_wal_boundary_advance(
 #[cfg(test)]
 mod tests {
     use super::{
-        ReplicaStreamError, WalRefreshState, apply_wal_bytes, can_accept_stream_advance_past_floor,
-        refresh_wal_index, store_shadow_wal_bytes, validate_snapshot_meta,
+        ReplicaStreamError, WalRefreshState, apply_wal_bytes, apply_wal_chunk_and_refresh,
+        can_accept_stream_advance_past_floor, materialize_standalone_db, refresh_wal_index,
+        reset_local_wal, store_shadow_wal_bytes, validate_snapshot_meta,
     };
     use crate::base::Generation;
     use crate::cmd::replica_sidecar::process_manager::ProcessManager;
@@ -1029,6 +1224,7 @@ mod tests {
     use rusqlite::Connection;
     use std::fs;
     use std::io::Write;
+    use std::time::{Duration, Instant};
     use tempfile::TempDir;
 
     fn base_meta() -> SnapshotMeta {
@@ -1071,6 +1267,84 @@ mod tests {
             .expect("failed to insert seed row");
         drop(conn);
         (temp_dir, db_path.to_string_lossy().to_string())
+    }
+
+    fn create_replica_with_valid_wal_chunk(row_value: &str) -> (TempDir, String, Vec<u8>, u64) {
+        let temp_dir = tempfile::tempdir().expect("failed to create tempdir");
+        let primary_path = temp_dir.path().join("primary.db");
+        let replica_path = temp_dir.path().join("replica.db");
+
+        let conn = Connection::open(&primary_path).expect("failed to open primary sqlite db");
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .expect("failed to set WAL mode");
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, v TEXT)",
+            [],
+        )
+        .expect("failed to create table");
+        conn.execute("INSERT INTO t(v) VALUES ('seed')", [])
+            .expect("failed to insert seed row");
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .expect("checkpoint seed row into db file");
+        let page_size_i64: i64 = conn
+            .pragma_query_value(None, "page_size", |row| row.get(0))
+            .expect("read page size");
+        drop(conn);
+
+        fs::copy(&primary_path, &replica_path).expect("copy base db to replica");
+
+        let writer = Connection::open(&primary_path).expect("reopen primary writer");
+        writer
+            .pragma_update(None, "journal_mode", "WAL")
+            .expect("set WAL mode on writer");
+        writer
+            .execute("INSERT INTO t(v) VALUES (?)", [row_value])
+            .expect("write WAL row");
+
+        let wal_bytes = fs::read(format!("{}-wal", primary_path.to_string_lossy()))
+            .expect("read valid WAL bytes");
+        assert!(
+            wal_bytes.len() > WAL_HEADER_SIZE as usize,
+            "test setup should produce WAL frames"
+        );
+
+        (
+            temp_dir,
+            replica_path.to_string_lossy().to_string(),
+            wal_bytes,
+            u64::try_from(page_size_i64).expect("valid page size"),
+        )
+    }
+
+    #[tokio::test]
+    async fn materialize_standalone_db_carries_visible_wal_frames_into_db_file() {
+        let (_temp_dir, db_path) = create_test_wal_db();
+        let conn = Connection::open(&db_path).expect("open writer");
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .expect("set WAL mode");
+        conn.execute("INSERT INTO t(v) VALUES ('wal-visible')", [])
+            .expect("write WAL row");
+
+        materialize_standalone_db(&db_path)
+            .await
+            .expect("materialize standalone db");
+        drop(conn);
+
+        assert!(
+            !std::path::Path::new(&format!("{db_path}-wal")).exists(),
+            "materialized DB should not require a WAL sidecar"
+        );
+        let restored = Connection::open(&db_path).expect("open materialized db");
+        let values: Vec<String> = {
+            let mut stmt = restored
+                .prepare("SELECT v FROM t ORDER BY id")
+                .expect("prepare values query");
+            stmt.query_map([], |row| row.get(0))
+                .expect("query values")
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .expect("collect values")
+        };
+        assert_eq!(values, vec!["seed".to_string(), "wal-visible".to_string()]);
     }
 
     #[test]
@@ -1166,6 +1440,54 @@ mod tests {
         }
 
         assert!(!suppress_ack);
+    }
+
+    #[test]
+    fn catchup_reader_stays_blocked_when_replay_lands_exactly_on_floor() {
+        let floor = WalGenerationPos {
+            generation: Generation::new(),
+            index: 1,
+            offset: 325_512,
+        };
+        let chunk_start = WalGenerationPos {
+            generation: floor.generation.clone(),
+            index: 1,
+            offset: 259_592,
+        };
+        let chunk_next = floor.clone();
+
+        assert!(!super::catchup_reader_release_ready(
+            Some(&floor),
+            &chunk_start,
+            &chunk_next,
+            false
+        ));
+    }
+
+    #[test]
+    fn catchup_reader_releases_after_replay_applies_data_past_floor() {
+        let floor = WalGenerationPos {
+            generation: Generation::new(),
+            index: 1,
+            offset: 325_512,
+        };
+        let chunk_start = WalGenerationPos {
+            generation: floor.generation.clone(),
+            index: 1,
+            offset: 325_512,
+        };
+        let chunk_next = WalGenerationPos {
+            generation: floor.generation.clone(),
+            index: 1,
+            offset: 469_712,
+        };
+
+        assert!(super::catchup_reader_release_ready(
+            Some(&floor),
+            &chunk_start,
+            &chunk_next,
+            false
+        ));
     }
 
     #[test]
@@ -1277,6 +1599,223 @@ mod tests {
         let wal = fs::read(&wal_path).expect("read local wal");
         assert_eq!(&wal[..WAL_HEADER_SIZE as usize], prefix.as_slice());
         assert_eq!(&wal[WAL_HEADER_SIZE as usize..], b"data");
+    }
+
+    #[tokio::test]
+    async fn apply_wal_bytes_starts_managed_reader_after_offset_zero_wal_is_written() {
+        let (temp_dir, db_path) = create_test_wal_db();
+        let wal_path = format!("{db_path}-wal");
+        fs::write(&wal_path, b"stale").expect("seed stale wal");
+
+        let marker_path = temp_dir.path().join("reader-started-with-wal");
+        let cmd = format!(
+            "if [ -s '{}' ]; then printf wal-present > '{}'; else printf wal-missing > '{}'; fi; sleep 60",
+            wal_path,
+            marker_path.display(),
+            marker_path.display()
+        );
+        let process_manager = ProcessManager::new(cmd);
+        let start = WalGenerationPos {
+            generation: Generation::new(),
+            index: 4,
+            offset: 0,
+        };
+        let wal_bytes = vec![9u8; 8 * 1024 * 1024];
+
+        apply_wal_bytes(&db_path, &start, &wal_bytes, Some(&process_manager))
+            .await
+            .expect("apply should succeed");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !marker_path.exists() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let marker = fs::read_to_string(&marker_path).expect("reader start marker");
+        assert_eq!(
+            marker, "wal-present",
+            "managed reader must not start between WAL reset and WAL append"
+        );
+        process_manager.stop().await;
+    }
+
+    #[tokio::test]
+    async fn reset_local_wal_keeps_managed_reader_blocked_for_caller_to_apply_wal() {
+        let (temp_dir, db_path) = create_test_wal_db();
+        let marker_path = temp_dir.path().join("reader-started");
+        let cmd = format!("printf started > '{}'; sleep 60", marker_path.display());
+        let process_manager = ProcessManager::new(cmd);
+
+        process_manager.add_blocker().await;
+        reset_local_wal(&db_path, true)
+            .await
+            .expect("reset local wal");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(
+            process_manager.blocker_count(),
+            1,
+            "caller must retain the reader blocker until WAL append/checkpoint is complete"
+        );
+        assert!(
+            !marker_path.exists(),
+            "managed reader must not restart immediately after WAL reset"
+        );
+
+        process_manager.remove_blocker().await;
+        process_manager.stop().await;
+    }
+
+    #[tokio::test]
+    async fn apply_wal_chunk_keeps_managed_reader_blocked_until_shadow_and_lsn_are_durable() {
+        let (temp_dir, db_path, wal_bytes, page_size) =
+            create_replica_with_valid_wal_chunk("chunk-visible");
+        let wal_path = format!("{db_path}-wal");
+        let generation = Generation::new();
+        let chunk_start = WalGenerationPos {
+            generation: generation.clone(),
+            index: 5,
+            offset: 0,
+        };
+        let chunk_next = WalGenerationPos {
+            generation,
+            index: 5,
+            offset: wal_bytes.len() as u64,
+        };
+
+        let meta_dir = temp_dir.path().join(format!(
+            ".{}-replited",
+            std::path::Path::new(&db_path)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+        ));
+        let shadow_path = meta_dir
+            .join("generations")
+            .join(chunk_start.generation.as_str())
+            .join("wal")
+            .join(format!("{:010}.wal", chunk_start.index));
+        let last_applied_lsn_path = meta_dir.join("last_applied_lsn");
+        let marker_path = temp_dir.path().join("reader-started-after-durable");
+        let cmd = format!(
+            "if [ ! -e '{}' ] && [ -s '{}' ] && [ -s '{}' ]; then printf durable > '{}'; else printf early > '{}'; fi; sleep 60",
+            wal_path,
+            shadow_path.display(),
+            last_applied_lsn_path.display(),
+            marker_path.display(),
+            marker_path.display()
+        );
+        let process_manager = ProcessManager::new(cmd);
+        let mut frames_since_refresh = 0;
+        let mut last_checkpoint_refresh = Instant::now();
+        let mut refresh_state = WalRefreshState::new();
+        let mut suppress_ack = false;
+
+        apply_wal_chunk_and_refresh(
+            &db_path,
+            &chunk_start,
+            &chunk_next,
+            &wal_bytes,
+            page_size,
+            &mut frames_since_refresh,
+            0,
+            0,
+            &mut last_checkpoint_refresh,
+            &mut refresh_state,
+            None,
+            &mut suppress_ack,
+            Some(&process_manager),
+        )
+        .await
+        .expect("chunk should apply");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !marker_path.exists() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let marker = fs::read_to_string(&marker_path).expect("reader start marker");
+        assert_eq!(
+            marker, "durable",
+            "managed reader must start only after WAL is materialized and shadow WAL and last_applied_lsn are durable"
+        );
+        let replica = Connection::open(&db_path).expect("open materialized replica");
+        let visible: i64 = replica
+            .query_row(
+                "SELECT COUNT(*) FROM t WHERE v = 'chunk-visible'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query materialized row");
+        assert_eq!(visible, 1, "materialized DB should include applied WAL row");
+        process_manager.stop().await;
+    }
+
+    #[tokio::test]
+    async fn apply_wal_chunk_restarts_managed_reader_after_non_checkpoint_tail_chunk() {
+        let (temp_dir, db_path) = create_test_wal_db();
+        let wal_path = format!("{db_path}-wal");
+        fs::write(&wal_path, vec![0u8; WAL_HEADER_SIZE as usize]).expect("seed WAL prefix");
+        let generation = Generation::new();
+        let chunk_start = WalGenerationPos {
+            generation: generation.clone(),
+            index: 5,
+            offset: WAL_HEADER_SIZE,
+        };
+        let wal_bytes = b"tail";
+        let chunk_next = WalGenerationPos {
+            generation,
+            index: 5,
+            offset: WAL_HEADER_SIZE + wal_bytes.len() as u64,
+        };
+        let marker_path = temp_dir.path().join("reader-start-count");
+        let cmd = format!("printf started >> '{}'; sleep 60", marker_path.display());
+        let process_manager = ProcessManager::new(cmd);
+        process_manager.start().await;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !marker_path.exists() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            fs::read_to_string(&marker_path).expect("initial reader start marker"),
+            "started"
+        );
+
+        let mut frames_since_refresh = 0;
+        let mut last_checkpoint_refresh = Instant::now();
+        let mut refresh_state = WalRefreshState::new();
+        let mut suppress_ack = false;
+
+        apply_wal_chunk_and_refresh(
+            &db_path,
+            &chunk_start,
+            &chunk_next,
+            wal_bytes,
+            4096,
+            &mut frames_since_refresh,
+            10000,
+            60000,
+            &mut last_checkpoint_refresh,
+            &mut refresh_state,
+            None,
+            &mut suppress_ack,
+            Some(&process_manager),
+        )
+        .await
+            .expect("tail chunk should apply and restart reader");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let marker = fs::read_to_string(&marker_path).expect("reader start marker");
+        assert_eq!(
+            marker, "startedstarted",
+            "managed reader must restart after ordinary tail chunks so a live child observes a materialized DB instead of stale external WAL frames"
+        );
+        assert_eq!(process_manager.blocker_count(), 0);
+        assert!(
+            !std::path::Path::new(&wal_path).exists(),
+            "materialized DB should not leave externally appended WAL frames for the restarted reader"
+        );
+        process_manager.stop().await;
     }
 
     #[test]

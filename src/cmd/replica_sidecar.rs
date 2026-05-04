@@ -346,6 +346,13 @@ async fn handle_catching_up_state(
             *resume_pos = Some(applied_lsn);
             *state = ReplicaState::Streaming;
             *invalid_lsn_retries = 0;
+            if ctx.process_manager.is_some() {
+                if let Err(err) = streaming::materialize_standalone_db(ctx.db_path).await {
+                    warn!("Failed to materialize standalone DB for {0}: {err:?}", ctx.db_path);
+                    sleep(Duration::from_secs(5)).await;
+                    return Ok(());
+                }
+            }
             release_reader_blocker(reader_blocker).await;
         }
         Err(err) => {

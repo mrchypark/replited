@@ -26,6 +26,7 @@ POCKETBASE_BIN="${POCKETBASE_BIN:-$BIN_DIR/pocketbase}"
 DEFAULT_POCKETBASE_BIN="$BIN_DIR/pocketbase"
 REPLITED_BIN="${REPLITED_BIN:-$ROOT_DIR/target/release/replited}"
 DEMO_HOLD="${DEMO_HOLD:-1}"
+REPLICA_EXEC_CMD="${REPLICA_EXEC_CMD:-$POCKETBASE_BIN serve --automigrate=false --http $REPLICA_HTTP --dir $REPLICA_DIR}"
 
 cleanup() {
   for pid_file in "$PRIMARY_PID_FILE" "$REPLICA_PID_FILE" "$PRIMARY_PB_PID_FILE"; do
@@ -171,7 +172,7 @@ sleep 2
   --config "$REPLICA_CONFIG" \
   replica-sidecar \
   --force-restore \
-  --exec "$POCKETBASE_BIN serve --http $REPLICA_HTTP --dir $REPLICA_DIR" \
+  --exec "$REPLICA_EXEC_CMD" \
   >"$LOG_DIR/replica-sidecar.log" 2>&1 &
 echo $! > "$REPLICA_PID_FILE"
 

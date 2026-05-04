@@ -48,6 +48,25 @@ impl Database {
         Ok(conn)
     }
 
+    fn compress_vacuumed_snapshot(&self) -> Result<Vec<u8>> {
+        let parent = parent_dir(&self.config.db).unwrap_or_else(|| ".".to_string());
+        let snapshot_file = NamedTempFile::new_in(parent)?;
+        let snapshot_path = snapshot_file.path().to_path_buf();
+        fs::remove_file(&snapshot_path)?;
+
+        let snapshot_path_str = snapshot_path.to_string_lossy().to_string();
+        let escaped_path = snapshot_path_str.replace('\'', "''");
+        let snapshot_conn = Connection::open(&self.config.db)?;
+        snapshot_conn.busy_timeout(Duration::from_secs(5))?;
+        snapshot_conn
+            .execute_batch(&format!("VACUUM main INTO '{escaped_path}'"))?;
+
+        let compressed_data = compress_file(&snapshot_path_str)?;
+        fs::remove_file(&snapshot_path)?;
+        drop(snapshot_file);
+        Ok(compressed_data)
+    }
+
     pub(super) async fn snapshot(&mut self) -> Result<(Vec<u8>, WalGenerationPos)> {
         let result: Result<(Vec<u8>, WalGenerationPos)> = async {
             // Ensure WAL exists before trying to derive a generation position.
@@ -91,13 +110,9 @@ impl Database {
 
             let wal_header_before_checkpoint = WALHeader::read(&self.wal_file)?;
 
-            // Flush those exact frames into the DB file while writers are still blocked.
-            self.exec_checkpoint(CheckpointMode::Passive.as_str())?;
+            let compressed_data = self.compress_vacuumed_snapshot()?;
 
             info!("db {} snapshot created, pos: {:?}", self.config.db, pos);
-
-            // compress db file
-            let compressed_data = compress_file(&self.config.db)?;
 
             // Mirror do_checkpoint(): force a post-snapshot WAL write so SQLite either keeps
             // using the current header or visibly restarts the WAL right away. That lets us
@@ -352,6 +367,112 @@ addr = "http://127.0.0.1:50051"
         assert!(
             snapshot_pos.offset > shadow_size_before,
             "snapshot position must advance to cover WAL frames copied into the snapshot DB; shadow_before={shadow_size_before} snapshot_pos={snapshot_pos:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_uses_fresh_database_view_after_external_bootstrap() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("primary.db");
+
+        let config = stream_only_db_config(db_path.to_string_lossy().as_ref());
+        let (mut db, _rx) = Database::try_create(config).await.expect("create db");
+
+        let external = Connection::open(&db.config.db).expect("open external app connection");
+        external
+            .pragma_update(None, "journal_mode", "WAL")
+            .expect("put external app connection in WAL mode");
+        external
+            .execute_batch(
+                "CREATE TABLE external_bootstrap (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO external_bootstrap (value) VALUES ('created-after-replited-opened');",
+            )
+            .expect("simulate app bootstrap after replited opened its connection");
+
+        let (compressed_data, _snapshot_pos) = db.snapshot().await.expect("snapshot");
+
+        let restored_path = dir.path().join("restored-external-bootstrap.db");
+        std::fs::write(
+            &restored_path,
+            decompressed_data(compressed_data).expect("decompress snapshot"),
+        )
+        .expect("write restored db");
+        let restored_conn = Connection::open(&restored_path).expect("open restored db");
+        let restored_value: String = restored_conn
+            .query_row("SELECT value FROM external_bootstrap", [], |row| row.get(0))
+            .expect("read externally bootstrapped table from snapshot");
+
+        assert_eq!(restored_value, "created-after-replited-opened");
+    }
+
+    #[tokio::test]
+    async fn snapshot_covers_wal_frames_even_when_checkpoint_is_blocked_by_reader() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("primary.db");
+
+        let config = stream_only_db_config(db_path.to_string_lossy().as_ref());
+        let (mut db, _rx) = Database::try_create(config).await.expect("create db");
+
+        db.connection
+            .execute(
+                "CREATE TABLE IF NOT EXISTS snapshot_blocked_checkpoint (id INTEGER PRIMARY KEY, value TEXT NOT NULL)",
+                (),
+            )
+            .expect("create user table");
+        db.connection
+            .execute(
+                "INSERT INTO snapshot_blocked_checkpoint (value) VALUES ('reader-endmark')",
+                (),
+            )
+            .expect("seed reader-visible row");
+
+        let reader = Connection::open(&db.config.db).expect("open external reader");
+        reader
+            .execute_batch("BEGIN; SELECT COUNT(*) FROM snapshot_blocked_checkpoint;")
+            .expect("hold external read transaction");
+
+        db.connection
+            .execute(
+                "INSERT INTO snapshot_blocked_checkpoint (value) VALUES ('after-reader')",
+                (),
+            )
+            .expect("write row that checkpoint cannot flush while reader is active");
+
+        let (compressed_data, _snapshot_pos) = db
+            .snapshot()
+            .await
+            .expect("snapshot should produce a standalone DB view");
+        reader
+            .execute_batch("ROLLBACK;")
+            .expect("release external reader");
+
+        let restored_path = dir.path().join("restored-blocked-checkpoint.db");
+        std::fs::write(
+            &restored_path,
+            decompressed_data(compressed_data).expect("decompress snapshot"),
+        )
+        .expect("write restored db");
+        let restored_conn = Connection::open(&restored_path).expect("open restored db");
+        let quick_check: String = restored_conn
+            .pragma_query_value(None, "quick_check", |row| row.get(0))
+            .expect("quick_check");
+        assert_eq!(quick_check, "ok");
+
+        let restored_values: Vec<String> = {
+            let mut stmt = restored_conn
+                .prepare(
+                    "SELECT value FROM snapshot_blocked_checkpoint ORDER BY id",
+                )
+                .expect("prepare restored values query");
+            stmt.query_map([], |row| row.get(0))
+                .expect("query restored values")
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .expect("collect restored values")
+        };
+        assert_eq!(
+            restored_values,
+            vec!["reader-endmark".to_string(), "after-reader".to_string()],
+            "snapshot DB should include WAL frames newer than an external reader endmark"
         );
     }
 
