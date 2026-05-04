@@ -302,6 +302,69 @@ def latest_state_replica_exec_cmd(
     )
 
 
+def latest_state_managed_proxy_child_template(
+    *,
+    name_prefix: str,
+    data_dir: Path,
+) -> str:
+    name = f"{name_prefix}-{{port}}"
+    docker_args = [
+        "docker",
+        "run",
+        "--rm",
+        "--platform=linux/amd64",
+        "--name",
+        name,
+        "-p",
+        "127.0.0.1:{port}:8090",
+        "-v",
+        "{dir}:/pb_data",
+        "-v",
+        f"{data_dir.resolve()}:/data",
+        "-e",
+        "DEBUG_MODE=true",
+        "-e",
+        "BATCH_ENABLED=false",
+        "-e",
+        "DEVICE_CACHE_FLUSH_INTERVAL=1s",
+        "-e",
+        "USE_INVERTER_LATEST_STATE=true",
+        "-e",
+        "DEVICE_ID_LIST_FILE=/data/device_list.csv",
+        "-e",
+        "REGISTRY_ENDPOINT=http://127.0.0.1:1",
+        "-e",
+        "REGISTRY_CREDENTIAL_ID=dummy",
+        "-e",
+        "REGISTRY_CREDENTIAL_PW=dummy",
+        "-e",
+        "ADMIN_EMAILS=test@test.com",
+        "-e",
+        "ADMIN_PASSWORDS=qwer@12345",
+        "-e",
+        "POCKETBASE_DB_READONLY=true",
+        LATEST_STATE_IMAGE,
+        "serve",
+        "--http",
+        "0.0.0.0:8090",
+        "--dir",
+        "/pb_data",
+    ]
+    quoted = " ".join(sh_quote(arg) for arg in docker_args)
+    return (
+        "sh -lc "
+        + sh_quote(
+            "set -e; "
+            f"name={sh_quote(name)}; "
+            'cleanup() { docker rm -f "$name" >/dev/null 2>&1 || true; }; '
+            "trap cleanup INT TERM EXIT; "
+            "cleanup; "
+            f"{quoted} & "
+            "pid=$!; wait $pid"
+        )
+    )
+
+
 def sh_quote(value: str) -> str:
     return "'" + value.replace("'", "'\"'\"'") + "'"
 
@@ -631,22 +694,37 @@ def run_scenario() -> int:
             insert_primary_device_state(primary_dir / "data.db", device_id)
 
         replica_config = write_replica_config(env, stream_port, primary_dir, replica_dir)
-        exec_cmd = latest_state_replica_exec_cmd(
-            name=replica_name,
-            replica_dir=replica_dir,
-            data_dir=data_dir,
-            port=replica_port,
-        )
+        replica_args = [
+            str(REPLITED_BIN.resolve()),
+            "--config",
+            str(replica_config.resolve()),
+            "replica-sidecar",
+            "--force-restore",
+        ]
+        if os.environ.get("REPLITED_LATEST_STATE_MANAGED_PROXY") == "1":
+            replica_args.extend(
+                [
+                    "--exec-managed-proxy",
+                    f"127.0.0.1:{replica_port}",
+                    "--exec-child-template",
+                    latest_state_managed_proxy_child_template(
+                        name_prefix=replica_name,
+                        data_dir=data_dir,
+                    ),
+                    "--exec-generation-root",
+                    str((replica_dir / "managed-readers").resolve()),
+                ]
+            )
+        else:
+            exec_cmd = latest_state_replica_exec_cmd(
+                name=replica_name,
+                replica_dir=replica_dir,
+                data_dir=data_dir,
+                port=replica_port,
+            )
+            replica_args.extend(["--exec", exec_cmd])
         replica_sidecar = start_logged_process(
-            [
-                str(REPLITED_BIN.resolve()),
-                "--config",
-                str(replica_config.resolve()),
-                "replica-sidecar",
-                "--force-restore",
-                "--exec",
-                exec_cmd,
-            ],
+            replica_args,
             cwd=replica_dir,
             log_path=logs_dir / "replica-sidecar.log",
             name="replica-sidecar",

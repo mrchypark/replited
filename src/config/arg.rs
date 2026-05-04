@@ -26,8 +26,20 @@ pub enum ArgCommand {
         force_restore: bool,
 
         /// Execute a child process (e.g. "pocketbase serve") and manage its lifecycle
-        #[arg(long)]
+        #[arg(long, conflicts_with = "exec_managed_proxy")]
         exec: Option<String>,
+
+        /// Listen address for managed proxy mode (e.g. "0.0.0.0:8090")
+        #[arg(long, conflicts_with = "exec")]
+        exec_managed_proxy: Option<String>,
+
+        /// Child command template for managed proxy mode; supports {port}, {dir}, and {db}
+        #[arg(long, requires = "exec_managed_proxy")]
+        exec_child_template: Option<String>,
+
+        /// Root directory for managed proxy generation directories
+        #[arg(long, requires = "exec_managed_proxy")]
+        exec_generation_root: Option<String>,
     },
 
     Restore(RestoreOptions),
@@ -155,6 +167,59 @@ mod tests {
             }
             other => panic!("expected restore command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn replica_sidecar_accepts_managed_proxy_exec_options() {
+        let arg = Arg::parse_from([
+            "replited",
+            "replica-sidecar",
+            "--force-restore",
+            "--exec-managed-proxy",
+            "0.0.0.0:8090",
+            "--exec-child-template",
+            "/app serve --http 127.0.0.1:{port} --dir {dir}",
+            "--exec-generation-root",
+            "/pb_data/replited-generations",
+        ]);
+
+        match arg.cmd {
+            ArgCommand::ReplicaSidecar {
+                force_restore,
+                exec,
+                exec_managed_proxy,
+                exec_child_template,
+                exec_generation_root,
+            } => {
+                assert!(force_restore);
+                assert_eq!(exec, None);
+                assert_eq!(exec_managed_proxy.as_deref(), Some("0.0.0.0:8090"));
+                assert_eq!(
+                    exec_child_template.as_deref(),
+                    Some("/app serve --http 127.0.0.1:{port} --dir {dir}")
+                );
+                assert_eq!(
+                    exec_generation_root.as_deref(),
+                    Some("/pb_data/replited-generations")
+                );
+            }
+            other => panic!("expected replica-sidecar command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replica_sidecar_rejects_legacy_exec_with_managed_proxy() {
+        let err = Arg::try_parse_from([
+            "replited",
+            "replica-sidecar",
+            "--exec",
+            "/app serve",
+            "--exec-managed-proxy",
+            "0.0.0.0:8090",
+        ])
+        .expect_err("legacy exec and managed proxy are mutually exclusive");
+
+        assert!(err.to_string().contains("--exec"));
     }
 
     #[test]

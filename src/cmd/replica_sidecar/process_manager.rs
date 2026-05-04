@@ -1,17 +1,25 @@
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
 use log::info;
+use rusqlite::Connection;
+use tokio::net::TcpStream;
 use tokio::sync::Mutex;
+
+use super::managed_reader::{ManagedChildTemplate, ManagedGenerationLayout};
+use super::reader_proxy::{ReaderProxy, ReaderProxyHandle};
 
 const CHILD_PROCESS_STARTING_LOG: &str = "ProcessManager: Starting child process.";
 const CHILD_TERMINATION_GRACE: Duration = Duration::from_secs(5);
+const MANAGED_PROXY_HEALTH_TIMEOUT: Duration = Duration::from_secs(30);
+const AUXILIARY_DB_FILE: &str = "auxiliary.db";
 
 #[derive(Clone)]
 pub(super) struct ProcessManager {
-    cmd: String,
-    child: Arc<Mutex<Option<tokio::process::Child>>>,
+    mode: ProcessManagerMode,
     blockers: Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -19,75 +27,84 @@ pub(super) struct ReaderBlocker {
     process_manager: Option<ProcessManager>,
 }
 
+#[derive(Clone)]
+enum ProcessManagerMode {
+    Legacy {
+        cmd: String,
+        child: Arc<Mutex<Option<tokio::process::Child>>>,
+    },
+    ManagedProxy {
+        template: ManagedChildTemplate,
+        layout: Arc<ManagedGenerationLayout>,
+        db_path: PathBuf,
+        proxy: ReaderProxyHandle,
+        active_child: Arc<Mutex<Option<ManagedChild>>>,
+        generation_counter: Arc<std::sync::atomic::AtomicU64>,
+        proxy_task: Arc<tokio::task::JoinHandle<std::io::Result<()>>>,
+    },
+}
+
+struct ManagedChild {
+    child: tokio::process::Child,
+    generation_id: String,
+    port: u16,
+}
+
 impl ProcessManager {
     pub(super) fn new(cmd: String) -> Self {
         Self {
-            cmd,
-            child: Arc::new(Mutex::new(None)),
+            mode: ProcessManagerMode::Legacy {
+                cmd,
+                child: Arc::new(Mutex::new(None)),
+            },
             blockers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
+    pub(super) async fn new_managed_proxy(
+        proxy_addr: SocketAddr,
+        template: ManagedChildTemplate,
+        generation_root: impl Into<PathBuf>,
+        db_path: impl Into<PathBuf>,
+    ) -> std::io::Result<Self> {
+        let (proxy, handle) = ReaderProxy::bind(proxy_addr).await?;
+        let proxy_task = tokio::spawn(proxy.serve());
+        Ok(Self {
+            mode: ProcessManagerMode::ManagedProxy {
+                template,
+                layout: Arc::new(ManagedGenerationLayout::new(generation_root)),
+                db_path: db_path.into(),
+                proxy: handle,
+                active_child: Arc::new(Mutex::new(None)),
+                generation_counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                proxy_task: Arc::new(proxy_task),
+            },
+            blockers: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        })
+    }
+
     pub(super) async fn start(&self) {
-        let mut child_lock = self.child.lock().await;
-        if child_lock.is_some() {
-            return;
-        }
-
-        info!("{CHILD_PROCESS_STARTING_LOG}");
-        if self.cmd.trim().is_empty() {
-            return;
-        }
-
-        let mut command = tokio::process::Command::new("sh");
-        command.arg("-c").arg(&self.cmd);
-        #[cfg(unix)]
-        {
-            command.process_group(0);
-        }
-
-        // Inherit stdout/stderr allowing logs to show up in replited output.
-        command.stdout(Stdio::inherit());
-        command.stderr(Stdio::inherit());
-
-        match command.spawn() {
-            Ok(child) => {
-                *child_lock = Some(child);
-                info!("ProcessManager: Child process started.");
-            }
-            Err(e) => {
-                log::error!("ProcessManager: Failed to spawn child process: {e}");
+        match &self.mode {
+            ProcessManagerMode::Legacy { cmd, child } => start_legacy_child(cmd, child).await,
+            ProcessManagerMode::ManagedProxy { .. } => {
+                if let Err(err) = self.promote_managed_generation().await {
+                    log::error!("ProcessManager: managed proxy handoff failed: {err}");
+                }
             }
         }
     }
 
     pub(super) async fn stop(&self) {
-        let mut child_lock = self.child.lock().await;
-        if let Some(mut child) = child_lock.take() {
-            info!("ProcessManager: Stopping child process...");
-            #[cfg(unix)]
-            if let Some(pid) = child.id() {
-                let pgid = -(pid as libc::pid_t);
-                // The exec command is shell-owned, so kill the whole process group to avoid
-                // leaving the managed reader bound to ports or holding SQLite files open.
-                unsafe {
-                    libc::kill(pgid, libc::SIGTERM);
-                }
-
-                match tokio::time::timeout(CHILD_TERMINATION_GRACE, child.wait()).await {
-                    Ok(_) => {
-                        info!("ProcessManager: Child process stopped.");
-                        return;
-                    }
-                    Err(_) => unsafe {
-                        libc::kill(pgid, libc::SIGKILL);
-                    },
-                }
+        match &self.mode {
+            ProcessManagerMode::Legacy { child, .. } => stop_child(child).await,
+            ProcessManagerMode::ManagedProxy {
+                active_child,
+                proxy_task,
+                ..
+            } => {
+                stop_managed_child(active_child).await;
+                proxy_task.abort();
             }
-
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            info!("ProcessManager: Child process stopped.");
         }
     }
 
@@ -95,8 +112,7 @@ impl ProcessManager {
         let prev = self
             .blockers
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if prev == 0 {
-            // First blocker, stop the process.
+        if prev == 0 && matches!(self.mode, ProcessManagerMode::Legacy { .. }) {
             self.stop().await;
         }
     }
@@ -110,7 +126,6 @@ impl ProcessManager {
 
     pub(super) async fn remove_blocker(&self) {
         if self.release_blocker_count() {
-            // Last blocker removed, start the process.
             self.start().await;
         }
     }
@@ -135,9 +150,207 @@ impl ProcessManager {
         }
     }
 
+    async fn promote_managed_generation(&self) -> std::io::Result<()> {
+        let ProcessManagerMode::ManagedProxy {
+            template,
+            layout,
+            db_path,
+            proxy,
+            active_child,
+            generation_counter,
+            ..
+        } = &self.mode
+        else {
+            return Ok(());
+        };
+
+        let generation_number =
+            generation_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let generation_id = format!("reader-{generation_number:020}");
+        let generation_dir = layout.generation_dir(&generation_id);
+        prepare_generation_dir(db_path, &generation_dir).await?;
+        layout.promote_active_generation(&generation_id)?;
+
+        let port = reserve_loopback_port()?;
+        let command = template.render(port, &generation_dir);
+        let child = spawn_shell_child(&command)?;
+        wait_for_http_health(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)).await?;
+
+        let mut active = active_child.lock().await;
+        let old = active.replace(ManagedChild {
+            child,
+            generation_id,
+            port,
+        });
+        proxy.set_active_target(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port));
+        drop(active);
+
+        if let Some(old) = old {
+            info!(
+                "ProcessManager: retiring managed reader generation {} on port {}",
+                old.generation_id, old.port
+            );
+            stop_process_child(old.child).await;
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(super) fn blocker_count(&self) -> usize {
         self.blockers.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+async fn start_legacy_child(cmd: &str, child: &Arc<Mutex<Option<tokio::process::Child>>>) {
+    let mut child_lock = child.lock().await;
+    if child_lock.is_some() {
+        return;
+    }
+
+    info!("{CHILD_PROCESS_STARTING_LOG}");
+    if cmd.trim().is_empty() {
+        return;
+    }
+
+    match spawn_shell_child(cmd) {
+        Ok(child) => {
+            *child_lock = Some(child);
+            info!("ProcessManager: Child process started.");
+        }
+        Err(e) => {
+            log::error!("ProcessManager: Failed to spawn child process: {e}");
+        }
+    }
+}
+
+fn spawn_shell_child(cmd: &str) -> std::io::Result<tokio::process::Child> {
+    let mut command = tokio::process::Command::new("sh");
+    command.arg("-c").arg(cmd);
+    #[cfg(unix)]
+    {
+        command.process_group(0);
+    }
+
+    // Inherit stdout/stderr allowing logs to show up in replited output.
+    command.stdout(Stdio::inherit());
+    command.stderr(Stdio::inherit());
+    command.spawn()
+}
+
+async fn stop_child(child: &Arc<Mutex<Option<tokio::process::Child>>>) {
+    let mut child_lock = child.lock().await;
+    if let Some(child) = child_lock.take() {
+        stop_process_child(child).await;
+    }
+}
+
+async fn stop_managed_child(active_child: &Arc<Mutex<Option<ManagedChild>>>) {
+    let mut active = active_child.lock().await;
+    if let Some(child) = active.take() {
+        stop_process_child(child.child).await;
+    }
+}
+
+async fn stop_process_child(mut child: tokio::process::Child) {
+    info!("ProcessManager: Stopping child process...");
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        let pgid = -(pid as libc::pid_t);
+        // The exec command is shell-owned, so kill the whole process group to avoid
+        // leaving managed reader descendants bound to ports or holding SQLite files open.
+        unsafe {
+            libc::kill(pgid, libc::SIGTERM);
+        }
+
+        match tokio::time::timeout(CHILD_TERMINATION_GRACE, child.wait()).await {
+            Ok(_) => {
+                info!("ProcessManager: Child process stopped.");
+                return;
+            }
+            Err(_) => unsafe {
+                libc::kill(pgid, libc::SIGKILL);
+            },
+        }
+    }
+
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+    info!("ProcessManager: Child process stopped.");
+}
+
+async fn prepare_generation_dir(db_path: &Path, generation_dir: &Path) -> std::io::Result<()> {
+    let db_path = db_path.to_path_buf();
+    let generation_dir = generation_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || prepare_generation_dir_sync(&db_path, &generation_dir))
+        .await
+        .map_err(|err| std::io::Error::other(err.to_string()))?
+}
+
+fn prepare_generation_dir_sync(db_path: &Path, generation_dir: &Path) -> std::io::Result<()> {
+    let tmp_dir = generation_dir.with_extension("tmp");
+    match std::fs::remove_dir_all(&tmp_dir) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    std::fs::create_dir_all(&tmp_dir)?;
+
+    let tmp_db = tmp_dir.join("data.db");
+    let conn = Connection::open(db_path).map_err(std::io::Error::other)?;
+    conn.backup(rusqlite::MAIN_DB, &tmp_db, None)
+        .map_err(std::io::Error::other)?;
+    drop(conn);
+
+    let source_aux = db_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(AUXILIARY_DB_FILE);
+    if source_aux.exists() {
+        std::fs::copy(&source_aux, tmp_dir.join(AUXILIARY_DB_FILE))?;
+    }
+
+    match std::fs::remove_dir_all(generation_dir) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    std::fs::rename(&tmp_dir, generation_dir)?;
+    Ok(())
+}
+
+fn reserve_loopback_port() -> std::io::Result<u16> {
+    let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+    Ok(listener.local_addr()?.port())
+}
+
+async fn wait_for_http_health(addr: SocketAddr) -> std::io::Result<()> {
+    let deadline = tokio::time::Instant::now() + MANAGED_PROXY_HEALTH_TIMEOUT;
+    let request = b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
+    loop {
+        match TcpStream::connect(addr).await {
+            Ok(mut stream) => {
+                if tokio::io::AsyncWriteExt::write_all(&mut stream, request)
+                    .await
+                    .is_ok()
+                {
+                    let mut buf = vec![0; 256];
+                    match tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await {
+                        Ok(n) if String::from_utf8_lossy(&buf[..n]).contains("200 OK") => {
+                            return Ok(());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Err(_) => {}
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("managed child did not become healthy at {addr}"),
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 

@@ -1822,7 +1822,14 @@ mod tests {
         .await
         .expect("tail chunk should apply and restart reader");
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while fs::read_to_string(&marker_path)
+            .map(|marker| marker != "startedstarted")
+            .unwrap_or(true)
+            && Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         let marker = fs::read_to_string(&marker_path).expect("reader start marker");
         assert_eq!(
             marker, "startedstarted",
