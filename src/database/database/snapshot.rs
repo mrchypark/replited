@@ -112,23 +112,29 @@ impl Database {
 
             let wal_header_after_snapshot = WALHeader::read(&self.wal_file)?;
             let current_index = parse_wal_path(&shadow_wal_file)?;
-            let next_shadow_wal_file = self.shadow_wal_file(&generation, current_index + 1);
-            if wal_header_before_checkpoint != wal_header_after_snapshot {
+            let stream_start_pos = if wal_header_before_checkpoint != wal_header_after_snapshot {
+                let next_shadow_wal_file = self.shadow_wal_file(&generation, current_index + 1);
                 debug!(
                     "db {} snapshot rotated WAL header, seeding next shadow WAL index {}",
                     self.config.db,
                     current_index + 1
                 );
+                self.init_shadow_wal_file(&next_shadow_wal_file)?;
+                WalGenerationPos {
+                    generation: pos.generation.clone(),
+                    index: current_index + 1,
+                    offset: WAL_HEADER_SIZE,
+                }
             } else {
                 debug!(
-                    "db {} snapshot kept WAL header, still seeding next shadow WAL index {} for restorable archival",
-                    self.config.db,
-                    current_index + 1
+                    "db {} snapshot kept WAL header, appending post-snapshot frames to current shadow WAL index {}",
+                    self.config.db, current_index
                 );
-            }
-            self.init_shadow_wal_file(&next_shadow_wal_file)?;
+                self.copy_to_shadow_wal(&shadow_wal_file)?;
+                pos
+            };
 
-            Ok((compressed_data.to_owned(), pos))
+            Ok((compressed_data.to_owned(), stream_start_pos))
         }
         .await;
 
@@ -507,7 +513,7 @@ addr = "http://127.0.0.1:50051"
     }
 
     #[tokio::test]
-    async fn snapshot_always_seeds_next_shadow_wal_index_for_restoreable_followup() {
+    async fn snapshot_keeps_same_shadow_wal_index_when_header_does_not_restart() {
         let dir = tempdir().expect("tempdir");
         let db_path = dir.path().join("primary.db");
 
@@ -532,19 +538,14 @@ addr = "http://127.0.0.1:50051"
         let (tail_index, _tail_size) = db
             .current_shadow_index(&generation)
             .expect("current shadow index");
-        let next_shadow_wal = db.shadow_wal_file(&generation, tail_index);
 
         assert_eq!(
-            tail_index,
-            snapshot_pos.index + 1,
-            "snapshot should advance shadow WAL index so post-snapshot archival starts from offset 0"
+            tail_index, snapshot_pos.index,
+            "snapshot should continue the same shadow WAL when SQLite keeps the WAL header"
         );
         assert!(
-            std::fs::metadata(&next_shadow_wal)
-                .expect("next shadow wal metadata")
-                .len()
-                > WAL_HEADER_SIZE,
-            "next shadow WAL should be seeded with a full header-bearing WAL image"
+            snapshot_pos.offset > WAL_HEADER_SIZE,
+            "same-index snapshot boundary should point after already materialized frames"
         );
     }
 }
