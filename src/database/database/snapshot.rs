@@ -48,6 +48,29 @@ impl Database {
         Ok(conn)
     }
 
+    fn compress_materialized_snapshot(&self) -> Result<Vec<u8>> {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let snapshot_path = Path::new(&self.meta_dir).join(format!("snapshot_{timestamp}.db"));
+        let snapshot_path_str = snapshot_path.to_string_lossy();
+        let escaped_path = snapshot_path_str.replace('\'', "''");
+        match std::fs::remove_file(&snapshot_path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+
+        let result = (|| -> Result<Vec<u8>> {
+            self.connection
+                .execute_batch(&format!("VACUUM main INTO '{escaped_path}'"))?;
+            compress_file(&snapshot_path_str)
+        })();
+
+        let _ = std::fs::remove_file(&snapshot_path);
+        result
+    }
+
     pub(super) async fn snapshot(&mut self) -> Result<(Vec<u8>, WalGenerationPos)> {
         let result: Result<(Vec<u8>, WalGenerationPos)> = async {
             // Ensure WAL exists before trying to derive a generation position.
@@ -60,7 +83,7 @@ impl Database {
                         self.wal_file
                     )));
                 }
-                let compressed_data = compress_file(&self.config.db)?;
+                let compressed_data = self.compress_materialized_snapshot()?;
                 info!(
                     "db {} checkpointed snapshot created without live WAL, pos: {:?}",
                     self.config.db, pos
@@ -98,7 +121,7 @@ impl Database {
 
             info!("db {} snapshot created, pos: {:?}", self.config.db, pos);
 
-            let compressed_data = compress_file(&self.config.db)?;
+            let compressed_data = self.compress_materialized_snapshot()?;
 
             // Mirror do_checkpoint(): force a post-snapshot WAL write so SQLite either keeps
             // using the current header or visibly restarts the WAL right away. That lets us
@@ -473,6 +496,71 @@ addr = "http://127.0.0.1:50051"
             restored_values,
             vec!["reader-endmark".to_string(), "after-reader".to_string()],
             "snapshot DB should include WAL frames newer than an external reader endmark"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_payload_is_self_contained_when_checkpoint_is_blocked_by_reader() {
+        let dir = tempdir().expect("tempdir");
+        let db_path = dir.path().join("primary.db");
+
+        let config = stream_only_db_config(db_path.to_string_lossy().as_ref());
+        let (mut db, _rx) = Database::try_create(config).await.expect("create db");
+
+        db.connection
+            .execute(
+                "CREATE TABLE IF NOT EXISTS snapshot_self_contained (id INTEGER PRIMARY KEY, value TEXT NOT NULL)",
+                (),
+            )
+            .expect("create user table");
+        db.connection
+            .execute(
+                "INSERT INTO snapshot_self_contained (value) VALUES ('reader-endmark')",
+                (),
+            )
+            .expect("seed reader-visible row");
+
+        let reader = Connection::open(&db.config.db).expect("open external reader");
+        reader
+            .execute_batch("BEGIN; SELECT COUNT(*) FROM snapshot_self_contained;")
+            .expect("hold external read transaction");
+
+        db.connection
+            .execute(
+                "INSERT INTO snapshot_self_contained (value) VALUES ('after-reader')",
+                (),
+            )
+            .expect("write row that checkpoint cannot flush while reader is active");
+
+        let (compressed_data, _snapshot_pos) = db
+            .snapshot()
+            .await
+            .expect("snapshot should produce a self-contained DB payload");
+        reader
+            .execute_batch("ROLLBACK;")
+            .expect("release external reader");
+
+        let restored_path = dir.path().join("restored-self-contained.db");
+        std::fs::write(
+            &restored_path,
+            decompressed_data(compressed_data).expect("decompress snapshot"),
+        )
+        .expect("write restored db");
+        let restored_conn = Connection::open(&restored_path).expect("open restored db");
+
+        let restored_values: Vec<String> = {
+            let mut stmt = restored_conn
+                .prepare("SELECT value FROM snapshot_self_contained ORDER BY id")
+                .expect("prepare restored values query");
+            stmt.query_map([], |row| row.get(0))
+                .expect("query restored values")
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .expect("collect restored values")
+        };
+        assert_eq!(
+            restored_values,
+            vec!["reader-endmark".to_string(), "after-reader".to_string()],
+            "stream snapshot payload must be restorable without an out-of-band WAL prefix"
         );
     }
 
