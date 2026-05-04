@@ -1,8 +1,12 @@
 use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
 
 use log::info;
 use tokio::sync::Mutex;
+
+const CHILD_PROCESS_STARTING_LOG: &str = "ProcessManager: Starting child process.";
+const CHILD_TERMINATION_GRACE: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub(super) struct ProcessManager {
@@ -30,7 +34,7 @@ impl ProcessManager {
             return;
         }
 
-        info!("ProcessManager: Starting child process: {}", self.cmd);
+        info!("{CHILD_PROCESS_STARTING_LOG}");
         if self.cmd.trim().is_empty() {
             return;
         }
@@ -69,9 +73,15 @@ impl ProcessManager {
                 unsafe {
                     libc::kill(pgid, libc::SIGTERM);
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                unsafe {
-                    libc::kill(pgid, libc::SIGKILL);
+
+                match tokio::time::timeout(CHILD_TERMINATION_GRACE, child.wait()).await {
+                    Ok(_) => {
+                        info!("ProcessManager: Child process stopped.");
+                        return;
+                    }
+                    Err(_) => unsafe {
+                        libc::kill(pgid, libc::SIGKILL);
+                    },
                 }
             }
 
@@ -170,7 +180,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::ProcessManager;
+    use super::{CHILD_PROCESS_STARTING_LOG, ProcessManager};
 
     fn process_is_alive(pid: &str) -> bool {
         Command::new("kill")
@@ -181,6 +191,16 @@ mod tests {
             .status()
             .map(|status| status.success())
             .unwrap_or(false)
+    }
+
+    #[test]
+    fn start_log_message_does_not_include_exec_command() {
+        let secret_bearing_command =
+            "EDGE_COMMAND_AUTH_KEY=secret-token REGISTRY_CREDENTIAL_PW=secret /app serve";
+
+        assert!(!CHILD_PROCESS_STARTING_LOG.contains(secret_bearing_command));
+        assert!(!CHILD_PROCESS_STARTING_LOG.contains("secret-token"));
+        assert!(!CHILD_PROCESS_STARTING_LOG.contains("REGISTRY_CREDENTIAL_PW"));
     }
 
     #[tokio::test]
@@ -221,6 +241,34 @@ mod tests {
         assert!(
             !process_is_alive(&child_pid),
             "stop should terminate shell descendants, pid={child_pid}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_allows_shell_wrapper_to_finish_term_cleanup_before_kill() {
+        let dir = tempdir().expect("tempdir");
+        let ready_file = dir.path().join("ready");
+        let cleanup_file = dir.path().join("cleaned");
+        let cmd = format!(
+            "trap 'sleep 1; printf cleaned > \"{}\"; exit 0' TERM; printf ready > \"{}\"; while :; do sleep 60 & wait $!; done",
+            cleanup_file.display(),
+            ready_file.display()
+        );
+        let pm = ProcessManager::new(cmd);
+
+        pm.start().await;
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !ready_file.exists() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(ready_file.exists(), "shell wrapper should start");
+
+        pm.stop().await;
+
+        assert_eq!(
+            fs::read_to_string(cleanup_file).expect("TERM cleanup marker"),
+            "cleaned"
         );
     }
 }

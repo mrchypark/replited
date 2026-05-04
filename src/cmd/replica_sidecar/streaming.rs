@@ -1641,7 +1641,11 @@ mod tests {
             .expect("apply should succeed");
 
         let deadline = Instant::now() + Duration::from_secs(2);
-        while !marker_path.exists() && Instant::now() < deadline {
+        while fs::read_to_string(&marker_path)
+            .map(|marker| marker.is_empty())
+            .unwrap_or(true)
+            && Instant::now() < deadline
+        {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
