@@ -446,8 +446,7 @@ addr = "http://127.0.0.1:50051"
         )
         .expect("write restored db");
         let generation = db.current_generation().expect("current generation");
-        let shadow_wal = db
-            .shadow_wal_file(&generation, snapshot_pos.index);
+        let shadow_wal = db.shadow_wal_file(&generation, snapshot_pos.index);
         let mut shadow_file = fs::File::open(&shadow_wal).expect("open shadow WAL");
         let mut wal_prefix = vec![0u8; snapshot_pos.offset as usize];
         shadow_file
@@ -463,9 +462,7 @@ addr = "http://127.0.0.1:50051"
 
         let restored_values: Vec<String> = {
             let mut stmt = restored_conn
-                .prepare(
-                    "SELECT value FROM snapshot_blocked_checkpoint ORDER BY id",
-                )
+                .prepare("SELECT value FROM snapshot_blocked_checkpoint ORDER BY id")
                 .expect("prepare restored values query");
             stmt.query_map([], |row| row.get(0))
                 .expect("query restored values")

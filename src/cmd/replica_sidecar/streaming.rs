@@ -1,4 +1,5 @@
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -32,6 +33,31 @@ fn managed_reader_startup_grace() -> Duration {
 
 #[cfg(test)]
 fn managed_reader_startup_grace() -> Duration {
+    Duration::ZERO
+}
+
+fn managed_reader_restart_jitter_for(seed: &str, max_ms: u64) -> Duration {
+    if max_ms == 0 || seed.is_empty() {
+        return Duration::ZERO;
+    }
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    seed.hash(&mut hasher);
+    Duration::from_millis(hasher.finish() % (max_ms + 1))
+}
+
+#[cfg(not(test))]
+fn managed_reader_restart_jitter() -> Duration {
+    let max_ms = std::env::var("REPLITED_MANAGED_READER_RESTART_JITTER_MAX_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let seed = std::env::var("HOSTNAME").unwrap_or_default();
+    managed_reader_restart_jitter_for(&seed, max_ms)
+}
+
+#[cfg(test)]
+fn managed_reader_restart_jitter() -> Duration {
     Duration::ZERO
 }
 
@@ -812,18 +838,21 @@ async fn apply_wal_chunk_and_refresh(
 ) -> Result<(), ReplicaStreamError> {
     let managed_reader = process_manager.is_some();
     if let Some(pm) = process_manager {
+        let jitter = managed_reader_restart_jitter();
+        if !jitter.is_zero() {
+            info!(
+                "ReplicaSidecar: delaying managed reader restart by {}ms to avoid synchronized replica restarts",
+                jitter.as_millis()
+            );
+            tokio::time::sleep(jitter).await;
+        }
         pm.add_blocker().await;
     }
 
     let mut checkpoint_due = false;
     let result = async {
-        apply_wal_bytes_with_reader_blocked(
-            db_path,
-            chunk_start,
-            wal_bytes,
-            managed_reader,
-        )
-        .await?;
+        apply_wal_bytes_with_reader_blocked(db_path, chunk_start, wal_bytes, managed_reader)
+            .await?;
         store_shadow_wal_bytes(db_path, chunk_start, wal_bytes)
             .map_err(|e| ReplicaStreamError::Io(e.to_string()))?;
         persist_last_applied_lsn(db_path, chunk_next)
@@ -1787,7 +1816,7 @@ mod tests {
             Some(&process_manager),
         )
         .await
-            .expect("tail chunk should apply and restart reader");
+        .expect("tail chunk should apply and restart reader");
 
         tokio::time::sleep(Duration::from_millis(100)).await;
         let marker = fs::read_to_string(&marker_path).expect("reader start marker");
@@ -1801,6 +1830,22 @@ mod tests {
             "managed reader restart should preserve the WAL file needed for same-generation tail chunks"
         );
         process_manager.stop().await;
+    }
+
+    #[test]
+    fn managed_reader_restart_jitter_is_stable_and_bounded_for_replica_seed() {
+        let jitter =
+            super::managed_reader_restart_jitter_for("latest-state-replited-read-a", 15_000);
+
+        assert_eq!(
+            jitter,
+            super::managed_reader_restart_jitter_for("latest-state-replited-read-a", 15_000)
+        );
+        assert!(jitter <= Duration::from_millis(15_000));
+        assert_eq!(
+            super::managed_reader_restart_jitter_for("latest-state-replited-read-a", 0),
+            Duration::ZERO
+        );
     }
 
     #[test]
